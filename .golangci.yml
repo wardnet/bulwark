@@ -1,0 +1,12 @@
+# golangci-lint configuration (v2 schema).
+#
+# Note: in golangci-lint v2 the old `gosimple` linter was merged into
+# `staticcheck`, so enabling `staticcheck` covers the gosimple checks too.
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused

@@ -1,0 +1,4 @@
+extends:
+  - github.com/wardnet/agentic-stacks/wardnet.yaml@main
+skills:
+  - ./.agents/skills/bump-version

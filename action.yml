@@ -1,0 +1,24 @@
+name: Install bulwark
+description: Download and install the bulwark binary
+
+inputs:
+  version:
+    description: bulwark version to install (omit or set to "latest" for the latest release)
+    default: latest
+
+runs:
+  using: composite
+  steps:
+    - name: Install bulwark
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        # install.sh is always fetched from the latest release; BULWARK_VERSION
+        # pins which bulwark binary it installs.
+        if [[ "${VERSION}" != "latest" ]]; then
+          export BULWARK_VERSION="${VERSION}"
+        fi
+        export BULWARK_INSTALL_DIR="${RUNNER_TEMP}/bulwark-bin"
+        curl -fsSL https://github.com/wardnet/bulwark/releases/latest/download/install.sh | sh
+        echo "${BULWARK_INSTALL_DIR}" >> "$GITHUB_PATH"

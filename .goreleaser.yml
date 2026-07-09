@@ -1,0 +1,77 @@
+# goreleaser configuration for bulwark.
+#
+# Builds a single binary, `bulwark`, from ./cmd/bulwark. It runs both as a
+# local developer tool (self-updates via `bulwark update`) and inside CI via
+# the reusable workflows / composite action in this repo, so it ships for
+# both linux and darwin.
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: bulwark
+    main: ./cmd/bulwark
+    binary: bulwark
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+# One archive so consumers get everything, plus a raw uncompressed binary for
+# curl-and-run / CI usage that doesn't want an extraction step.
+archives:
+  - id: bulwark
+    ids:
+      - bulwark
+    name_template: >-
+      bulwark_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+
+  - id: raw
+    ids:
+      - bulwark
+    formats:
+      - binary
+    name_template: >-
+      {{ .Binary }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  github:
+    owner: wardnet
+    name: bulwark
+  extra_files:
+    - glob: scripts/install.sh
+  header: |
+    ## bulwark
+
+    Unified code-quality and security scanning for Rust, TypeScript, and Go —
+    one CLI, run identically locally and in CI.
+
+    **Install / update**
+
+    ```sh
+    curl -fsSL https://github.com/wardnet/bulwark/releases/latest/download/install.sh | sh
+    ```
+
+    `bulwark update` self-updates the CLI in place.
