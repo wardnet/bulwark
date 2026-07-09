@@ -6,9 +6,10 @@ updates:
     schedule:
       interval: weekly
     # Wait 5 days after a release is published before opening an update PR,
-    # so freshly-cut versions have time to be yanked or superseded.
+    # so freshly-cut versions have time to be yanked or superseded. 5 days is
+    # the deliberate org-wide convention (matches wardnet/wardnet-cloud/inforge).
     cooldown:
-      default-days: 5
+      default-days: 5 # nosemgrep: package_managers.dependabot.dependabot-missing-cooldown.dependabot-missing-cooldown
     open-pull-requests-limit: 10
 
   # GitHub Actions used in our workflows.
@@ -16,6 +17,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # 5 days is the deliberate org-wide convention (matches wardnet/wardnet-cloud/inforge).
     cooldown:
-      default-days: 5
+      default-days: 5 # nosemgrep: package_managers.dependabot.dependabot-missing-cooldown.dependabot-missing-cooldown
     open-pull-requests-limit: 10

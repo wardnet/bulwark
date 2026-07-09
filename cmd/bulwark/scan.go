@@ -2,60 +2,16 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
+
+	"wardnet/bulwark/internal/detect"
+	"wardnet/bulwark/internal/executil"
+	"wardnet/bulwark/internal/golang"
+	"wardnet/bulwark/internal/rust"
+	"wardnet/bulwark/internal/semgrep"
+	"wardnet/bulwark/internal/typescript"
 )
-
-// ecosystem is a language toolchain bulwark knows how to scan.
-type ecosystem string
-
-const (
-	ecosystemRust ecosystem = "rust"
-	ecosystemTS   ecosystem = "typescript"
-	ecosystemGo   ecosystem = "go"
-)
-
-// detectEcosystems walks root looking for the manifest files that mark each
-// supported ecosystem. It does not descend into vendor/build directories.
-func detectEcosystems(root string) ([]ecosystem, error) {
-	found := map[ecosystem]bool{}
-	skip := map[string]bool{
-		"node_modules": true, "target": true, ".git": true, ".bare": true,
-		"dist": true, "vendor": true,
-	}
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() && skip[d.Name()] {
-			return filepath.SkipDir
-		}
-		if d.IsDir() {
-			return nil
-		}
-		switch d.Name() {
-		case "Cargo.toml":
-			found[ecosystemRust] = true
-		case "package.json":
-			found[ecosystemTS] = true
-		case "go.mod":
-			found[ecosystemGo] = true
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	var out []ecosystem
-	for _, e := range []ecosystem{ecosystemRust, ecosystemTS, ecosystemGo} {
-		if found[e] {
-			out = append(out, e)
-		}
-	}
-	return out, nil
-}
 
 func newScanCmd() *cobra.Command {
 	var dir string
@@ -63,7 +19,8 @@ func newScanCmd() *cobra.Command {
 		Use:   "scan",
 		Short: "Run code-quality and security checks for every detected ecosystem",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			ecosystems, err := detectEcosystems(dir)
+			ctx := cmd.Context()
+			ecosystems, err := detect.Ecosystems(dir)
 			if err != nil {
 				return err
 			}
@@ -71,14 +28,47 @@ func newScanCmd() *cobra.Command {
 				_, err := fmt.Fprintln(cmd.OutOrStdout(), "no supported ecosystem detected under", dir)
 				return err
 			}
+
+			var results []executil.Result
 			for _, e := range ecosystems {
-				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "detected %s — scanner not yet implemented\n", e); err != nil {
-					return err
+				switch e {
+				case detect.Rust:
+					results = append(results, rust.Check(ctx, dir)...)
+				case detect.TypeScript:
+					tsResults, err := typescript.Check(ctx, dir)
+					if err != nil {
+						return err
+					}
+					results = append(results, tsResults...)
+				case detect.Go:
+					results = append(results, golang.Check(ctx, dir)...)
 				}
 			}
-			return fmt.Errorf("bulwark scan is not implemented yet")
+			results = append(results, semgrep.Check(ctx, dir))
+
+			return report(cmd, results)
 		},
 	}
 	cmd.Flags().StringVar(&dir, "dir", ".", "root directory to scan")
 	return cmd
+}
+
+// report prints a pass/fail line per check and returns an error if any
+// check failed, so the process exit code reflects the aggregate result.
+func report(cmd *cobra.Command, results []executil.Result) error {
+	failed := 0
+	for _, r := range results {
+		status := "PASS"
+		if !r.Ok() {
+			status = "FAIL"
+			failed++
+		}
+		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "[%s] %s\n", status, r.Name); err != nil {
+			return err
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d check(s) failed", failed)
+	}
+	return nil
 }

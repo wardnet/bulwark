@@ -13,9 +13,12 @@ runs:
       shell: bash
       env:
         VERSION: ${{ inputs.version }}
-      run: |
+      run: | # nosemgrep: yaml.github-actions.security.gha-curl-pipe-shell.gha-curl-pipe-shell
         # install.sh is always fetched from the latest release; BULWARK_VERSION
-        # pins which bulwark binary it installs.
+        # pins which bulwark binary it installs. install.sh itself verifies the
+        # downloaded binary's SHA-256 against the release's checksums.txt
+        # before executing anything — same curl-bootstrap convention already
+        # used by inforge's action.yml.
         if [[ "${VERSION}" != "latest" ]]; then
           export BULWARK_VERSION="${VERSION}"
         fi

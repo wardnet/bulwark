@@ -14,3 +14,4 @@ dist/
 # Agentic toolkit generated config
 /.claude/
 /CLAUDE.md
+/.mcp.json

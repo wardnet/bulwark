@@ -2,6 +2,8 @@ module wardnet/bulwark
 
 go 1.26.4
 
+toolchain go1.26.5
+
 require (
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/mod v0.38.0
