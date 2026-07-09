@@ -50,7 +50,8 @@ own tool version and installs it into a bulwark-managed cache directory rather t
 whatever's already on the machine (see each `internal/<lang>` package's doc comment for why).
 `version` and `update` are fully implemented and tested, following the same pattern as `inforge`'s
 self-update (checksum-verified binary replacement, refuses on dev builds, passive update nudge on
-every other command). `bulwark coverage` is still stubbed — see `cmd/bulwark/coverage.go`.
+every other command). `bulwark coverage` is fully implemented too — see Coverage below — verified
+end-to-end against this repo's own real `bulwark-state` branch on GitHub (not just a local fixture).
 
 ## Configuration
 
@@ -78,10 +79,30 @@ semgrep:
 Omitting the file, or omitting a section/key within it, keeps that value at its default — see
 `internal/config/config_test.go` for the exact merge semantics.
 
-Planned, not yet implemented:
-- **Coverage**: a lazy, per-main-commit-SHA baseline stored on a `bulwark-state` branch (not `main`)
-  — no separate "on merge to main" trigger; the first PR against a new main SHA computes and caches
-  the baseline, every subsequent PR against that SHA reuses it.
+## Coverage
+
+`bulwark coverage` diffs the current branch's per-language coverage against a lazily-computed,
+per-main-commit-SHA baseline cached on a dedicated `bulwark-state` branch (never `main` — bot-owned
+generated cache data, not source, needs no PR/review and never pollutes main's history):
+
+- `internal/gitstate.BaseSHA` resolves `git merge-base HEAD origin/main`.
+- `internal/gitstate.ReadBaseline` fetches `bulwark-state` and reads `<sha>.json` via `git show`
+  (no checkout) — a missing branch or missing file is a cache miss, not an error.
+- On a cache miss, `cmd/bulwark/coverage.go`'s `computeBaselineAt` checks out `origin/main` at that
+  SHA into a throwaway `git worktree` (never disturbing the caller's own working tree/branch),
+  computes coverage there, and `internal/gitstate.WriteBaseline` pushes it to `bulwark-state` (via
+  another throwaway worktree — creating the branch as an orphan the first time). A push race with
+  another concurrent cache-miss is non-fatal: caching is an optimization, the caller already has its
+  computed value regardless.
+- `internal/coverage.Compute` gets the actual number per detected ecosystem: `go tool cover -func`'s
+  total line for Go, `cargo llvm-cov --json`'s `data[0].totals.lines.percent` for Rust (requires
+  `cargo-llvm-cov` already installed — a cargo subcommand, not something bulwark auto-installs the
+  way it does gosec/govulncheck/ESLint), and — for TypeScript, best-effort only — a package's own
+  `test:coverage` script plus Vitest/Istanbul's `coverage-summary.json`, since unlike a linter there's
+  no single canonical coverage-invocation convention to standardize on across arbitrary TS packages.
+  A language whose coverage can't be measured is silently omitted from the report, not failed.
+- A language with no prior baseline entry (new) is reported but doesn't fail the check on its own;
+  a language whose current coverage is below its baseline does.
 
 ## Conventions
 

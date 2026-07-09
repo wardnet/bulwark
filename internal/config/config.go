@@ -70,3 +70,14 @@ func Load(root string) (Config, error) {
 	}
 	return cfg, nil
 }
+
+// AllExcludes merges every language's exclude list — used by callers (scan,
+// coverage) whose initial ecosystem-detection pass doesn't yet know which
+// language a given excluded directory belongs to.
+func (c Config) AllExcludes() []string {
+	var out []string
+	out = append(out, c.Rust.Exclude...)
+	out = append(out, c.TypeScript.Exclude...)
+	out = append(out, c.Go.Exclude...)
+	return out
+}

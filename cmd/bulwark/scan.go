@@ -27,7 +27,7 @@ func newScanCmd() *cobra.Command {
 				return err
 			}
 
-			ecosystems, err := detect.Ecosystems(dir, allExcludes(cfg))
+			ecosystems, err := detect.Ecosystems(dir, cfg.AllExcludes())
 			if err != nil {
 				return err
 			}
@@ -69,17 +69,6 @@ func newScanCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&dir, "dir", ".", "root directory to scan")
 	return cmd
-}
-
-// allExcludes merges every language's exclude list, since Ecosystems' initial
-// detection pass doesn't yet know which language a given excluded directory
-// belongs to.
-func allExcludes(cfg config.Config) []string {
-	var out []string
-	out = append(out, cfg.Rust.Exclude...)
-	out = append(out, cfg.TypeScript.Exclude...)
-	out = append(out, cfg.Go.Exclude...)
-	return out
 }
 
 // report prints a pass/fail line per check and returns an error if any
