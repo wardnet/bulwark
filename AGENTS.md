@@ -21,7 +21,14 @@ go run github.com/goreleaser/goreleaser/v2@latest release --snapshot --clean
 ## Layout
 
 ```
-cmd/bulwark/                    # the bulwark CLI
+cmd/bulwark/                    # the bulwark CLI (scan, coverage, version, update)
+internal/detect/                # ecosystem + TS-package detection (walks for Cargo.toml/package.json/go.mod)
+internal/config/                # .bulwark.yml loading (opt-out only — see Configuration below)
+internal/rust/                  # clippy, cargo-audit, cargo-deny
+internal/typescript/            # self-contained pinned ESLint + eslint-plugin-security
+internal/golang/                # gosec, govulncheck (installed into a version-keyed GOBIN dir)
+internal/semgrep/                # pinned Semgrep, installed via pipx
+internal/executil/              # shared external-command runner every scanner package uses
 .goreleaser.yml                 # build/release config (v2 schema)
 .golangci.yml                   # lint config (v2 schema)
 .github/workflows/{ci,release}.yml
@@ -37,18 +44,41 @@ scripts/install.sh              # curl|sh installer shipped with every release
 
 ## Status
 
-This repo is newly scaffolded. `bulwark scan` and `bulwark coverage` are stubbed (they detect the
-ecosystems present but do not yet run any scanner) — see the two subcommand files in `cmd/bulwark/`
-for the current state before assuming either is functional. `version` and `update` are fully
-implemented, following the same pattern as `inforge`'s self-update (checksum-verified binary
-replacement, refuses on dev builds, passive update nudge on every other command).
+`bulwark scan` is implemented for Rust, TypeScript, and Go, plus Semgrep — every check is a real
+tool invocation (not a stub), verified end-to-end against this repo itself. Every scanner pins its
+own tool version and installs it into a bulwark-managed cache directory rather than trusting
+whatever's already on the machine (see each `internal/<lang>` package's doc comment for why).
+`version` and `update` are fully implemented and tested, following the same pattern as `inforge`'s
+self-update (checksum-verified binary replacement, refuses on dev builds, passive update nudge on
+every other command). `bulwark coverage` is still stubbed — see `cmd/bulwark/coverage.go`.
 
-Planned scanner integration, once implemented:
-- **Rust**: clippy (pedantic + restriction groups), cargo-audit (CVE gate), cargo-deny (licenses +
-  bans only — `advisories` disabled to avoid duplicating cargo-audit), Semgrep.
-- **TypeScript**: a self-contained ESLint + `eslint-plugin-security` toolchain that `bulwark` itself
-  pins and invokes via `npx`, independent of the target package's own devDependencies, plus Semgrep.
-- **Go**: gosec, govulncheck, Semgrep.
+## Configuration
+
+`.bulwark.yml` at the scan root is optional and purely **opt-out** — its job is narrowing what
+bulwark's zero-config default already does (scan everything detected, every check enabled), not
+tuning severity or suppressing individual findings (that's what a fix-up pass + inline
+`#nosec`/`nosemgrep` annotations in the scanned repo are for). See `internal/config/config.go` for
+the full schema; shape:
+
+```yaml
+rust:
+  enabled: true          # set false to skip Rust entirely even if a Cargo.toml is detected
+  exclude: []            # extra directory names to skip during ecosystem/package detection
+typescript:
+  enabled: true
+  exclude: ["legacy-app"]
+go:
+  enabled: true
+  exclude: []
+semgrep:
+  enabled: true
+  config: auto           # override to a custom registry ref/path if needed
+```
+
+Omitting the file, or omitting a section/key within it, keeps that value at its default — see
+`internal/config/config_test.go` for the exact merge semantics.
+
+Planned, not yet implemented:
 - **Coverage**: a lazy, per-main-commit-SHA baseline stored on a `bulwark-state` branch (not `main`)
   — no separate "on merge to main" trigger; the first PR against a new main SHA computes and caches
   the baseline, every subsequent PR against that SHA reuses it.
