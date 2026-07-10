@@ -155,7 +155,7 @@ func selfUpdate(ctx context.Context, ver, exe string) error {
 	// CreateTemp made the file 0600 and OpenFile's mode is ignored for existing
 	// files, so this chmod — not the mode passed to downloadBinary — is what
 	// makes the binary executable.
-	if err := os.Chmod(tmpPath, 0o755); err != nil {
+	if err := os.Chmod(tmpPath, 0o755); err != nil { // #nosec G302 -- the replacement binary must be executable
 		return err
 	}
 	if err := os.Rename(tmpPath, exe); err != nil {
@@ -180,7 +180,7 @@ func downloadBinary(ctx context.Context, url, dst string, mode os.FileMode) erro
 			resp.StatusCode, url, runtime.GOOS, runtime.GOARCH)
 	}
 
-	f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode) // #nosec G304 -- dst is our own staged temp path, not user input
 	if err != nil {
 		return err
 	}
@@ -225,7 +225,7 @@ func verifyChecksum(ctx context.Context, client *http.Client, ver, asset, path s
 		return fmt.Errorf("no checksum for %s in %s", asset, url)
 	}
 
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- path is our own staged temp path, not user input
 	if err != nil {
 		return err
 	}
@@ -263,7 +263,7 @@ func maybeNudgeUpdate() {
 	path := filepath.Join(cacheDir, "bulwark", "update-check.json")
 
 	var st updateCheckState
-	if data, err := os.ReadFile(path); err == nil {
+	if data, err := os.ReadFile(path); err == nil { // #nosec G304 -- path is built from os.UserCacheDir(), not user input
 		_ = json.Unmarshal(data, &st)
 	}
 	if time.Since(st.CheckedAt) >= updateCheckTTL {
@@ -277,8 +277,8 @@ func maybeNudgeUpdate() {
 			st.Latest = latest
 		}
 		if data, err := json.Marshal(st); err == nil {
-			if err := os.MkdirAll(filepath.Dir(path), 0o755); err == nil {
-				_ = os.WriteFile(path, data, 0o644)
+			if err := os.MkdirAll(filepath.Dir(path), 0o750); err == nil {
+				_ = os.WriteFile(path, data, 0o600)
 			}
 		}
 	}

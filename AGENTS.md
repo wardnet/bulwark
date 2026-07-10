@@ -21,12 +21,21 @@ go run github.com/goreleaser/goreleaser/v2@latest release --snapshot --clean
 ## Layout
 
 ```
-cmd/bulwark/                    # the bulwark CLI
+cmd/bulwark/                    # the bulwark CLI (scan, coverage, version, update)
+internal/detect/                # ecosystem + TS-package detection (walks for Cargo.toml/package.json/go.mod)
+internal/config/                # .bulwark.yml loading (opt-out only — see Configuration below)
+internal/rust/                  # clippy, cargo-audit, cargo-deny
+internal/typescript/            # self-contained pinned ESLint + eslint-plugin-security
+internal/golang/                # gosec, govulncheck (installed into a version-keyed GOBIN dir)
+internal/semgrep/                # pinned Semgrep, installed via pipx
+internal/coverage/               # per-language coverage percentage (see Coverage below)
+internal/gitstate/               # bulwark-state branch read/write (see Coverage below)
+internal/executil/              # shared external-command runner every scanner package uses
 .goreleaser.yml                 # build/release config (v2 schema)
 .golangci.yml                   # lint config (v2 schema)
 .github/workflows/{ci,release}.yml
 .github/dependabot.yml
-action.yml                      # composite action: install the released binary
+action.yml                      # composite action: install + scan + coverage + PR comment + report
 scripts/install.sh              # curl|sh installer shipped with every release
 ```
 
@@ -37,21 +46,130 @@ scripts/install.sh              # curl|sh installer shipped with every release
 
 ## Status
 
-This repo is newly scaffolded. `bulwark scan` and `bulwark coverage` are stubbed (they detect the
-ecosystems present but do not yet run any scanner) — see the two subcommand files in `cmd/bulwark/`
-for the current state before assuming either is functional. `version` and `update` are fully
-implemented, following the same pattern as `inforge`'s self-update (checksum-verified binary
-replacement, refuses on dev builds, passive update nudge on every other command).
+All four subcommands (`scan`, `coverage`, `version`, `update`) are fully implemented — every check
+is a real tool invocation (not a stub). Every scanner pins its own tool version and installs it into
+a bulwark-managed cache directory rather than trusting whatever's already on the machine (see each
+`internal/<lang>` package's doc comment for why). `update` follows the same pattern as `inforge`'s
+self-update (checksum-verified binary replacement, refuses on dev builds, passive update nudge on
+every other command). `bulwark coverage` has been verified end-to-end against this repo's own real
+`bulwark-state` branch on GitHub, not just a local fixture.
 
-Planned scanner integration, once implemented:
-- **Rust**: clippy (pedantic + restriction groups), cargo-audit (CVE gate), cargo-deny (licenses +
-  bans only — `advisories` disabled to avoid duplicating cargo-audit), Semgrep.
-- **TypeScript**: a self-contained ESLint + `eslint-plugin-security` toolchain that `bulwark` itself
-  pins and invokes via `npx`, independent of the target package's own devDependencies, plus Semgrep.
-- **Go**: gosec, govulncheck, Semgrep.
-- **Coverage**: a lazy, per-main-commit-SHA baseline stored on a `bulwark-state` branch (not `main`)
-  — no separate "on merge to main" trigger; the first PR against a new main SHA computes and caches
-  the baseline, every subsequent PR against that SHA reuses it.
+## CI
+
+`.github/workflows/ci.yml` runs three jobs on every push/PR to `main`: `lint` (golangci-lint),
+`build & test` (`go build`/`go test -race`), and `self-scan` — bulwark builds itself and runs
+`bulwark scan --dir .` against its own repo. `self-scan` is dogfooding, not a formality: it's the
+only job that exercises the actual scan/report path end-to-end against a real repo, and it already
+caught a real bug once (see the git history around the `go-version: "1.26.5"` pin below).
+
+**Pin the exact Go patch version in workflows (`"1.26.5"`), never a bare minor (`"1.26"`).**
+`actions/setup-go`'s `go-version: "1.26"` resolves to whatever `1.26.x` patch it has
+cached/available, which is not necessarily the version this repo's `go.mod` `toolchain` directive
+pins — and critically, `go install`-ing an *external* tool (gosec, govulncheck) does **not** consult
+the current module's `go.mod` toolchain directive the way building the module itself does. This bit
+us for real: `self-scan`'s `govulncheck` step passed locally (toolchain directive respected) but
+failed in CI (setup-go had installed an older, vulnerable patch) until `go-version` was pinned to the
+exact `1.26.5`. If `go.mod`'s `toolchain` line is ever bumped, update every `go-version:` in
+`ci.yml`/`release.yml` to match in the same change.
+
+## Configuration
+
+`.bulwark.yml` at the scan root is optional and purely **opt-out** — its job is narrowing what
+bulwark's zero-config default already does (scan everything detected, every check enabled), not
+tuning severity or suppressing individual findings (that's what a fix-up pass + inline
+`#nosec`/`nosemgrep` annotations in the scanned repo are for). See `internal/config/config.go` for
+the full schema; shape:
+
+```yaml
+rust:
+  enabled: true          # set false to skip Rust entirely even if a Cargo.toml is detected
+  exclude: []            # extra directory names to skip during ecosystem/package detection
+typescript:
+  enabled: true
+  exclude: ["legacy-app"]
+go:
+  enabled: true
+  exclude: []
+semgrep:
+  enabled: true
+  config: auto           # override to a custom registry ref/path if needed
+```
+
+Omitting the file, or omitting a section/key within it, keeps that value at its default — see
+`internal/config/config_test.go` for the exact merge semantics.
+
+## Coverage
+
+`bulwark coverage` diffs the current branch's per-language coverage against a lazily-computed,
+per-main-commit-SHA baseline cached on a dedicated `bulwark-state` branch (never `main` — bot-owned
+generated cache data, not source, needs no PR/review and never pollutes main's history):
+
+- `internal/gitstate.BaseSHA` resolves `git merge-base HEAD origin/main`.
+- `internal/gitstate.ReadBaseline` fetches `bulwark-state` and reads `<sha>.json` via `git show`
+  (no checkout) — a missing branch or missing file is a cache miss, not an error.
+- On a cache miss, `cmd/bulwark/coverage.go`'s `computeBaselineAt` checks out `origin/main` at that
+  SHA into a throwaway `git worktree` (never disturbing the caller's own working tree/branch),
+  computes coverage there, and `internal/gitstate.WriteBaseline` pushes it to `bulwark-state` (via
+  another throwaway worktree — creating the branch as an orphan the first time). A push race with
+  another concurrent cache-miss is non-fatal: caching is an optimization, the caller already has its
+  computed value regardless.
+- `internal/coverage.Compute` gets the actual number per detected ecosystem: `go tool cover -func`'s
+  total line for Go, `cargo llvm-cov --json`'s `data[0].totals.lines.percent` for Rust, and — for
+  TypeScript, best-effort only — a package's own `test:coverage` script plus Vitest/Istanbul's
+  `coverage-summary.json`, since unlike a linter there's no single canonical coverage-invocation
+  convention to standardize on across arbitrary TS packages. A language whose coverage can't be
+  measured is silently omitted from the report, not failed.
+- A language with no prior baseline entry (new) is reported but doesn't fail the check on its own;
+  a language whose current coverage is below its baseline does; a language dropped from the current
+  run (baseline had it, current doesn't) is reported as `[DROPPED]` and also doesn't fail on its own.
+
+### `--tests=run` vs `--tests=skip`
+
+Unlike Codecov or Sonar — which never execute your tests, only ingest a coverage report your build
+already produced — `bulwark coverage`'s default (`--tests=run`) actually runs each ecosystem's test
+suite itself (`go test -coverprofile`, `cargo llvm-cov`, a package's `test:coverage` script). That's
+the right default for local dev (one command, no separate step to remember), but it's wrong for CI
+if a test job already runs with coverage instrumentation on — running tests again would duplicate
+work that may already be expensive (wardnet/wardnet-cloud's existing pipelines already run tests
+twice: once plain for pass/fail, once instrumented for coverage; `bulwark coverage` piling on a third
+run would make it worse, not better).
+
+`--tests=skip` fixes this: it never executes anything, only looks for a report file a prior step
+already produced — `internal/coverage.findReport` checks an explicit `--go-report`/`--rust-report`
+override first, then a built-in candidate list (`coverage.out`/`cover.out`/`c.out` for Go;
+`coverage/llvm-cov.json`/`llvm-cov.json`/`target/llvm-cov/llvm-cov.json` for Rust — TypeScript has
+no override, since `coverage/coverage-summary.json` is already Istanbul's own fixed convention, not
+something projects vary). In CI, the intended shape is: the existing test job already produces
+coverage as a side effect of running tests once (e.g. `cargo llvm-cov nextest` *as* the test runner,
+not a second pass after a plain `cargo test`), and `bulwark coverage --tests=skip` runs afterward as
+a pure report-consumer.
+
+One exception: computing a **baseline** at a historical main SHA (a cache miss) always uses
+`--tests=run` internally (`cmd/bulwark/coverage.go`'s `computeBaselineAt` hardcodes
+`coverage.ModeRun`), regardless of the top-level flag — a historical commit's throwaway checkout has
+no CI-produced report sitting in it, so there's nothing to skip to. This only costs a real test run
+once per main commit (cached afterward on `bulwark-state`), not once per PR, so it doesn't reintroduce
+the duplication `--tests=skip` exists to avoid.
+
+## The `action.yml` composite action
+
+Unlike `inforge`'s action (install-only — its invocations vary too much per call site to bake in),
+bulwark's usage is uniform enough (`.bulwark.yml` already carries all the config) that the action
+owns the whole install → run → report flow: install bulwark, run `scan`/`coverage` (each toggleable
+independently via `run-scan`/`run-coverage`), post one sticky PR comment summarizing both (upsert,
+not a fresh comment every run — via `marocchino/sticky-pull-request-comment`), and optionally
+upload to Codecov (non-blocking, purely for its dashboard/history) and/or switch bulwark's own
+Semgrep check into `semgrep ci` mode (diff-aware + uploads to the Semgrep AppSec Platform) when a
+`SEMGREP_APP_TOKEN`-equivalent input is supplied.
+
+**Never interpolate `${{ inputs.* }}` or `${{ steps.*.outputs.* }}` directly into a `run:` script
+body** — pass it via that step's `env:` block instead, and reference the env var name (`"$DIR"`,
+not `"${{ inputs.dir }}"`) inside the script. Semgrep's own `yaml.github-actions.security.run-shell-injection`
+rule caught this exact mistake once already (see git history) — expression interpolation directly
+into a shell script is a real script-injection vector if the interpolated value could ever contain
+shell metacharacters, regardless of how trusted the input value looks today. `if:` conditions and
+`with:` blocks on a `uses:` step are fine to interpolate directly — only `run:` script bodies are
+the risk, since that's the only place text gets spliced into something a shell then executes.
 
 ## Conventions
 
