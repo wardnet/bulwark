@@ -35,5 +35,10 @@ func ensure(ctx context.Context) executil.Result {
 			return executil.Result{Name: "semgrep"}
 		}
 	}
-	return executil.Run(ctx, "", "pipx", "install", "--force", "semgrep=="+version)
+	r := executil.Run(ctx, "", "pipx", "install", "--force", "semgrep=="+version)
+	// Override Name: executil.Run sets it to the literal binary invoked
+	// ("pipx"), but a failure here means the Semgrep check itself never ran —
+	// report() should say so, not "pipx".
+	r.Name = "semgrep"
+	return r
 }
