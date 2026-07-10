@@ -17,13 +17,13 @@ import (
 // regardless of what's already on the machine.
 const version = "1.168.0"
 
-// Check runs Semgrep's auto ruleset (SAST rules for whatever languages it
-// finds) against dir, failing on any finding.
-func Check(ctx context.Context, dir string) executil.Result {
+// Check runs Semgrep against dir using the given ruleset config (e.g. "auto",
+// or a custom registry ref/path from .bulwark.yml), failing on any finding.
+func Check(ctx context.Context, dir, rulesetConfig string) executil.Result {
 	if r := ensure(ctx); !r.Ok() {
 		return r
 	}
-	return executil.Run(ctx, dir, "semgrep", "scan", "--config", "auto", "--error")
+	return executil.Run(ctx, dir, "semgrep", "scan", "--config", rulesetConfig, "--error")
 }
 
 // ensure installs the pinned Semgrep version via pipx unless it's already
@@ -35,5 +35,10 @@ func ensure(ctx context.Context) executil.Result {
 			return executil.Result{Name: "semgrep"}
 		}
 	}
-	return executil.Run(ctx, "", "pipx", "install", "--force", "semgrep=="+version)
+	r := executil.Run(ctx, "", "pipx", "install", "--force", "semgrep=="+version)
+	// Override Name: executil.Run sets it to the literal binary invoked
+	// ("pipx"), but a failure here means the Semgrep check itself never ran —
+	// report() should say so, not "pipx".
+	r.Name = "semgrep"
+	return r
 }

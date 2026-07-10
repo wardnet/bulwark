@@ -32,9 +32,10 @@ const (
 	pluginSecurityVersion = "4.0.1"
 )
 
-// Check lints every package directory under root.
-func Check(ctx context.Context, root string) ([]executil.Result, error) {
-	pkgDirs, err := detect.TSPackageDirs(root)
+// Check lints every package directory under root, skipping any directory
+// named in exclude.
+func Check(ctx context.Context, root string, exclude []string) ([]executil.Result, error) {
+	pkgDirs, err := detect.TSPackageDirs(root, exclude)
 	if err != nil {
 		return nil, err
 	}
