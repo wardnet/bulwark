@@ -70,3 +70,28 @@ jobs:
 
       - name: bulwark scan (self)
         run: /tmp/bulwark scan --dir .
+
+  # The single job the branch-protection ruleset actually requires. Individual
+  # job names (lint, build & test, ...) are an implementation detail that
+  # changes as CI evolves — pointing the ruleset at each one means every job
+  # rename/add/remove is also a ruleset edit, and a job that's silently never
+  # required (as self-scan was here) goes unnoticed. Add a job to `needs:`
+  # below and the gate covers it automatically; the ruleset itself never
+  # needs to change again.
+  pr-gate:
+    name: PR Gate
+    if: always()
+    needs: [lint, build-test, self-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all upstream jobs to have succeeded
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          echo "$RESULTS"
+          case "$RESULTS" in
+            *failure*|*cancelled*|*skipped*)
+              echo "one or more required jobs did not succeed" >&2
+              exit 1
+              ;;
+          esac
