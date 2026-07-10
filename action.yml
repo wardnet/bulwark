@@ -162,8 +162,12 @@ runs:
           if [[ "$RUN_COVERAGE" == "true" ]]; then
             cov_icon="✅"
             [[ "$COVERAGE_EXIT_CODE" != "0" ]] && cov_icon="❌"
-            cov_detail=$(grep -E '^\[(PASS|FAIL|NEW|DROPPED)\]' "$coverage_out" | sed -E 's/^\[[A-Z]+\][[:space:]]+//' | paste -sd ';' - | sed 's/;/; /g')
-            [[ -z "$cov_detail" ]] && cov_detail="failed, see details below"
+            # Not line-anchored: bulwark's own output has run the cached-baseline
+            # JSON blob and the "[PASS] go: ..." summary together with no
+            # newline between them (e.g. "}[PASS]    go: 56.9% (baseline 56.9%)"),
+            # so a `^`-anchored match silently finds nothing on a real run.
+            cov_detail=$(grep -oE '\[(PASS|FAIL|NEW|DROPPED)\][[:space:]]+.*' "$coverage_out" | sed -E 's/^\[[A-Z]+\][[:space:]]+//' | paste -sd ';' - | sed 's/;/; /g')
+            [[ -z "$cov_detail" ]] && cov_detail="see details below"
             echo "- ${cov_icon} **coverage** — ${cov_detail}"
             echo
             echo "<details><summary>full output</summary>"
