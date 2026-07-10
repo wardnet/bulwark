@@ -127,7 +127,27 @@ runs:
         # actual pass/fail gate is each command's exit code, not these counts.
         gosec_count() { grep -oE 'Issues[[:space:]]*:[[:space:]]*[0-9]+' "$1" | grep -oE '[0-9]+' | tail -1; }
         govulncheck_count() { grep -c '^Vulnerability #' "$1"; }
-        semgrep_count() { grep -oE '[0-9]+ findings\.' "$1" | tail -1 | grep -oE '[0-9]+'; }
+        # In CI mode (semgrep ci, diff-aware — used when semgrep-app-token is set), Semgrep
+        # prints two different finding counts: "Current version has N findings." (the whole
+        # repo, unrelated to this PR) and " • Findings: N (M blocking)" (this PR's diff — the
+        # number that actually determines pass/fail). Only the latter is meaningful here; local
+        # `semgrep scan` (no token) has no blocking concept, so falls back to its own
+        # "Ran ... rules on ... files: N findings." total for both fields.
+        semgrep_count() {
+          local line total blocking
+          line=$(grep -oE 'Findings:[[:space:]]*[0-9]+[[:space:]]*\([0-9]+ blocking\)' "$1" | tail -1)
+          if [[ -n "$line" ]]; then
+            read -r total blocking <<< "$(echo "$line" | grep -oE '[0-9]+' | tr '\n' ' ')"
+          else
+            total=$(grep -oE '[0-9]+ findings\.' "$1" | tail -1 | grep -oE '[0-9]+')
+            blocking="$total"
+          fi
+          echo "${total:-0} ${blocking:-0}"
+        }
+        # tool_result reads a tool's own [PASS]/[FAIL] line (bulwark scan's own report()
+        # output) — the ground truth for whether that specific tool failed, since a nonzero
+        # SCAN_EXIT_CODE only says "at least one check failed", not which one.
+        tool_result() { grep -oE "^\[(PASS|FAIL)\] $2\$" "$1" | tail -1 | sed -E 's/^\[([A-Z]+)\].*/\1/'; }
 
         {
           echo "## bulwark"
@@ -138,9 +158,16 @@ runs:
               echo "- ✅ **scan** — no findings"
             else
               parts=()
-              n=$(gosec_count "$scan_out"); [[ -n "$n" && "$n" != "0" ]] && parts+=("${n} gosec")
-              n=$(govulncheck_count "$scan_out"); [[ -n "$n" && "$n" != "0" ]] && parts+=("${n} govulncheck")
-              n=$(semgrep_count "$scan_out"); [[ -n "$n" && "$n" != "0" ]] && parts+=("${n} semgrep")
+              if [[ "$(tool_result "$scan_out" gosec)" == "FAIL" ]]; then
+                n=$(gosec_count "$scan_out"); [[ -n "$n" && "$n" != "0" ]] && parts+=("${n} gosec")
+              fi
+              if [[ "$(tool_result "$scan_out" govulncheck)" == "FAIL" ]]; then
+                n=$(govulncheck_count "$scan_out"); [[ -n "$n" && "$n" != "0" ]] && parts+=("${n} govulncheck")
+              fi
+              if [[ "$(tool_result "$scan_out" semgrep)" == "FAIL" ]]; then
+                read -r n _ <<< "$(semgrep_count "$scan_out")"
+                [[ -n "$n" && "$n" != "0" ]] && parts+=("${n} semgrep")
+              fi
               if [[ "${#parts[@]}" -gt 0 ]]; then
                 detail=$(IFS=,; echo "${parts[*]}" | sed 's/,/, /g')
                 echo "- ❌ **scan** — ${detail} findings"
