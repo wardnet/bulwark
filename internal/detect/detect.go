@@ -13,6 +13,16 @@ const (
 	Go         Ecosystem = "go"
 )
 
+// Extensions maps each Ecosystem to the file extensions bulwark considers
+// part of it. Shared by any caller that needs to scope work (e.g. patch
+// coverage's diff) to one ecosystem's own files, rather than re-deriving its
+// own copy of this mapping.
+var Extensions = map[Ecosystem][]string{
+	Go:         {".go"},
+	Rust:       {".rs"},
+	TypeScript: {".ts", ".tsx"},
+}
+
 var defaultSkipDirs = map[string]bool{
 	"node_modules": true, "target": true, ".git": true, ".bare": true,
 	"dist": true, "vendor": true, "build": true,

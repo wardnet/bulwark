@@ -103,7 +103,7 @@ func TestGoCoverageModeSkipDoesNotRunTests(t *testing.T) {
 	write(t, dir, "main_test.go", "package fixture\n\nimport \"testing\"\n\nfunc TestFails(t *testing.T) { t.Fatal(\"this test must never run under ModeSkip\") }\n")
 	write(t, dir, "coverage.out", "mode: set\nfixture/main.go:3.13,3.16 1 1\n")
 
-	pct, ok := goCoverage(context.Background(), dir, ModeSkip, "")
+	pct, _, ok := goCoverage(context.Background(), dir, "", ModeSkip, "")
 	if !ok {
 		t.Fatal("expected goCoverage to succeed by parsing the existing coverage.out")
 	}
