@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"wardnet/bulwark/internal/config"
 	"wardnet/bulwark/internal/detect"
 	"wardnet/bulwark/internal/executil"
 )
@@ -20,8 +21,15 @@ import (
 // isn't available or produces no measurable result — coverage tooling is
 // more varied across projects than a linter, so bulwark reports what it can
 // rather than failing the whole run over one package's missing test script.
-func Compute(ctx context.Context, dir string, exclude []string) (map[string]float64, error) {
-	ecosystems, err := detect.Ecosystems(dir, exclude)
+//
+// The initial ecosystem-detection pass uses cfg.AllExcludes() (it doesn't yet
+// know which language a given excluded directory belongs to), but each
+// language-specific pass below uses only that language's own exclude list —
+// a Rust-only exclude must never cause a real TypeScript package to be
+// silently dropped from coverage, matching how cmd/bulwark/scan.go scopes
+// excludes per language.
+func Compute(ctx context.Context, dir string, cfg config.Config) (map[string]float64, error) {
+	ecosystems, err := detect.Ecosystems(dir, cfg.AllExcludes())
 	if err != nil {
 		return nil, err
 	}
@@ -36,7 +44,7 @@ func Compute(ctx context.Context, dir string, exclude []string) (map[string]floa
 		case detect.Go:
 			pct, ok = goCoverage(ctx, dir)
 		case detect.TypeScript:
-			pct, ok = tsCoverage(ctx, dir, exclude)
+			pct, ok = tsCoverage(ctx, dir, cfg.TypeScript.Exclude)
 		}
 		if ok {
 			report[string(e)] = pct

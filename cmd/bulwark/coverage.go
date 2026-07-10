@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 
 	"github.com/spf13/cobra"
 
@@ -25,9 +26,8 @@ func newCoverageCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			exclude := cfg.AllExcludes()
 
-			current, err := coverage.Compute(ctx, dir, exclude)
+			current, err := coverage.Compute(ctx, dir, cfg)
 			if err != nil {
 				return err
 			}
@@ -49,12 +49,18 @@ func newCoverageCmd() *cobra.Command {
 				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "no cached baseline for %s — computing one now (first PR against this main commit pays this cost)\n", sha); err != nil {
 					return err
 				}
-				baseline, err = computeBaselineAt(ctx, dir, sha, exclude)
+				baseline, err = computeBaselineAt(ctx, dir, sha, cfg)
 				if err != nil {
 					return err
 				}
+				// Caching the baseline is best-effort: a write failure (worktree
+				// race, disk pressure, transient git error) must never fail this
+				// command outright — `current` and `baseline` are already
+				// computed, and diffReport below is what actually matters.
 				if err := gitstate.WriteBaseline(ctx, dir, sha, baseline); err != nil {
-					return err
+					if _, printErr := fmt.Fprintf(cmd.ErrOrStderr(), "warning: failed to cache coverage baseline for %s: %v\n", sha, err); printErr != nil {
+						return printErr
+					}
 				}
 			}
 
@@ -68,7 +74,7 @@ func newCoverageCmd() *cobra.Command {
 // computeBaselineAt checks out origin/main at sha into a throwaway worktree
 // and computes coverage there, so a cache miss doesn't disturb the caller's
 // own working tree/branch.
-func computeBaselineAt(ctx context.Context, dir, sha string, exclude []string) (map[string]float64, error) {
+func computeBaselineAt(ctx context.Context, dir, sha string, cfg config.Config) (map[string]float64, error) {
 	tmp, err := os.MkdirTemp("", "bulwark-baseline-*")
 	if err != nil {
 		return nil, err
@@ -79,31 +85,47 @@ func computeBaselineAt(ctx context.Context, dir, sha string, exclude []string) (
 	if r := executil.Run(ctx, dir, "git", "worktree", "add", "--detach", tmp, sha); !r.Ok() {
 		return nil, fmt.Errorf("worktree add %s at %s: %w", tmp, sha, r.Err)
 	}
-	return coverage.Compute(ctx, tmp, exclude)
+	return coverage.Compute(ctx, tmp, cfg)
 }
 
-// diffReport prints current vs. baseline per language and fails if any
-// language's coverage regressed. A language present only in current (no
-// baseline entry — newly added) or only in baseline (dropped) is reported
-// but doesn't fail the check on its own.
+// diffReport prints current vs. baseline per language, covering every
+// language mentioned by either side (not just current's), and fails if any
+// language's coverage regressed. A language with no baseline entry (newly
+// added) or a language dropped from current (no longer measurable) is
+// reported but doesn't fail the check on its own — only a measured decrease
+// does.
 func diffReport(cmd *cobra.Command, current, baseline map[string]float64) error {
+	langs := make(map[string]struct{}, len(current)+len(baseline))
+	for lang := range current {
+		langs[lang] = struct{}{}
+	}
+	for lang := range baseline {
+		langs[lang] = struct{}{}
+	}
+	sorted := make([]string, 0, len(langs))
+	for lang := range langs {
+		sorted = append(sorted, lang)
+	}
+	sort.Strings(sorted)
+
 	regressed := 0
-	for lang, cur := range current {
-		base, ok := baseline[lang]
+	for _, lang := range sorted {
+		cur, curOK := current[lang]
+		base, baseOK := baseline[lang]
+		var line string
 		switch {
-		case !ok:
-			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "[NEW]  %s: %.1f%% (no baseline yet)\n", lang, cur); err != nil {
-				return err
-			}
+		case !baseOK:
+			line = fmt.Sprintf("[NEW]     %s: %.1f%% (no baseline yet)", lang, cur)
+		case !curOK:
+			line = fmt.Sprintf("[DROPPED] %s: no longer measured (baseline was %.1f%%)", lang, base)
 		case cur < base:
 			regressed++
-			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "[FAIL] %s: %.1f%% (baseline %.1f%%, regressed %.1f%%)\n", lang, cur, base, base-cur); err != nil {
-				return err
-			}
+			line = fmt.Sprintf("[FAIL]    %s: %.1f%% (baseline %.1f%%, regressed %.1f%%)", lang, cur, base, base-cur)
 		default:
-			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "[PASS] %s: %.1f%% (baseline %.1f%%)\n", lang, cur, base); err != nil {
-				return err
-			}
+			line = fmt.Sprintf("[PASS]    %s: %.1f%% (baseline %.1f%%)", lang, cur, base)
+		}
+		if _, err := fmt.Fprintln(cmd.OutOrStdout(), line); err != nil {
+			return err
 		}
 	}
 	if regressed > 0 {

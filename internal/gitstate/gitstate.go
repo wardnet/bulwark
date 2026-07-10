@@ -71,17 +71,27 @@ func WriteBaseline(ctx context.Context, dir, sha string, report map[string]float
 	defer func() { _ = os.RemoveAll(tmp) }()
 	defer func() { _ = executil.Run(ctx, dir, "git", "worktree", "remove", "--force", tmp) }()
 
+	// A local branch unique to this invocation (derived from the unique temp
+	// dir), never the shared BranchName itself: git refuses to have the same
+	// branch checked out in two worktrees at once, and this repo may well
+	// have several worktrees already (bulwark's own gt bare-repo layout, or
+	// concurrent CI jobs sharing a checkout) — two concurrent WriteBaseline
+	// calls must not race on a shared local branch name. The remote branch
+	// is still named BranchName; only the local staging name differs, pushed
+	// via refspec below.
+	staging := "bulwark-state-staging-" + filepath.Base(tmp)
+
 	branchExists := executil.Run(ctx, dir, "git", "ls-remote", "--exit-code", "--heads", "origin", BranchName).Ok()
 	if branchExists {
-		if r := executil.Run(ctx, dir, "git", "worktree", "add", "-B", BranchName, tmp, "origin/"+BranchName); !r.Ok() {
+		if r := executil.Run(ctx, dir, "git", "worktree", "add", "-b", staging, tmp, "origin/"+BranchName); !r.Ok() {
 			return fmt.Errorf("worktree add %s: %w", BranchName, r.Err)
 		}
 	} else {
 		if r := executil.Run(ctx, dir, "git", "worktree", "add", "--detach", tmp); !r.Ok() {
 			return fmt.Errorf("worktree add (detached): %w", r.Err)
 		}
-		if r := executil.Run(ctx, tmp, "git", "checkout", "--orphan", BranchName); !r.Ok() {
-			return fmt.Errorf("checkout --orphan %s: %w", BranchName, r.Err)
+		if r := executil.Run(ctx, tmp, "git", "checkout", "--orphan", staging); !r.Ok() {
+			return fmt.Errorf("checkout --orphan %s: %w", staging, r.Err)
 		}
 		if r := executil.Run(ctx, tmp, "git", "rm", "-rf", "--ignore-unmatch", "."); !r.Ok() {
 			return fmt.Errorf("clear orphan worktree: %w", r.Err)
@@ -102,7 +112,7 @@ func WriteBaseline(ctx context.Context, dir, sha string, report map[string]float
 	if !commitR.Ok() {
 		return fmt.Errorf("git commit: %w", commitR.Err)
 	}
-	if r := executil.Run(ctx, tmp, "git", "push", "origin", BranchName); !r.Ok() {
+	if r := executil.Run(ctx, tmp, "git", "push", "origin", staging+":refs/heads/"+BranchName); !r.Ok() {
 		// Non-fatal: see doc comment above — caching is best-effort.
 		return nil
 	}
