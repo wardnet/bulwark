@@ -31,22 +31,50 @@ type Semgrep struct {
 	Config  string `yaml:"config"`
 }
 
+// PatchLanguage is the opt-out surface for one language's patch-coverage gate.
+type PatchLanguage struct {
+	Enabled bool `yaml:"enabled"`
+}
+
+// PatchCoverage is the opt-out surface for the patch-coverage gate, per
+// language. Patch coverage has no threshold of its own — it always gates
+// against that language's existing aggregate baseline (patch% >= baseline%).
+type PatchCoverage struct {
+	Rust       PatchLanguage `yaml:"rust"`
+	TypeScript PatchLanguage `yaml:"typescript"`
+	Go         PatchLanguage `yaml:"go"`
+}
+
+// Coverage is the opt-out/override surface for coverage gating.
+type Coverage struct {
+	Patch PatchCoverage `yaml:"patch"`
+}
+
 // Config is bulwark's full, resolved configuration for one scan.
 type Config struct {
 	Rust       Language `yaml:"rust"`
 	TypeScript Language `yaml:"typescript"`
 	Go         Language `yaml:"go"`
 	Semgrep    Semgrep  `yaml:"semgrep"`
+	Coverage   Coverage `yaml:"coverage"`
 }
 
 // Default returns bulwark's zero-config behavior: every language and Semgrep
-// enabled, no excludes, Semgrep's ruleset set to "auto".
+// enabled, no excludes, Semgrep's ruleset set to "auto", every language's
+// patch-coverage gate enabled.
 func Default() Config {
 	return Config{
 		Rust:       Language{Enabled: true},
 		TypeScript: Language{Enabled: true},
 		Go:         Language{Enabled: true},
 		Semgrep:    Semgrep{Enabled: true, Config: "auto"},
+		Coverage: Coverage{
+			Patch: PatchCoverage{
+				Rust:       PatchLanguage{Enabled: true},
+				TypeScript: PatchLanguage{Enabled: true},
+				Go:         PatchLanguage{Enabled: true},
+			},
+		},
 	}
 }
 

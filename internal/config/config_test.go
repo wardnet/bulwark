@@ -68,6 +68,32 @@ func TestLoadSemgrepConfigOverride(t *testing.T) {
 	}
 }
 
+func TestLoadPatchCoverageDefaultsEnabled(t *testing.T) {
+	got, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !got.Coverage.Patch.Go.Enabled || !got.Coverage.Patch.Rust.Enabled || !got.Coverage.Patch.TypeScript.Enabled {
+		t.Fatalf("patch coverage must default to enabled for every language: %+v", got.Coverage)
+	}
+}
+
+func TestLoadPatchCoverageOptOut(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "coverage:\n  patch:\n    go:\n      enabled: false\n")
+
+	got, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Coverage.Patch.Go.Enabled {
+		t.Fatal("coverage.patch.go.enabled: false in the file did not disable Go patch coverage")
+	}
+	if !got.Coverage.Patch.Rust.Enabled || !got.Coverage.Patch.TypeScript.Enabled {
+		t.Fatalf("disabling go patch coverage incorrectly disabled another language: %+v", got.Coverage)
+	}
+}
+
 func TestLoadInvalidYAML(t *testing.T) {
 	dir := t.TempDir()
 	write(t, dir, "rust: [this is not a mapping\n")

@@ -33,6 +33,11 @@ inputs:
   rust-report:
     description: path (relative to dir) to an existing cargo-llvm-cov JSON export; only used with tests-mode=skip
     default: ""
+  rust-lcov-report:
+    description: >
+      path (relative to dir) to an existing cargo-llvm-cov lcov export, used for Rust patch
+      coverage; only used with tests-mode=skip
+    default: ""
   semgrep-app-token:
     description: >
       Semgrep AppSec Platform token. When set, bulwark's Semgrep check runs `semgrep ci` instead
@@ -92,11 +97,13 @@ runs:
         TESTS_MODE: ${{ inputs.tests-mode }}
         GO_REPORT: ${{ inputs.go-report }}
         RUST_REPORT: ${{ inputs.rust-report }}
+        RUST_LCOV_REPORT: ${{ inputs.rust-lcov-report }}
       run: |
         set +e
         args=(coverage --dir "$DIR" --tests="$TESTS_MODE")
         if [[ -n "$GO_REPORT" ]]; then args+=(--go-report "$GO_REPORT"); fi
         if [[ -n "$RUST_REPORT" ]]; then args+=(--rust-report "$RUST_REPORT"); fi
+        if [[ -n "$RUST_LCOV_REPORT" ]]; then args+=(--rust-lcov-report "$RUST_LCOV_REPORT"); fi
         bulwark "${args[@]}" 2>&1 | tee "${RUNNER_TEMP}/bulwark-coverage-output.txt"
         echo "exit-code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 

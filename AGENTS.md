@@ -151,6 +151,64 @@ no CI-produced report sitting in it, so there's nothing to skip to. This only co
 once per main commit (cached afterward on `bulwark-state`), not once per PR, so it doesn't reintroduce
 the duplication `--tests=skip` exists to avoid.
 
+### Patch coverage
+
+Aggregate coverage and patch coverage catch disjoint regression classes: aggregate catches
+coverage lost in code the current PR never touches (e.g. a deleted test file — none of those lines
+are in the diff, so aggregate is the only gate that notices); patch coverage catches untested new
+code even when the codebase is big enough that it doesn't move the aggregate percentage. Neither
+bounds the other, so `bulwark coverage` computes and gates on both, not either/or — patch coverage
+is a second, independent check alongside `diffReport`'s existing aggregate gate, not a replacement.
+
+Patch coverage has **no baseline or threshold of its own** — it always gates against that same
+language's aggregate baseline already read from `bulwark-state` (`patch% >= baseline%`). A language
+with no aggregate baseline yet is reported informationally (`[NEW]`), not failed, mirroring
+aggregate's own handling of a first-time-seen language. It's opt-out, not opt-in, per language, via
+`.bulwark.yml`:
+
+```yaml
+coverage:
+  patch:
+    go:
+      enabled: false   # defaults to true
+```
+
+Changed lines come from a hand-rolled unified-diff hunk parser (`internal/coverage.ChangedLines`,
+`git diff --unified=0 <merge-base>..HEAD`) — deliberately not a diff library, since the format
+needed is a small, stable subset (hunk headers + `+` lines). `mergeBase` is the exact same SHA
+`gitstate.BaseSHA` already resolved for the aggregate baseline lookup, reused as-is rather than
+recomputed. The parser does no language-aware filtering of comments/blank lines/imports — that
+happens for free later, when changed lines are intersected with a coverage report's line-hit data
+(`internal/coverage.PatchPercent`), since non-executable lines never appear in a coverage report to
+begin with.
+
+Per-ecosystem line-hit sources, all converging on the same `LineHits` (`map[file]map[line]hits`)
+shape:
+
+- **Go**: `internal/coverage.ParseGoProfile` reads the same `coverage.out` profile
+  `go tool cover -func` already parses for the aggregate percentage — no separate format, no second
+  `go test` run. `Compute`'s returned `PatchSources.GoProfile` is that resolved path, kept alive
+  until the caller's `cleanup()` runs.
+- **Rust**: `cargo llvm-cov` doesn't emit per-line data in its `--json` export, so patch coverage
+  additionally produces an `--lcov` report. Under `--tests=run`, this doesn't cost a second test
+  execution: `cargo llvm-cov --no-report` runs the suite once and keeps raw profile data on disk,
+  then both `--no-run --json` (aggregate, unchanged) and `--no-run --lcov` (patch, new) regenerate
+  their reports from that same profile. Under `--tests=skip`, the lcov file is just another
+  `findReport` lookup — an explicit `--rust-lcov-report` override, else a candidate list
+  (`coverage/lcov.info`, `lcov.info`, `target/llvm-cov/lcov.info`), mirroring `--rust-report`
+  exactly; a missing file means Rust patch coverage is silently omitted, not a failure.
+- **TypeScript**: reads `<pkgDir>/coverage/lcov.info` (Istanbul/Vitest's native lcov output) — fixed
+  convention, no override flag, matching the existing no-override precedent for TS aggregate
+  coverage. This only works if the consumer's own test config already has an `lcov` reporter
+  enabled; otherwise it's silently omitted, the same best-effort caveat AGENTS.md already documents
+  for TS aggregate coverage.
+
+`cmd/bulwark/coverage.go`'s `patchReport` prints one bracketed status line per language using the
+same `[PASS]/[FAIL]/[NEW]` vocabulary the aggregate gate already uses (e.g.
+`[FAIL]    go patch: 0.0% (0/9 new lines; baseline 55.68%)`) — this needs no changes to
+`action.yml`'s PR-comment builder, since its `cov_detail` regex is generic and already picks up any
+matching bracketed line.
+
 ## The `action.yml` composite action
 
 Unlike `inforge`'s action (install-only — its invocations vary too much per call site to bake in),
