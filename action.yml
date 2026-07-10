@@ -117,26 +117,62 @@ runs:
         SCAN_EXIT_CODE: ${{ steps.scan.outputs.exit-code }}
         COVERAGE_EXIT_CODE: ${{ steps.coverage.outputs.exit-code }}
       run: |
+        set +e
         summary="${RUNNER_TEMP}/bulwark-pr-summary.md"
+        scan_out="${RUNNER_TEMP}/bulwark-scan-output.txt"
+        coverage_out="${RUNNER_TEMP}/bulwark-coverage-output.txt"
+
+        # Best-effort finding counts scraped from each scanner's own summary
+        # output, for a one-line PR comment header — informational only, the
+        # actual pass/fail gate is each command's exit code, not these counts.
+        gosec_count() { grep -oE 'Issues[[:space:]]*:[[:space:]]*[0-9]+' "$1" | grep -oE '[0-9]+' | tail -1; }
+        govulncheck_count() { grep -c '^Vulnerability #' "$1"; }
+        semgrep_count() { grep -oE '[0-9]+ findings\.' "$1" | tail -1 | grep -oE '[0-9]+'; }
+
         {
           echo "## bulwark"
           echo
+
           if [[ "$RUN_SCAN" == "true" ]]; then
-            scan_status="✅ passed"
-            [[ "$SCAN_EXIT_CODE" != "0" ]] && scan_status="❌ failed"
-            echo "### scan — ${scan_status}"
+            if [[ "$SCAN_EXIT_CODE" == "0" ]]; then
+              echo "- ✅ **scan** — no findings"
+            else
+              parts=()
+              n=$(gosec_count "$scan_out"); [[ -n "$n" && "$n" != "0" ]] && parts+=("${n} gosec")
+              n=$(govulncheck_count "$scan_out"); [[ -n "$n" && "$n" != "0" ]] && parts+=("${n} govulncheck")
+              n=$(semgrep_count "$scan_out"); [[ -n "$n" && "$n" != "0" ]] && parts+=("${n} semgrep")
+              if [[ "${#parts[@]}" -gt 0 ]]; then
+                detail=$(IFS=,; echo "${parts[*]}" | sed 's/,/, /g')
+                echo "- ❌ **scan** — ${detail} findings"
+              else
+                echo "- ❌ **scan** — failed, see details below"
+              fi
+            fi
+            echo
+            echo "<details><summary>full output</summary>"
+            echo
             echo '```'
-            cat "${RUNNER_TEMP}/bulwark-scan-output.txt"
+            cat "$scan_out"
             echo '```'
             echo
+            echo "</details>"
+            echo
           fi
+
           if [[ "$RUN_COVERAGE" == "true" ]]; then
-            cov_status="✅ passed"
-            [[ "$COVERAGE_EXIT_CODE" != "0" ]] && cov_status="❌ failed"
-            echo "### coverage — ${cov_status}"
+            cov_icon="✅"
+            [[ "$COVERAGE_EXIT_CODE" != "0" ]] && cov_icon="❌"
+            cov_detail=$(grep -E '^\[(PASS|FAIL|NEW|DROPPED)\]' "$coverage_out" | sed -E 's/^\[[A-Z]+\][[:space:]]+//' | paste -sd ';' - | sed 's/;/; /g')
+            [[ -z "$cov_detail" ]] && cov_detail="failed, see details below"
+            echo "- ${cov_icon} **coverage** — ${cov_detail}"
+            echo
+            echo "<details><summary>full output</summary>"
+            echo
             echo '```'
-            cat "${RUNNER_TEMP}/bulwark-coverage-output.txt"
+            cat "$coverage_out"
             echo '```'
+            echo
+            echo "</details>"
           fi
         } > "${summary}"
         echo "summary-path=${summary}" >> "$GITHUB_OUTPUT"
