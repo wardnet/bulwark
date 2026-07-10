@@ -84,13 +84,32 @@ See [AGENTS.md](AGENTS.md#configuration) for the full schema and merge semantics
 
 ## GitHub Actions
 
+The action installs bulwark, runs `scan`/`coverage`, posts a single sticky PR comment summarizing
+both, and optionally reports to the Semgrep AppSec Platform and/or Codecov:
+
 ```yaml
-- uses: wardnet/bulwark@v1
-- run: bulwark scan --dir .
+permissions:
+  contents: write       # bulwark coverage caches baselines on the bulwark-state branch
+  pull-requests: write  # for the PR summary comment
+steps:
+  - uses: actions/checkout@v7
+    with:
+      fetch-depth: 0    # bulwark coverage needs full history to resolve the PR's base commit
+  - uses: wardnet/bulwark@v1
+    with:
+      semgrep-app-token: ${{ secrets.SEMGREP_APP_TOKEN }}  # optional — omit to keep Semgrep local-only
+      codecov-token: ${{ secrets.CODECOV_TOKEN }}          # optional — omit to skip the Codecov upload
 ```
 
+Both `scan` and `coverage` can be turned off independently (`run-scan: false` / `run-coverage:
+false`) if a repo only wants one of them, or isn't ready to grant `contents: write` yet. See
+`action.yml`'s own input descriptions for the full list (`dir`, `tests-mode`, `go-report`,
+`rust-report`, `github-token`).
+
 (No release has been cut yet, so `@v1` doesn't resolve to anything until the first `v1.x.y` tag is
-pushed and the floating `v1` alias is moved to it — see the `bump-version` skill for that process.)
+pushed and the floating `v1` alias is moved to it — see the `bump-version` skill for that process.
+The action also can't be exercised end-to-end in bulwark's own CI until then, since its first step
+downloads whatever's the *latest released* binary.)
 
 ## Contributing
 

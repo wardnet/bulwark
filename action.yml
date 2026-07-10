@@ -1,10 +1,53 @@
-name: Install bulwark
-description: Download and install the bulwark binary
+name: bulwark
+description: Install bulwark, run scan/coverage, post a PR summary, and report to Semgrep AppSec Platform / Codecov
 
 inputs:
   version:
     description: bulwark version to install (omit or set to "latest" for the latest release)
     default: latest
+  dir:
+    description: directory to scan (passed to bulwark's --dir)
+    default: "."
+  run-scan:
+    description: run `bulwark scan`
+    default: "true"
+  run-coverage:
+    description: >
+      run `bulwark coverage`. Requires the calling workflow's checkout step to use
+      `fetch-depth: 0` (bulwark needs full history to resolve the PR's base commit and to check
+      out historical commits for baseline computation), and `contents: write` permission to cache
+      baselines on the bulwark-state branch — a failure to cache is non-fatal (best-effort), but a
+      failure to even diff coverage is not.
+    default: "true"
+  tests-mode:
+    description: >
+      passed through to `bulwark coverage --tests=`. "run" (default) has bulwark execute each
+      ecosystem's test suite itself — the right choice if this action is the only place tests run.
+      "skip" only parses a report an earlier step in the same job already produced (see go-report/
+      rust-report below) — use this if a separate test step already runs with coverage
+      instrumentation on, so tests aren't executed a second time.
+    default: run
+  go-report:
+    description: path (relative to dir) to an existing Go coverage profile; only used with tests-mode=skip
+    default: ""
+  rust-report:
+    description: path (relative to dir) to an existing cargo-llvm-cov JSON export; only used with tests-mode=skip
+    default: ""
+  semgrep-app-token:
+    description: >
+      Semgrep AppSec Platform token. When set, bulwark's Semgrep check runs `semgrep ci` instead
+      of `semgrep scan` — Semgrep's own diff-aware CI mode, which also uploads results to the
+      platform dashboard. Omit to keep Semgrep local-only (today's default behavior).
+    required: false
+  codecov-token:
+    description: >
+      Codecov upload token. When set, uploads whatever coverage report(s) bulwark found/produced
+      to Codecov for its dashboard/history/PR-comment — non-blocking, purely informational; the
+      actual pass/fail coverage gate is bulwark coverage itself, not Codecov.
+    required: false
+  github-token:
+    description: token used to post/update the PR summary comment (needs pull-requests:write)
+    default: ${{ github.token }}
 
 runs:
   using: composite
@@ -27,3 +70,88 @@ runs:
         curl -fsSL -o "${RUNNER_TEMP}/bulwark-install.sh" https://github.com/wardnet/bulwark/releases/latest/download/install.sh
         sh "${RUNNER_TEMP}/bulwark-install.sh"
         echo "${BULWARK_INSTALL_DIR}" >> "$GITHUB_PATH"
+
+    - name: bulwark scan
+      if: inputs.run-scan == 'true'
+      id: scan
+      shell: bash
+      env:
+        SEMGREP_APP_TOKEN: ${{ inputs.semgrep-app-token }}
+        DIR: ${{ inputs.dir }}
+      run: |
+        set +e
+        bulwark scan --dir "$DIR" 2>&1 | tee "${RUNNER_TEMP}/bulwark-scan-output.txt"
+        echo "exit-code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+    - name: bulwark coverage
+      if: inputs.run-coverage == 'true'
+      id: coverage
+      shell: bash
+      env:
+        DIR: ${{ inputs.dir }}
+        TESTS_MODE: ${{ inputs.tests-mode }}
+        GO_REPORT: ${{ inputs.go-report }}
+        RUST_REPORT: ${{ inputs.rust-report }}
+      run: |
+        set +e
+        args=(coverage --dir "$DIR" --tests="$TESTS_MODE")
+        if [[ -n "$GO_REPORT" ]]; then args+=(--go-report "$GO_REPORT"); fi
+        if [[ -n "$RUST_REPORT" ]]; then args+=(--rust-report "$RUST_REPORT"); fi
+        bulwark "${args[@]}" 2>&1 | tee "${RUNNER_TEMP}/bulwark-coverage-output.txt"
+        echo "exit-code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+    - name: Upload coverage to Codecov
+      if: inputs.run-coverage == 'true' && inputs.codecov-token != ''
+      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+      with:
+        token: ${{ inputs.codecov-token }}
+        fail_ci_if_error: false
+
+    - name: Build PR summary
+      if: github.event_name == 'pull_request' && (inputs.run-scan == 'true' || inputs.run-coverage == 'true')
+      id: summary
+      shell: bash
+      env:
+        RUN_SCAN: ${{ inputs.run-scan }}
+        RUN_COVERAGE: ${{ inputs.run-coverage }}
+        SCAN_EXIT_CODE: ${{ steps.scan.outputs.exit-code }}
+        COVERAGE_EXIT_CODE: ${{ steps.coverage.outputs.exit-code }}
+      run: |
+        summary="${RUNNER_TEMP}/bulwark-pr-summary.md"
+        {
+          echo "## bulwark"
+          echo
+          if [[ "$RUN_SCAN" == "true" ]]; then
+            scan_status="✅ passed"
+            [[ "$SCAN_EXIT_CODE" != "0" ]] && scan_status="❌ failed"
+            echo "### scan — ${scan_status}"
+            echo '```'
+            cat "${RUNNER_TEMP}/bulwark-scan-output.txt"
+            echo '```'
+            echo
+          fi
+          if [[ "$RUN_COVERAGE" == "true" ]]; then
+            cov_status="✅ passed"
+            [[ "$COVERAGE_EXIT_CODE" != "0" ]] && cov_status="❌ failed"
+            echo "### coverage — ${cov_status}"
+            echo '```'
+            cat "${RUNNER_TEMP}/bulwark-coverage-output.txt"
+            echo '```'
+          fi
+        } > "${summary}"
+        echo "summary-path=${summary}" >> "$GITHUB_OUTPUT"
+
+    - name: Post PR summary
+      if: github.event_name == 'pull_request' && (inputs.run-scan == 'true' || inputs.run-coverage == 'true')
+      uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
+      with:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        header: bulwark
+        path: ${{ steps.summary.outputs.summary-path }}
+
+    - name: Fail if any check failed
+      if: (inputs.run-scan == 'true' && steps.scan.outputs.exit-code != '0') || (inputs.run-coverage == 'true' && steps.coverage.outputs.exit-code != '0')
+      shell: bash
+      run: |
+        echo "bulwark scan or coverage failed — see the steps above for details." >&2
+        exit 1

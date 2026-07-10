@@ -35,7 +35,7 @@ internal/executil/              # shared external-command runner every scanner p
 .golangci.yml                   # lint config (v2 schema)
 .github/workflows/{ci,release}.yml
 .github/dependabot.yml
-action.yml                      # composite action: install the released binary
+action.yml                      # composite action: install + scan + coverage + PR comment + report
 scripts/install.sh              # curl|sh installer shipped with every release
 ```
 
@@ -150,6 +150,26 @@ One exception: computing a **baseline** at a historical main SHA (a cache miss) 
 no CI-produced report sitting in it, so there's nothing to skip to. This only costs a real test run
 once per main commit (cached afterward on `bulwark-state`), not once per PR, so it doesn't reintroduce
 the duplication `--tests=skip` exists to avoid.
+
+## The `action.yml` composite action
+
+Unlike `inforge`'s action (install-only — its invocations vary too much per call site to bake in),
+bulwark's usage is uniform enough (`.bulwark.yml` already carries all the config) that the action
+owns the whole install → run → report flow: install bulwark, run `scan`/`coverage` (each toggleable
+independently via `run-scan`/`run-coverage`), post one sticky PR comment summarizing both (upsert,
+not a fresh comment every run — via `marocchino/sticky-pull-request-comment`), and optionally
+upload to Codecov (non-blocking, purely for its dashboard/history) and/or switch bulwark's own
+Semgrep check into `semgrep ci` mode (diff-aware + uploads to the Semgrep AppSec Platform) when a
+`SEMGREP_APP_TOKEN`-equivalent input is supplied.
+
+**Never interpolate `${{ inputs.* }}` or `${{ steps.*.outputs.* }}` directly into a `run:` script
+body** — pass it via that step's `env:` block instead, and reference the env var name (`"$DIR"`,
+not `"${{ inputs.dir }}"`) inside the script. Semgrep's own `yaml.github-actions.security.run-shell-injection`
+rule caught this exact mistake once already (see git history) — expression interpolation directly
+into a shell script is a real script-injection vector if the interpolated value could ever contain
+shell metacharacters, regardless of how trusted the input value looks today. `if:` conditions and
+`with:` blocks on a `uses:` step are fine to interpolate directly — only `run:` script bodies are
+the risk, since that's the only place text gets spliced into something a shell then executes.
 
 ## Conventions
 
