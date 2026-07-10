@@ -28,6 +28,8 @@ internal/rust/                  # clippy, cargo-audit, cargo-deny
 internal/typescript/            # self-contained pinned ESLint + eslint-plugin-security
 internal/golang/                # gosec, govulncheck (installed into a version-keyed GOBIN dir)
 internal/semgrep/                # pinned Semgrep, installed via pipx
+internal/coverage/               # per-language coverage percentage (see Coverage below)
+internal/gitstate/               # bulwark-state branch read/write (see Coverage below)
 internal/executil/              # shared external-command runner every scanner package uses
 .goreleaser.yml                 # build/release config (v2 schema)
 .golangci.yml                   # lint config (v2 schema)
@@ -44,14 +46,31 @@ scripts/install.sh              # curl|sh installer shipped with every release
 
 ## Status
 
-`bulwark scan` is implemented for Rust, TypeScript, and Go, plus Semgrep — every check is a real
-tool invocation (not a stub), verified end-to-end against this repo itself. Every scanner pins its
-own tool version and installs it into a bulwark-managed cache directory rather than trusting
-whatever's already on the machine (see each `internal/<lang>` package's doc comment for why).
-`version` and `update` are fully implemented and tested, following the same pattern as `inforge`'s
+All four subcommands (`scan`, `coverage`, `version`, `update`) are fully implemented — every check
+is a real tool invocation (not a stub). Every scanner pins its own tool version and installs it into
+a bulwark-managed cache directory rather than trusting whatever's already on the machine (see each
+`internal/<lang>` package's doc comment for why). `update` follows the same pattern as `inforge`'s
 self-update (checksum-verified binary replacement, refuses on dev builds, passive update nudge on
-every other command). `bulwark coverage` is fully implemented too — see Coverage below — verified
-end-to-end against this repo's own real `bulwark-state` branch on GitHub (not just a local fixture).
+every other command). `bulwark coverage` has been verified end-to-end against this repo's own real
+`bulwark-state` branch on GitHub, not just a local fixture.
+
+## CI
+
+`.github/workflows/ci.yml` runs three jobs on every push/PR to `main`: `lint` (golangci-lint),
+`build & test` (`go build`/`go test -race`), and `self-scan` — bulwark builds itself and runs
+`bulwark scan --dir .` against its own repo. `self-scan` is dogfooding, not a formality: it's the
+only job that exercises the actual scan/report path end-to-end against a real repo, and it already
+caught a real bug once (see the git history around the `go-version: "1.26.5"` pin below).
+
+**Pin the exact Go patch version in workflows (`"1.26.5"`), never a bare minor (`"1.26"`).**
+`actions/setup-go`'s `go-version: "1.26"` resolves to whatever `1.26.x` patch it has
+cached/available, which is not necessarily the version this repo's `go.mod` `toolchain` directive
+pins — and critically, `go install`-ing an *external* tool (gosec, govulncheck) does **not** consult
+the current module's `go.mod` toolchain directive the way building the module itself does. This bit
+us for real: `self-scan`'s `govulncheck` step passed locally (toolchain directive respected) but
+failed in CI (setup-go had installed an older, vulnerable patch) until `go-version` was pinned to the
+exact `1.26.5`. If `go.mod`'s `toolchain` line is ever bumped, update every `go-version:` in
+`ci.yml`/`release.yml` to match in the same change.
 
 ## Configuration
 
