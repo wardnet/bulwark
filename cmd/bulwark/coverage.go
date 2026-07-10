@@ -16,23 +16,36 @@ import (
 
 func newCoverageCmd() *cobra.Command {
 	var dir string
+	var testsMode string
+	var goReport string
+	var rustReport string
 	cmd := &cobra.Command{
 		Use:   "coverage",
 		Short: "Diff current coverage against the bulwark-state baseline for the PR's base commit",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
 
+			mode := coverage.Mode(testsMode)
+			if mode != coverage.ModeRun && mode != coverage.ModeSkip {
+				return fmt.Errorf("--tests must be %q or %q, got %q", coverage.ModeRun, coverage.ModeSkip, testsMode)
+			}
+			reports := coverage.ReportPaths{Go: goReport, Rust: rustReport}
+
 			cfg, err := config.Load(dir)
 			if err != nil {
 				return err
 			}
 
-			current, err := coverage.Compute(ctx, dir, cfg)
+			current, err := coverage.Compute(ctx, dir, cfg, mode, reports)
 			if err != nil {
 				return err
 			}
 			if len(current) == 0 {
-				_, err := fmt.Fprintln(cmd.OutOrStdout(), "no coverage measured — no coverage tooling detected/available for any ecosystem")
+				msg := "no coverage measured — no coverage tooling detected/available for any ecosystem"
+				if mode == coverage.ModeSkip {
+					msg += " (--tests=skip only reads an existing report — did an earlier CI step produce one at the expected path?)"
+				}
+				_, err := fmt.Fprintln(cmd.OutOrStdout(), msg)
 				return err
 			}
 
@@ -68,12 +81,27 @@ func newCoverageCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&dir, "dir", ".", "repository root")
+	cmd.Flags().StringVar(&testsMode, "tests", string(coverage.ModeRun),
+		`whether to execute tests ("run", the default — good for local dev) or only parse an
+existing report a prior CI step already produced ("skip" — use in CI once that step already
+runs with coverage instrumentation on, so tests aren't executed a second/third time)`)
+	cmd.Flags().StringVar(&goReport, "go-report", "",
+		"path (relative to --dir) to an existing go coverage profile; only used with --tests=skip. Default: search coverage.out, cover.out, c.out")
+	cmd.Flags().StringVar(&rustReport, "rust-report", "",
+		"path (relative to --dir) to an existing cargo-llvm-cov JSON export; only used with --tests=skip. Default: search coverage/llvm-cov.json, llvm-cov.json, target/llvm-cov/llvm-cov.json")
 	return cmd
 }
 
 // computeBaselineAt checks out origin/main at sha into a throwaway worktree
 // and computes coverage there, so a cache miss doesn't disturb the caller's
-// own working tree/branch.
+// own working tree/branch. This always actually runs tests (coverage.ModeRun),
+// regardless of the top-level --tests flag: a historical commit's checkout
+// has no pre-existing CI-produced report to find — the report itself would
+// have to come from actually running the suite at that commit — so there is
+// no "skip" equivalent for baseline computation. This is a one-time cost per
+// main commit (cached afterward on the bulwark-state branch), not a
+// per-invocation cost, so it doesn't reintroduce the duplicate-test-run
+// problem --tests=skip exists to avoid.
 func computeBaselineAt(ctx context.Context, dir, sha string, cfg config.Config) (map[string]float64, error) {
 	tmp, err := os.MkdirTemp("", "bulwark-baseline-*")
 	if err != nil {
@@ -85,7 +113,7 @@ func computeBaselineAt(ctx context.Context, dir, sha string, cfg config.Config) 
 	if r := executil.Run(ctx, dir, "git", "worktree", "add", "--detach", tmp, sha); !r.Ok() {
 		return nil, fmt.Errorf("worktree add %s at %s: %w", tmp, sha, r.Err)
 	}
-	return coverage.Compute(ctx, tmp, cfg)
+	return coverage.Compute(ctx, tmp, cfg, coverage.ModeRun, coverage.ReportPaths{})
 }
 
 // diffReport prints current vs. baseline per language, covering every

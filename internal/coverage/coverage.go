@@ -16,6 +16,36 @@ import (
 	"wardnet/bulwark/internal/executil"
 )
 
+// Mode controls whether Compute executes tests itself or only parses an
+// already-produced coverage report.
+type Mode string
+
+const (
+	// ModeRun executes each ecosystem's test suite (with coverage
+	// instrumentation) itself. The right default for local dev: one command,
+	// no separate test step to remember to run first.
+	ModeRun Mode = "run"
+	// ModeSkip never executes tests — it only looks for a report file each
+	// ecosystem's coverage tooling would already have produced as part of a
+	// prior, separate test step (e.g. CI's own test job), and parses it. This
+	// mirrors how Codecov/Sonar work: they never run your tests themselves,
+	// only ingest a report your build already produced. Use this in CI so a
+	// test step that already runs with coverage instrumentation on doesn't
+	// get executed a second (or, for repos whose CI already runs a plain
+	// pass/fail test job separately from an instrumented coverage job, a
+	// third) time.
+	ModeSkip Mode = "skip"
+)
+
+// ReportPaths overrides the default report-file search candidates per
+// language, for a repo whose coverage output doesn't land at one of the
+// conventional locations findReport checks. A zero value uses the built-in
+// candidate list for that language. Only meaningful with ModeSkip.
+type ReportPaths struct {
+	Go   string
+	Rust string
+}
+
 // Compute returns a coverage percentage per detected ecosystem under dir.
 // An ecosystem is silently omitted (not an error) when its coverage tooling
 // isn't available or produces no measurable result — coverage tooling is
@@ -28,7 +58,7 @@ import (
 // a Rust-only exclude must never cause a real TypeScript package to be
 // silently dropped from coverage, matching how cmd/bulwark/scan.go scopes
 // excludes per language.
-func Compute(ctx context.Context, dir string, cfg config.Config) (map[string]float64, error) {
+func Compute(ctx context.Context, dir string, cfg config.Config, mode Mode, reports ReportPaths) (map[string]float64, error) {
 	ecosystems, err := detect.Ecosystems(dir, cfg.AllExcludes())
 	if err != nil {
 		return nil, err
@@ -40,11 +70,11 @@ func Compute(ctx context.Context, dir string, cfg config.Config) (map[string]flo
 		var ok bool
 		switch e {
 		case detect.Rust:
-			pct, ok = rustCoverage(ctx, dir)
+			pct, ok = rustCoverage(ctx, dir, mode, reports.Rust)
 		case detect.Go:
-			pct, ok = goCoverage(ctx, dir)
+			pct, ok = goCoverage(ctx, dir, mode, reports.Go)
 		case detect.TypeScript:
-			pct, ok = tsCoverage(ctx, dir, cfg.TypeScript.Exclude)
+			pct, ok = tsCoverage(ctx, dir, cfg.TypeScript.Exclude, mode)
 		}
 		if ok {
 			report[string(e)] = pct
@@ -53,19 +83,57 @@ func Compute(ctx context.Context, dir string, cfg config.Config) (map[string]flo
 	return report, nil
 }
 
-// goCoverage runs `go test -coverprofile` and parses the total percentage
-// from `go tool cover -func`'s summary line.
-func goCoverage(ctx context.Context, dir string) (float64, bool) {
-	tmp, err := os.MkdirTemp("", "bulwark-gocov-*")
-	if err != nil {
-		return 0, false
+// findReport resolves the coverage report file to parse: override if given
+// (relative to dir), otherwise the first of candidates (also relative to
+// dir) that actually exists. Returns false if nothing is found.
+func findReport(dir, override string, candidates []string) (string, bool) {
+	if override != "" {
+		p := filepath.Join(dir, override)
+		if _, err := os.Stat(p); err == nil {
+			return p, true
+		}
+		return "", false
 	}
-	defer func() { _ = os.RemoveAll(tmp) }()
-	profile := filepath.Join(tmp, "cover.out")
+	for _, c := range candidates {
+		p := filepath.Join(dir, c)
+		if _, err := os.Stat(p); err == nil {
+			return p, true
+		}
+	}
+	return "", false
+}
 
-	if r := executil.Run(ctx, dir, "go", "test", "-coverprofile="+profile, "./..."); !r.Ok() {
-		return 0, false
+// goReportCandidates are the conventional relative paths a `go test
+// -coverprofile=...` profile tends to land at when a repo's own CI already
+// produces one.
+var goReportCandidates = []string{"coverage.out", "cover.out", "c.out"}
+
+// goCoverage gets the total percentage from `go tool cover -func`'s summary
+// line, either running `go test -coverprofile` itself (ModeRun) or parsing
+// an existing profile another step already produced (ModeSkip) — either way
+// the profile is fed through the same `go tool cover -func` formatting step,
+// which does not re-run any tests.
+func goCoverage(ctx context.Context, dir string, mode Mode, reportPath string) (float64, bool) {
+	var profile string
+	switch mode {
+	case ModeSkip:
+		found, ok := findReport(dir, reportPath, goReportCandidates)
+		if !ok {
+			return 0, false
+		}
+		profile = found
+	default:
+		tmp, err := os.MkdirTemp("", "bulwark-gocov-*")
+		if err != nil {
+			return 0, false
+		}
+		defer func() { _ = os.RemoveAll(tmp) }()
+		profile = filepath.Join(tmp, "cover.out")
+		if r := executil.Run(ctx, dir, "go", "test", "-coverprofile="+profile, "./..."); !r.Ok() {
+			return 0, false
+		}
 	}
+
 	r := executil.Run(ctx, dir, "go", "tool", "cover", "-func="+profile)
 	if !r.Ok() {
 		return 0, false
@@ -108,21 +176,42 @@ type llvmCovExport struct {
 	} `json:"data"`
 }
 
-// rustCoverage runs cargo-llvm-cov's JSON summary and reads the workspace's
-// total line coverage percentage. Requires cargo-llvm-cov to already be
-// installed (a cargo subcommand, like cargo-audit/cargo-deny — not something
-// bulwark auto-installs, since it isn't a plain go-installable/npm-installable
-// tool bulwark can pin the same way).
-func rustCoverage(ctx context.Context, dir string) (float64, bool) {
-	if !executil.Available("cargo-llvm-cov") {
-		return 0, false
+// rustReportCandidates are the conventional relative paths bulwark checks for
+// an existing cargo-llvm-cov JSON export another step already produced.
+var rustReportCandidates = []string{"coverage/llvm-cov.json", "llvm-cov.json", "target/llvm-cov/llvm-cov.json"}
+
+// rustCoverage reads the workspace's total line coverage percentage from a
+// cargo-llvm-cov JSON export, either running `cargo llvm-cov` itself
+// (ModeRun — requires cargo-llvm-cov already installed, a cargo subcommand
+// like cargo-audit/cargo-deny that bulwark doesn't auto-install) or parsing
+// an existing export another step already produced (ModeSkip — needs no
+// tool installed at all, since nothing is executed).
+func rustCoverage(ctx context.Context, dir string, mode Mode, reportPath string) (float64, bool) {
+	var data []byte
+	switch mode {
+	case ModeSkip:
+		found, ok := findReport(dir, reportPath, rustReportCandidates)
+		if !ok {
+			return 0, false
+		}
+		d, err := os.ReadFile(found) // #nosec G304 -- found is resolved from bulwark's own candidate list or an explicit CLI flag, not user input
+		if err != nil {
+			return 0, false
+		}
+		data = d
+	default:
+		if !executil.Available("cargo-llvm-cov") {
+			return 0, false
+		}
+		r := executil.Run(ctx, dir, "cargo", "llvm-cov", "--summary-only", "--json")
+		if !r.Ok() {
+			return 0, false
+		}
+		data = []byte(r.Output)
 	}
-	r := executil.Run(ctx, dir, "cargo", "llvm-cov", "--summary-only", "--json")
-	if !r.Ok() {
-		return 0, false
-	}
+
 	var export llvmCovExport
-	if err := json.Unmarshal([]byte(r.Output), &export); err != nil || len(export.Data) == 0 {
+	if err := json.Unmarshal(data, &export); err != nil || len(export.Data) == 0 {
 		return 0, false
 	}
 	return export.Data[0].Totals.Lines.Percent, true
@@ -138,10 +227,14 @@ type istanbulSummary struct {
 	} `json:"total"`
 }
 
-// tsCoverage looks for a "test:coverage" script in each detected package and,
-// if present, runs it and reads Vitest/Istanbul's coverage-summary.json.
-// Packages without that script are skipped, not failed.
-func tsCoverage(ctx context.Context, dir string, exclude []string) (float64, bool) {
+// tsCoverage looks for Vitest/Istanbul's coverage-summary.json in each
+// detected package (the tool's own standard output location — unlike Go/Rust
+// there's no bulwark-configurable override, since this path is already the
+// de facto convention, not something projects vary). In ModeRun it first
+// runs the package's own "test:coverage" script (skipping packages that
+// don't declare one) to produce that file; in ModeSkip it only reads a file
+// a prior step already produced, running nothing.
+func tsCoverage(ctx context.Context, dir string, exclude []string, mode Mode) (float64, bool) {
 	pkgDirs, err := detect.TSPackageDirs(dir, exclude)
 	if err != nil || len(pkgDirs) == 0 {
 		return 0, false
@@ -149,11 +242,13 @@ func tsCoverage(ctx context.Context, dir string, exclude []string) (float64, boo
 
 	var total, count float64
 	for _, pkgDir := range pkgDirs {
-		if !hasCoverageScript(pkgDir) {
-			continue
-		}
-		if r := executil.Run(ctx, pkgDir, "npm", "run", "test:coverage"); !r.Ok() {
-			continue
+		if mode == ModeRun {
+			if !hasCoverageScript(pkgDir) {
+				continue
+			}
+			if r := executil.Run(ctx, pkgDir, "npm", "run", "test:coverage"); !r.Ok() {
+				continue
+			}
 		}
 		summaryPath := filepath.Join(pkgDir, "coverage", "coverage-summary.json")
 		data, err := os.ReadFile(summaryPath) // #nosec G304 -- summaryPath is a fixed relative path under a detected package dir, not user input

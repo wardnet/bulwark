@@ -95,14 +95,42 @@ generated cache data, not source, needs no PR/review and never pollutes main's h
   another concurrent cache-miss is non-fatal: caching is an optimization, the caller already has its
   computed value regardless.
 - `internal/coverage.Compute` gets the actual number per detected ecosystem: `go tool cover -func`'s
-  total line for Go, `cargo llvm-cov --json`'s `data[0].totals.lines.percent` for Rust (requires
-  `cargo-llvm-cov` already installed — a cargo subcommand, not something bulwark auto-installs the
-  way it does gosec/govulncheck/ESLint), and — for TypeScript, best-effort only — a package's own
-  `test:coverage` script plus Vitest/Istanbul's `coverage-summary.json`, since unlike a linter there's
-  no single canonical coverage-invocation convention to standardize on across arbitrary TS packages.
-  A language whose coverage can't be measured is silently omitted from the report, not failed.
+  total line for Go, `cargo llvm-cov --json`'s `data[0].totals.lines.percent` for Rust, and — for
+  TypeScript, best-effort only — a package's own `test:coverage` script plus Vitest/Istanbul's
+  `coverage-summary.json`, since unlike a linter there's no single canonical coverage-invocation
+  convention to standardize on across arbitrary TS packages. A language whose coverage can't be
+  measured is silently omitted from the report, not failed.
 - A language with no prior baseline entry (new) is reported but doesn't fail the check on its own;
-  a language whose current coverage is below its baseline does.
+  a language whose current coverage is below its baseline does; a language dropped from the current
+  run (baseline had it, current doesn't) is reported as `[DROPPED]` and also doesn't fail on its own.
+
+### `--tests=run` vs `--tests=skip`
+
+Unlike Codecov or Sonar — which never execute your tests, only ingest a coverage report your build
+already produced — `bulwark coverage`'s default (`--tests=run`) actually runs each ecosystem's test
+suite itself (`go test -coverprofile`, `cargo llvm-cov`, a package's `test:coverage` script). That's
+the right default for local dev (one command, no separate step to remember), but it's wrong for CI
+if a test job already runs with coverage instrumentation on — running tests again would duplicate
+work that may already be expensive (wardnet/wardnet-cloud's existing pipelines already run tests
+twice: once plain for pass/fail, once instrumented for coverage; `bulwark coverage` piling on a third
+run would make it worse, not better).
+
+`--tests=skip` fixes this: it never executes anything, only looks for a report file a prior step
+already produced — `internal/coverage.findReport` checks an explicit `--go-report`/`--rust-report`
+override first, then a built-in candidate list (`coverage.out`/`cover.out`/`c.out` for Go;
+`coverage/llvm-cov.json`/`llvm-cov.json`/`target/llvm-cov/llvm-cov.json` for Rust — TypeScript has
+no override, since `coverage/coverage-summary.json` is already Istanbul's own fixed convention, not
+something projects vary). In CI, the intended shape is: the existing test job already produces
+coverage as a side effect of running tests once (e.g. `cargo llvm-cov nextest` *as* the test runner,
+not a second pass after a plain `cargo test`), and `bulwark coverage --tests=skip` runs afterward as
+a pure report-consumer.
+
+One exception: computing a **baseline** at a historical main SHA (a cache miss) always uses
+`--tests=run` internally (`cmd/bulwark/coverage.go`'s `computeBaselineAt` hardcodes
+`coverage.ModeRun`), regardless of the top-level flag — a historical commit's throwaway checkout has
+no CI-produced report sitting in it, so there's nothing to skip to. This only costs a real test run
+once per main commit (cached afterward on `bulwark-state`), not once per PR, so it doesn't reintroduce
+the duplication `--tests=skip` exists to avoid.
 
 ## Conventions
 
