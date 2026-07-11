@@ -46,9 +46,10 @@ inputs:
     required: false
   codecov-token:
     description: >
-      Codecov upload token. When set, uploads whatever coverage report(s) bulwark found/produced
-      to Codecov for its dashboard/history/PR-comment — non-blocking, purely informational; the
-      actual pass/fail coverage gate is bulwark coverage itself, not Codecov.
+      Codecov upload token. When set, uploads whatever coverage report(s) and JUnit test-result
+      file(s) bulwark found/produced to Codecov for its dashboard/history/PR-comment —
+      non-blocking, purely informational; the actual pass/fail coverage gate is bulwark coverage
+      itself, not Codecov.
     required: false
   github-token:
     description: token used to post/update the PR summary comment (needs pull-requests:write)
@@ -112,6 +113,15 @@ runs:
       uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
       with:
         token: ${{ inputs.codecov-token }}
+        report_type: coverage
+        fail_ci_if_error: false
+
+    - name: Upload test results to Codecov
+      if: inputs.run-coverage == 'true' && inputs.codecov-token != ''
+      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+      with:
+        token: ${{ inputs.codecov-token }}
+        report_type: test_results
         fail_ci_if_error: false
 
     - name: Build PR summary

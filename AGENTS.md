@@ -246,7 +246,13 @@ independently via `run-scan`/`run-coverage`), post one sticky PR comment summari
 not a fresh comment every run — via `marocchino/sticky-pull-request-comment`), and optionally
 upload to Codecov (non-blocking, purely for its dashboard/history) and/or switch bulwark's own
 Semgrep check into `semgrep ci` mode (diff-aware + uploads to the Semgrep AppSec Platform) when a
-`SEMGREP_APP_TOKEN`-equivalent input is supplied.
+`SEMGREP_APP_TOKEN`-equivalent input is supplied. The Codecov upload is two `codecov/codecov-action`
+invocations sharing the same `codecov-token` gate — one `report_type: coverage`, one
+`report_type: test_results` — both relying entirely on that action's own recursive workspace
+auto-discovery rather than bulwark passing explicit `files:`/`directory:` paths itself. This is
+why a consumer's CI only needs to hand bulwark a token: bulwark owns the whole Codecov
+relationship (coverage *and* JUnit test-results), so the calling workflow never has to install a
+Codecov CLI or push to Codecov directly itself.
 
 **Never interpolate `${{ inputs.* }}` or `${{ steps.*.outputs.* }}` directly into a `run:` script
 body** — pass it via that step's `env:` block instead, and reference the env var name (`"$DIR"`,
