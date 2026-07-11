@@ -43,7 +43,11 @@ func newScanCmd() *cobra.Command {
 					if !cfg.Rust.Enabled {
 						continue
 					}
-					results = append(results, rust.Check(ctx, dir)...)
+					rustResults, err := rust.Check(ctx, dir, cfg.Rust.Exclude)
+					if err != nil {
+						return err
+					}
+					results = append(results, rustResults...)
 				case detect.TypeScript:
 					if !cfg.TypeScript.Enabled {
 						continue

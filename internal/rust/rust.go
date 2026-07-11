@@ -1,4 +1,8 @@
-// Package rust runs Rust checks: fmt, clippy, cargo-audit, cargo-deny.
+// Package rust runs Rust checks: fmt, clippy, cargo-audit, cargo-deny,
+// against every independent Cargo crate/workspace root discovered under a
+// scan directory (see detect.RustCrateDirs) — not assuming the scan
+// directory itself is the crate/workspace root, since a Cargo workspace may
+// be nested under an arbitrary --dir in a polyglot monorepo.
 //
 // clippy's lint groups (pedantic/restriction) are configured by the target
 // project's own Cargo.toml ([workspace.lints.clippy]), not by bulwark — this
@@ -18,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"wardnet/bulwark/internal/detect"
 	"wardnet/bulwark/internal/executil"
 )
 
@@ -28,28 +33,61 @@ const (
 	cargoDenyVersion  = "0.20.2"
 )
 
-// Check runs every Rust check against the Cargo workspace rooted at dir.
-func Check(ctx context.Context, dir string) []executil.Result {
-	results := []executil.Result{
-		named("cargo fmt", executil.Run(ctx, dir, "cargo", "fmt", "--check")),
-		named("cargo clippy", executil.Run(ctx, dir, "cargo", "clippy", "--all-targets", "--", "-D", "warnings")),
+// Check runs every Rust check against every independent Cargo crate/workspace
+// root discovered under root, skipping any directory named in exclude. A
+// nested crate already covered by an ancestor workspace's Cargo.toml is not
+// re-checked independently — see detect.RustCrateDirs.
+func Check(ctx context.Context, root string, exclude []string) ([]executil.Result, error) {
+	crateDirs, err := detect.RustCrateDirs(root, exclude)
+	if err != nil {
+		return nil, err
+	}
+	if len(crateDirs) == 0 {
+		return nil, nil
 	}
 
-	if bin, err := ensure(ctx, "cargo-audit", cargoAuditVersion); err != nil {
-		results = append(results, executil.Result{Name: "cargo-audit", Err: err})
-	} else {
-		results = append(results, named("cargo-audit", executil.Run(ctx, dir, bin, "audit")))
+	multi := len(crateDirs) > 1
+	var results []executil.Result
+	for _, dir := range crateDirs {
+		label := crateLabel(root, dir, multi)
+
+		results = append(results,
+			named(label+"cargo fmt", executil.Run(ctx, dir, "cargo", "fmt", "--check")),
+			named(label+"cargo clippy", executil.Run(ctx, dir, "cargo", "clippy", "--all-targets", "--", "-D", "warnings")),
+		)
+
+		if bin, err := ensure(ctx, "cargo-audit", cargoAuditVersion); err != nil {
+			results = append(results, executil.Result{Name: label + "cargo-audit", Err: err})
+		} else {
+			results = append(results, named(label+"cargo-audit", executil.Run(ctx, dir, bin, "audit")))
+		}
+
+		if bin, err := ensure(ctx, "cargo-deny", cargoDenyVersion); err != nil {
+			results = append(results, executil.Result{Name: label + "cargo-deny", Err: err})
+		} else {
+			// advisories is intentionally excluded here: cargo-audit already
+			// covers RustSec CVEs, and running both would double-report them.
+			results = append(results, named(label+"cargo-deny", executil.Run(ctx, dir, bin, "deny", "check", "licenses", "bans")))
+		}
 	}
 
-	if bin, err := ensure(ctx, "cargo-deny", cargoDenyVersion); err != nil {
-		results = append(results, executil.Result{Name: "cargo-deny", Err: err})
-	} else {
-		// advisories is intentionally excluded here: cargo-audit already
-		// covers RustSec CVEs, and running both would double-report them.
-		results = append(results, named("cargo-deny", executil.Run(ctx, dir, bin, "deny", "check", "licenses", "bans")))
-	}
+	return results, nil
+}
 
-	return results
+// crateLabel returns a prefix distinguishing dir's checks from other crates'
+// when multi is true (more than one crate was discovered), so scan output
+// remains attributable. When multi is false, it returns "" — preserving
+// today's exact single-crate check names ("cargo fmt", "cargo clippy", etc.)
+// for the common case.
+func crateLabel(root, dir string, multi bool) string {
+	if !multi {
+		return ""
+	}
+	rel, err := filepath.Rel(root, dir)
+	if err != nil || rel == "." {
+		return ""
+	}
+	return rel + ": "
 }
 
 // named returns r with Name overridden, so scan's report distinguishes each

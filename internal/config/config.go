@@ -25,6 +25,22 @@ type Language struct {
 	Exclude []string `yaml:"exclude"`
 }
 
+// TypeScriptLanguage extends Language with TS-only coverage install
+// configuration.
+type TypeScriptLanguage struct {
+	Language `yaml:",inline"`
+	// Install overrides coverage's install-command auto-detection (npm ci /
+	// corepack enable && yarn install --immutable / pnpm install
+	// --frozen-lockfile, chosen by the root's lockfile) with an explicit
+	// shell command. Needed for Corepack-pinned or otherwise nonstandard
+	// install flows auto-detection can't infer, or to resolve an ambiguous
+	// multi-lockfile root that auto-detection otherwise skips. Only
+	// consulted by coverage (internal/coverage), never by scan. Unset means:
+	// use auto-detection, falling back to no install step if no single
+	// recognized lockfile is found.
+	Install string `yaml:"install,omitempty"`
+}
+
 // Semgrep is the opt-out/override surface for the Semgrep check.
 type Semgrep struct {
 	Enabled bool   `yaml:"enabled"`
@@ -52,11 +68,11 @@ type Coverage struct {
 
 // Config is bulwark's full, resolved configuration for one scan.
 type Config struct {
-	Rust       Language `yaml:"rust"`
-	TypeScript Language `yaml:"typescript"`
-	Go         Language `yaml:"go"`
-	Semgrep    Semgrep  `yaml:"semgrep"`
-	Coverage   Coverage `yaml:"coverage"`
+	Rust       Language           `yaml:"rust"`
+	TypeScript TypeScriptLanguage `yaml:"typescript"`
+	Go         Language           `yaml:"go"`
+	Semgrep    Semgrep            `yaml:"semgrep"`
+	Coverage   Coverage           `yaml:"coverage"`
 }
 
 // Default returns bulwark's zero-config behavior: every language and Semgrep
@@ -65,7 +81,7 @@ type Config struct {
 func Default() Config {
 	return Config{
 		Rust:       Language{Enabled: true},
-		TypeScript: Language{Enabled: true},
+		TypeScript: TypeScriptLanguage{Language: Language{Enabled: true}},
 		Go:         Language{Enabled: true},
 		Semgrep:    Semgrep{Enabled: true, Config: "auto"},
 		Coverage: Coverage{

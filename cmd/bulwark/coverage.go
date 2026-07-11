@@ -22,8 +22,8 @@ func newCoverageCmd() *cobra.Command {
 	var dir string
 	var testsMode string
 	var goReport string
-	var rustReport string
-	var rustLCOVReport string
+	var rustReport []string
+	var rustLCOVReport []string
 	cmd := &cobra.Command{
 		Use:   "coverage",
 		Short: "Diff current coverage against the bulwark-state baseline for the PR's base commit",
@@ -34,7 +34,11 @@ func newCoverageCmd() *cobra.Command {
 			if mode != coverage.ModeRun && mode != coverage.ModeSkip {
 				return fmt.Errorf("--tests must be %q or %q, got %q", coverage.ModeRun, coverage.ModeSkip, testsMode)
 			}
-			reports := coverage.ReportPaths{Go: goReport, Rust: rustReport, RustLCOV: rustLCOVReport}
+			reports := coverage.ReportPaths{
+				Go:       goReport,
+				Rust:     parseRustReportOverrides(rustReport),
+				RustLCOV: parseRustReportOverrides(rustLCOVReport),
+			}
 
 			cfg, err := config.Load(dir)
 			if err != nil {
@@ -108,11 +112,39 @@ existing report a prior CI step already produced ("skip" — use in CI once that
 runs with coverage instrumentation on, so tests aren't executed a second/third time)`)
 	cmd.Flags().StringVar(&goReport, "go-report", "",
 		"path (relative to --dir) to an existing go coverage profile; only used with --tests=skip. Default: search coverage.out, cover.out, c.out")
-	cmd.Flags().StringVar(&rustReport, "rust-report", "",
-		"path (relative to --dir) to an existing cargo-llvm-cov JSON export; only used with --tests=skip. Default: search coverage/llvm-cov.json, llvm-cov.json, target/llvm-cov/llvm-cov.json")
-	cmd.Flags().StringVar(&rustLCOVReport, "rust-lcov-report", "",
-		"path (relative to --dir) to an existing cargo-llvm-cov lcov export, used for Rust patch coverage; only used with --tests=skip. Default: search coverage/lcov.info, lcov.info, target/llvm-cov/lcov.info")
+	cmd.Flags().StringArrayVar(&rustReport, "rust-report", nil,
+		`path (relative to --dir) to an existing cargo-llvm-cov JSON export; only used with --tests=skip.
+Repeatable. A bare path applies only when exactly one Rust crate/workspace is discovered under --dir;
+for multiple crates, disambiguate with "<crateDir>=<path>" (crateDir relative to --dir), e.g.
+--rust-report daemon=daemon/coverage/daemon-llvm-cov.json. Default per crate: search
+coverage/llvm-cov.json, llvm-cov.json, target/llvm-cov/llvm-cov.json relative to that crate's directory`)
+	cmd.Flags().StringArrayVar(&rustLCOVReport, "rust-lcov-report", nil,
+		`path (relative to --dir) to an existing cargo-llvm-cov lcov export, used for Rust patch coverage;
+only used with --tests=skip. Repeatable, same bare-vs-"<crateDir>=<path>" syntax as --rust-report.
+Default per crate: search coverage/lcov.info, lcov.info, target/llvm-cov/lcov.info relative to that
+crate's directory`)
 	return cmd
+}
+
+// parseRustReportOverrides parses repeated --rust-report/--rust-lcov-report
+// flag values into a coverage.RustReportOverrides map. Each value is either a
+// bare path (stored under the "" key, consulted only when Rust discovery
+// finds exactly one crate — preserving the original single-crate CLI usage
+// unchanged) or a "<crateDir>=<path>" pair disambiguating which discovered
+// crate directory (relative to --dir) the override applies to.
+func parseRustReportOverrides(values []string) coverage.RustReportOverrides {
+	if len(values) == 0 {
+		return nil
+	}
+	overrides := make(coverage.RustReportOverrides, len(values))
+	for _, v := range values {
+		if key, path, ok := strings.Cut(v, "="); ok {
+			overrides[key] = path
+		} else {
+			overrides[""] = v
+		}
+	}
+	return overrides
 }
 
 // computeBaselineAt checks out origin/main at sha into a throwaway worktree
@@ -213,14 +245,10 @@ func patchReport(cmd *cobra.Command, ctx context.Context, dir string, want cover
 			}
 			hit, total = coverage.PatchPercent(langChanged, hits)
 		case "rust":
-			if sources.RustLCOV == "" {
+			if len(sources.RustLCOV) == 0 {
 				continue
 			}
-			data, err := os.ReadFile(sources.RustLCOV) // #nosec G304 -- sources.RustLCOV is resolved by bulwark itself (a scratch path it wrote, or its own candidate-list/flag lookup), not user input
-			if err != nil {
-				continue
-			}
-			hit, total = coverage.PatchPercent(langChanged, coverage.ParseLCOV(data, dir))
+			hit, total = rustPatchPercent(dir, sources.RustLCOV, langChanged)
 		case "typescript":
 			if len(sources.TSLCOV) == 0 {
 				continue
@@ -328,6 +356,68 @@ func tsPatchPercent(dir string, tsLCOV map[string]string, changed map[string][]i
 			assigned[file] = true
 		}
 		h, t := coverage.PatchPercent(scoped, p.hits)
+		hit += h
+		total += t
+	}
+	return hit, total
+}
+
+// rustPatchPercent sums patch coverage across every discovered Rust crate
+// independently, mirroring tsPatchPercent's per-package longest-prefix
+// matching: multiple crates can each have a file at the same crate-relative
+// path, and a naive merge would let one clobber another's hit data under
+// Go's unordered map iteration.
+func rustPatchPercent(dir string, rustLCOV map[string]string, changed map[string][]int) (hit, total int) {
+	type crate struct {
+		prefix string // relative to dir, "" for dir itself
+		hits   coverage.LineHits
+	}
+	var crates []crate
+	for crateDir, lcovPath := range rustLCOV {
+		rel, err := filepath.Rel(dir, crateDir)
+		if err != nil {
+			continue
+		}
+		prefix := filepath.ToSlash(rel)
+		if prefix == "." {
+			prefix = ""
+		}
+		overlaps := false
+		for file := range changed {
+			if prefix == "" || strings.HasPrefix(file, prefix+"/") {
+				overlaps = true
+				break
+			}
+		}
+		if !overlaps {
+			continue
+		}
+		data, err := os.ReadFile(lcovPath) // #nosec G304 -- lcovPath is resolved by bulwark itself (a scratch path it wrote, or its own candidate-list/flag lookup), not user input
+		if err != nil {
+			continue
+		}
+		crates = append(crates, crate{prefix: prefix, hits: coverage.ParseLCOV(data, crateDir)})
+	}
+	sort.Slice(crates, func(i, j int) bool { return len(crates[i].prefix) > len(crates[j].prefix) })
+
+	assigned := map[string]bool{}
+	for _, c := range crates {
+		scoped := map[string][]int{}
+		for file, lines := range changed {
+			if assigned[file] {
+				continue
+			}
+			rel := file
+			if c.prefix != "" {
+				if !strings.HasPrefix(file, c.prefix+"/") {
+					continue
+				}
+				rel = strings.TrimPrefix(file, c.prefix+"/")
+			}
+			scoped[rel] = lines
+			assigned[file] = true
+		}
+		h, t := coverage.PatchPercent(scoped, c.hits)
 		hit += h
 		total += t
 	}

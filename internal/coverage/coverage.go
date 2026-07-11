@@ -6,6 +6,7 @@ package coverage
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -37,14 +38,24 @@ const (
 	ModeSkip Mode = "skip"
 )
 
+// RustReportOverrides maps a discovered Rust crate directory (relative to
+// --dir) to an explicit report path override (also relative to --dir), for
+// use with ModeSkip. The empty-string key ("") is the override applied when
+// Rust discovery (detect.RustCrateDirs) finds exactly one crate — this
+// preserves the single-crate CLI usage of a bare `--rust-report <path>`
+// unchanged even though the flag is now repeatable/keyed for multi-crate
+// repos.
+type RustReportOverrides map[string]string
+
 // ReportPaths overrides the default report-file search candidates per
 // language, for a repo whose coverage output doesn't land at one of the
-// conventional locations findReport checks. A zero value uses the built-in
-// candidate list for that language. Only meaningful with ModeSkip.
+// conventional locations findReport/findReportForCrate checks. A zero value
+// uses the built-in candidate list for that language. Only meaningful with
+// ModeSkip.
 type ReportPaths struct {
 	Go       string
-	Rust     string
-	RustLCOV string
+	Rust     RustReportOverrides
+	RustLCOV RustReportOverrides
 }
 
 // PatchWanted says which languages' patch-coverage line-hit sources Compute
@@ -65,7 +76,7 @@ type PatchWanted struct {
 // percentages.
 type PatchSources struct {
 	GoProfile  string
-	RustLCOV   string
+	RustLCOV   map[string]string // Rust crate dir -> its cargo-llvm-cov lcov export
 	TSLCOV     map[string]string // TS package dir -> its coverage/lcov.info
 	ModuleName string            // this module's path, needed to resolve GoProfile's package-qualified file names
 }
@@ -113,9 +124,11 @@ func Compute(ctx context.Context, dir string, cfg config.Config, mode Mode, repo
 		var ok bool
 		switch e {
 		case detect.Rust:
-			var lcovPath string
-			pct, lcovPath, ok = rustCoverage(ctx, dir, workDir, mode, reports.Rust, reports.RustLCOV, want.Rust)
-			sources.RustLCOV = lcovPath
+			var lcovPaths map[string]string
+			pct, lcovPaths, ok = rustCoverage(ctx, dir, workDir, mode, cfg.Rust.Exclude, reports.Rust, reports.RustLCOV, want.Rust)
+			if ok && want.Rust {
+				sources.RustLCOV = lcovPaths
+			}
 		case detect.Go:
 			var profilePath string
 			pct, profilePath, ok = goCoverage(ctx, dir, workDir, mode, reports.Go)
@@ -124,7 +137,7 @@ func Compute(ctx context.Context, dir string, cfg config.Config, mode Mode, repo
 				sources.ModuleName = moduleName(ctx, dir)
 			}
 		case detect.TypeScript:
-			pct, ok = tsCoverage(ctx, dir, cfg.TypeScript.Exclude, mode)
+			pct, ok = tsCoverage(ctx, dir, cfg.TypeScript.Exclude, mode, cfg.TypeScript.Install)
 			if ok && want.TypeScript {
 				pkgDirs, _ := detect.TSPackageDirs(dir, cfg.TypeScript.Exclude)
 				sources.TSLCOV = tsLCOVSources(pkgDirs)
@@ -265,7 +278,81 @@ var rustReportCandidates = []string{"coverage/llvm-cov.json", "llvm-cov.json", "
 // for an existing cargo-llvm-cov lcov export another step already produced.
 var rustLCOVReportCandidates = []string{"coverage/lcov.info", "lcov.info", "target/llvm-cov/lcov.info"}
 
-// rustCoverage reads the workspace's total line coverage percentage from a
+// findReportForCrate resolves a coverage report path for one discovered Rust
+// crate directory: first any override keyed by crateRelDir (crateDir's path
+// relative to dir), then — only when solo is true, i.e. exactly one crate
+// was discovered — the override keyed by "", then the candidate list
+// resolved relative to crateDir itself (matching where cargo llvm-cov
+// naturally writes output when run in-place inside each crate directory).
+// Override path values are resolved relative to dir, preserving the
+// documented "relative to --dir" contract for the override strings
+// themselves.
+func findReportForCrate(dir, crateDir, crateRelDir string, overrides RustReportOverrides, solo bool, candidates []string) (string, bool) {
+	if override, ok := overrides[crateRelDir]; ok {
+		p := filepath.Join(dir, override)
+		if _, err := os.Stat(p); err == nil {
+			return p, true
+		}
+		return "", false
+	}
+	if solo {
+		if override, ok := overrides[""]; ok {
+			p := filepath.Join(dir, override)
+			if _, err := os.Stat(p); err == nil {
+				return p, true
+			}
+			return "", false
+		}
+	}
+	for _, c := range candidates {
+		p := filepath.Join(crateDir, c)
+		if _, err := os.Stat(p); err == nil {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+// rustCoverage reads the total line coverage percentage for every
+// independent Cargo crate/workspace root discovered under dir (see
+// detect.RustCrateDirs), averaging across crates that produced a result —
+// mirroring how tsCoverage averages across TS packages. Returns a map of
+// crate dir -> its resolved lcov export path (when wantLCOV is set and one
+// was resolved for that crate), for patch coverage.
+func rustCoverage(ctx context.Context, dir, workDir string, mode Mode, exclude []string, reportOverrides, lcovReportOverrides RustReportOverrides, wantLCOV bool) (float64, map[string]string, bool) {
+	crateDirs, err := detect.RustCrateDirs(dir, exclude)
+	if err != nil || len(crateDirs) == 0 {
+		return 0, nil, false
+	}
+	solo := len(crateDirs) == 1
+
+	var total, count float64
+	lcovPaths := map[string]string{}
+	for i, crateDir := range crateDirs {
+		rel, err := filepath.Rel(dir, crateDir)
+		if err != nil {
+			continue
+		}
+		if rel == "." {
+			rel = ""
+		}
+		pct, lcovPath, ok := rustCoverageOne(ctx, dir, crateDir, rel, workDir, mode, reportOverrides, lcovReportOverrides, solo, wantLCOV, i)
+		if !ok {
+			continue
+		}
+		total += pct
+		count++
+		if lcovPath != "" {
+			lcovPaths[crateDir] = lcovPath
+		}
+	}
+	if count == 0 {
+		return 0, nil, false
+	}
+	return total / count, lcovPaths, true
+}
+
+// rustCoverageOne reads one crate's total line coverage percentage from a
 // cargo-llvm-cov JSON export, either running `cargo llvm-cov` itself
 // (ModeRun — requires cargo-llvm-cov already installed, a cargo subcommand
 // like cargo-audit/cargo-deny that bulwark doesn't auto-install) or parsing
@@ -273,17 +360,17 @@ var rustLCOVReportCandidates = []string{"coverage/lcov.info", "lcov.info", "targ
 // tool installed at all, since nothing is executed).
 //
 // When wantLCOV is set, it also resolves an lcov export for patch coverage:
-// under ModeSkip this is just another findReport lookup (lcovReportPath
-// overrides, else the candidate list); under ModeRun, `cargo llvm-cov
-// --no-report` runs the tests exactly once, keeping raw profile data on
-// disk, and both the JSON and lcov reports are then regenerated from that
-// same profile via `--no-run` — no second test execution.
-func rustCoverage(ctx context.Context, dir, workDir string, mode Mode, reportPath, lcovReportPath string, wantLCOV bool) (float64, string, bool) {
+// under ModeSkip this is just another findReportForCrate lookup; under
+// ModeRun, `cargo llvm-cov --no-report` runs the tests exactly once, keeping
+// raw profile data on disk, and both the JSON and lcov reports are then
+// regenerated from that same profile via `--no-run` — no second test
+// execution.
+func rustCoverageOne(ctx context.Context, dir, crateDir, crateRelDir, workDir string, mode Mode, reportOverrides, lcovReportOverrides RustReportOverrides, solo, wantLCOV bool, idx int) (float64, string, bool) {
 	var data []byte
 	var lcovPath string
 	switch mode {
 	case ModeSkip:
-		found, ok := findReport(dir, reportPath, rustReportCandidates)
+		found, ok := findReportForCrate(dir, crateDir, crateRelDir, reportOverrides, solo, rustReportCandidates)
 		if !ok {
 			return 0, "", false
 		}
@@ -293,7 +380,7 @@ func rustCoverage(ctx context.Context, dir, workDir string, mode Mode, reportPat
 		}
 		data = d
 		if wantLCOV {
-			if p, ok := findReport(dir, lcovReportPath, rustLCOVReportCandidates); ok {
+			if p, ok := findReportForCrate(dir, crateDir, crateRelDir, lcovReportOverrides, solo, rustLCOVReportCandidates); ok {
 				lcovPath = p
 			}
 		}
@@ -302,23 +389,23 @@ func rustCoverage(ctx context.Context, dir, workDir string, mode Mode, reportPat
 			return 0, "", false
 		}
 		if !wantLCOV {
-			r := executil.Run(ctx, dir, "cargo", "llvm-cov", "--summary-only", "--json")
+			r := executil.Run(ctx, crateDir, "cargo", "llvm-cov", "--summary-only", "--json")
 			if !r.Ok() {
 				return 0, "", false
 			}
 			data = []byte(r.Output)
 			break
 		}
-		if r := executil.Run(ctx, dir, "cargo", "llvm-cov", "--no-report"); !r.Ok() {
+		if r := executil.Run(ctx, crateDir, "cargo", "llvm-cov", "--no-report"); !r.Ok() {
 			return 0, "", false
 		}
-		r := executil.Run(ctx, dir, "cargo", "llvm-cov", "--no-run", "--summary-only", "--json")
+		r := executil.Run(ctx, crateDir, "cargo", "llvm-cov", "--no-run", "--summary-only", "--json")
 		if !r.Ok() {
 			return 0, "", false
 		}
 		data = []byte(r.Output)
-		lcovOut := filepath.Join(workDir, "rust-lcov.info")
-		if r := executil.Run(ctx, dir, "cargo", "llvm-cov", "--no-run", "--lcov", "--output-path", lcovOut); r.Ok() {
+		lcovOut := filepath.Join(workDir, fmt.Sprintf("rust-lcov-%d.info", idx))
+		if r := executil.Run(ctx, crateDir, "cargo", "llvm-cov", "--no-run", "--lcov", "--output-path", lcovOut); r.Ok() {
 			lcovPath = lcovOut
 		}
 	}
@@ -340,17 +427,130 @@ type istanbulSummary struct {
 	} `json:"total"`
 }
 
+// tsLockfiles maps each recognized lockfile name to the package manager it
+// identifies.
+var tsLockfiles = map[string]string{
+	"package-lock.json": "npm",
+	"yarn.lock":         "yarn",
+	"pnpm-lock.yaml":    "pnpm",
+}
+
+// resolvePackageManager inspects root for exactly one recognized lockfile
+// (package-lock.json -> npm, yarn.lock -> yarn, pnpm-lock.yaml -> pnpm). If
+// more than one is present at the same root — often a sign of stale/leftover
+// files — resolution is ambiguous and returns ("", false) rather than
+// silently guessing a priority order; the caller skips auto-detected install
+// for that root entirely rather than picking one arbitrarily.
+func resolvePackageManager(root string) (string, bool) {
+	var found []string
+	for file, manager := range tsLockfiles {
+		if _, err := os.Stat(filepath.Join(root, file)); err == nil {
+			found = append(found, manager)
+		}
+	}
+	if len(found) != 1 {
+		return "", false
+	}
+	return found[0], true
+}
+
+// hasAnyLockfile reports whether dir contains any recognized lockfile,
+// regardless of ambiguity — used to find workspace roots, where presence is
+// what matters, not which single manager it identifies.
+func hasAnyLockfile(dir string) bool {
+	for file := range tsLockfiles {
+		if _, err := os.Stat(filepath.Join(dir, file)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// tsWorkspaceRoots returns, for each pkgDir, the nearest ancestor directory
+// (including pkgDir itself, not walking above dir) containing a recognized
+// lockfile — deduped, since TSPackageDirs returns one entry per package.json
+// including nested workspace members that all share one root lockfile, and
+// an install command must run once per shared root, not once per member. A
+// pkgDir with no lockfile anywhere in its ancestry up to dir is omitted —
+// nothing to auto-install there.
+func tsWorkspaceRoots(dir string, pkgDirs []string) []string {
+	seen := map[string]bool{}
+	var roots []string
+	for _, pkgDir := range pkgDirs {
+		d := pkgDir
+		for {
+			if hasAnyLockfile(d) {
+				if !seen[d] {
+					seen[d] = true
+					roots = append(roots, d)
+				}
+				break
+			}
+			if d == dir {
+				break
+			}
+			parent := filepath.Dir(d)
+			if parent == d {
+				break
+			}
+			d = parent
+		}
+	}
+	return roots
+}
+
+// tsInstall runs one install command per unique workspace root in roots,
+// before any test:coverage script executes. override, when non-empty
+// (cfg.TypeScript.Install), replaces auto-detection entirely and is run via
+// a shell at every root — a free-form user-authored command legitimately
+// needs shell semantics (&&, env expansion), unlike bulwark's other,
+// hardcoded tool invocations. Failures are non-fatal here: tsCoverage's
+// existing per-package soft-omission (hasCoverageScript / test:coverage
+// failure) already handles a still-broken package after a failed or skipped
+// install.
+func tsInstall(ctx context.Context, roots []string, override string) {
+	for _, root := range roots {
+		if override != "" {
+			executil.Run(ctx, root, "sh", "-c", override) // #nosec G204 -- override comes from the target repo's own .bulwark.yml, authored by whoever configured bulwark for that repo, not remote/untrusted input
+			continue
+		}
+		manager, ok := resolvePackageManager(root)
+		if !ok {
+			continue
+		}
+		switch manager {
+		case "npm":
+			executil.Run(ctx, root, "npm", "ci")
+		case "yarn":
+			// Best-effort: corepack may already be enabled, or absent on an
+			// older Node — either way, yarn install below still runs.
+			executil.Run(ctx, root, "corepack", "enable")
+			executil.Run(ctx, root, "yarn", "install", "--immutable")
+		case "pnpm":
+			executil.Run(ctx, root, "pnpm", "install", "--frozen-lockfile")
+		}
+	}
+}
+
 // tsCoverage looks for Vitest/Istanbul's coverage-summary.json in each
 // detected package (the tool's own standard output location — unlike Go/Rust
 // there's no bulwark-configurable override, since this path is already the
 // de facto convention, not something projects vary). In ModeRun it first
-// runs the package's own "test:coverage" script (skipping packages that
-// don't declare one) to produce that file; in ModeSkip it only reads a file
-// a prior step already produced, running nothing.
-func tsCoverage(ctx context.Context, dir string, exclude []string, mode Mode) (float64, bool) {
+// installs each workspace root's dependencies (auto-detected by lockfile, or
+// install if set) — a fresh checkout (e.g. coverage baseline computation's
+// throwaway git worktree) has no node_modules a prior step could have
+// already installed — then runs each package's own "test:coverage" script
+// (skipping packages that don't declare one) to produce that file; in
+// ModeSkip it only reads a file a prior step already produced, running
+// nothing.
+func tsCoverage(ctx context.Context, dir string, exclude []string, mode Mode, install string) (float64, bool) {
 	pkgDirs, err := detect.TSPackageDirs(dir, exclude)
 	if err != nil || len(pkgDirs) == 0 {
 		return 0, false
+	}
+
+	if mode == ModeRun {
+		tsInstall(ctx, tsWorkspaceRoots(dir, pkgDirs), install)
 	}
 
 	var total, count float64
