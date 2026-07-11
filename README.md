@@ -1,7 +1,13 @@
-# bulwark
+<p align="center">
+  <img src="assets/bulwark-logo.png" alt="bulwark" width="140">
+</p>
 
-Unified code-quality and security scanning for Rust, TypeScript, and Go — one CLI, run identically
-locally and in CI, so "green locally" and "green in CI" can never drift apart.
+<h1 align="center">bulwark</h1>
+
+<p align="center">
+  Unified code-quality and security scanning for Rust, TypeScript, and Go — one CLI, run identically
+  locally and in CI, so "green locally" and "green in CI" can never drift apart.
+</p>
 
 `bulwark` replaces ad hoc, per-repo security workflows (CodeQL, standalone `cargo-audit` jobs,
 Codecov as a blocking gate) with one consistent pipeline: it auto-detects which ecosystems a repo

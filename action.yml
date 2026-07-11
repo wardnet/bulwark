@@ -167,7 +167,11 @@ runs:
         tool_result() { grep -oE "^\[(PASS|FAIL)\] $2\$" "$1" | tail -1 | sed -E 's/^\[([A-Z]+)\].*/\1/'; }
 
         {
-          echo "## bulwark"
+          # The logo is referenced by absolute raw URL, not a repo-relative path: this comment is
+          # posted into the *consuming* repo's PR, where `assets/...` would resolve against that
+          # repo and 404. Pinned to bulwark's default branch rather than a release tag so the
+          # image keeps resolving for consumers still pinned to an older bulwark version.
+          echo '## <img src="https://raw.githubusercontent.com/wardnet/bulwark/main/assets/bulwark-logo.png" alt="" width="20" align="top"> bulwark'
           echo
 
           if [[ "$RUN_SCAN" == "true" ]]; then
