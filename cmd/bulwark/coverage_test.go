@@ -155,3 +155,83 @@ func TestTSPatchPercentDoesNotClobberAcrossPackages(t *testing.T) {
 		t.Fatalf("hit = %d, want 1 (web's line is hit, api's is not — a clobbered merge would report 0 or 2, not 1)", hit)
 	}
 }
+
+// TestRustPatchPercentDoesNotClobberAcrossPackages mirrors
+// TestTSPatchPercentDoesNotClobberAcrossPackages for rustPatchPercent — two
+// discovered crates, each with a file at the same crate-relative path, must
+// not clobber each other's hit data.
+func TestRustPatchPercentDoesNotClobberAcrossPackages(t *testing.T) {
+	dir := t.TempDir()
+	crateA := filepath.Join(dir, "crates", "a")
+	crateB := filepath.Join(dir, "crates", "b")
+	writeLCOV := func(coverageDir, sf string, hit int) {
+		t.Helper()
+		if err := os.MkdirAll(coverageDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		data := fmt.Sprintf("SF:%s\nDA:1,%d\nend_of_record\n", sf, hit)
+		if err := os.WriteFile(filepath.Join(coverageDir, "lcov.info"), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeLCOV(filepath.Join(crateA, "coverage"), filepath.Join(crateA, "src", "lib.rs"), 1)
+	writeLCOV(filepath.Join(crateB, "coverage"), filepath.Join(crateB, "src", "lib.rs"), 0)
+
+	rustLCOV := map[string]string{
+		crateA: filepath.Join(crateA, "coverage", "lcov.info"),
+		crateB: filepath.Join(crateB, "coverage", "lcov.info"),
+	}
+	changed := map[string][]int{
+		"crates/a/src/lib.rs": {1},
+		"crates/b/src/lib.rs": {1},
+	}
+
+	hit, total := rustPatchPercent(dir, rustLCOV, changed)
+	if total != 2 {
+		t.Fatalf("total = %d, want 2 (one coverable changed line per crate)", total)
+	}
+	if hit != 1 {
+		t.Fatalf("hit = %d, want 1 (crate a's line is hit, crate b's is not — a clobbered merge would report 0 or 2, not 1)", hit)
+	}
+}
+
+func TestParseRustReportOverrides(t *testing.T) {
+	cases := []struct {
+		name   string
+		values []string
+		want   map[string]string
+	}{
+		{"nil for no values", nil, nil},
+		{
+			name:   "bare value stored under empty key",
+			values: []string{"daemon/coverage/daemon-llvm-cov.json"},
+			want:   map[string]string{"": "daemon/coverage/daemon-llvm-cov.json"},
+		},
+		{
+			name:   "keyed value",
+			values: []string{"daemon=daemon/coverage/daemon-llvm-cov.json"},
+			want:   map[string]string{"daemon": "daemon/coverage/daemon-llvm-cov.json"},
+		},
+		{
+			name:   "mixed bare and keyed",
+			values: []string{"daemon=daemon/coverage/daemon-llvm-cov.json", "other=other/coverage/llvm-cov.json"},
+			want: map[string]string{
+				"daemon": "daemon/coverage/daemon-llvm-cov.json",
+				"other":  "other/coverage/llvm-cov.json",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseRustReportOverrides(tc.values)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+			for k, v := range tc.want {
+				if got[k] != v {
+					t.Errorf("got[%q] = %q, want %q", k, got[k], v)
+				}
+			}
+		})
+	}
+}

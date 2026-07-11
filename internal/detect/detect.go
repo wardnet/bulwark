@@ -2,7 +2,11 @@
 // under a directory tree, so bulwark scan only runs the checks that apply.
 package detect
 
-import "os"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+)
 
 // Ecosystem is a language toolchain bulwark knows how to scan.
 type Ecosystem string
@@ -125,4 +129,101 @@ func TSPackageDirs(root string, exclude []string) ([]string, error) {
 		return nil, err
 	}
 	return dirs, nil
+}
+
+// RustCrateDirs returns every directory under root that is the effective
+// root of an independent Cargo invocation: each directory containing a
+// Cargo.toml, except a nested Cargo.toml whose nearest Cargo.toml ancestor
+// (within the same walk) already declares a [workspace] table — cargo
+// resolves workspace membership from that ancestor, so re-running
+// fmt/clippy/audit/deny in a member crate's own directory would be redundant
+// with running it once at the workspace root. Directories named in exclude
+// (in addition to the built-in defaults) are skipped, matching TSPackageDirs.
+func RustCrateDirs(root string, exclude []string) ([]string, error) {
+	skip := skipSet(exclude)
+	var all []string // every dir with a Cargo.toml, parent before child
+	workspaceRoots := map[string]bool{}
+
+	var visit func(dir string) error
+	visit = func(dir string) error {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return err
+		}
+		hasCargoToml := false
+		for _, e := range entries {
+			if !e.IsDir() && e.Name() == "Cargo.toml" {
+				hasCargoToml = true
+			}
+		}
+		if hasCargoToml {
+			all = append(all, dir)
+			if isWorkspaceRoot(filepath.Join(dir, "Cargo.toml")) {
+				workspaceRoots[dir] = true
+			}
+		}
+		for _, e := range entries {
+			if e.IsDir() && !skip[e.Name()] {
+				if err := visit(filepath.Join(dir, e.Name())); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := visit(root); err != nil {
+		return nil, err
+	}
+
+	var dirs []string
+	for _, dir := range all {
+		if coveredByAncestorWorkspace(dir, workspaceRoots) {
+			continue
+		}
+		dirs = append(dirs, dir)
+	}
+	return dirs, nil
+}
+
+// isWorkspaceRoot reports whether the Cargo.toml at path declares a
+// [workspace] table. This is a line-level sniff, not a full TOML parse (no
+// new dependency needed for this): it matches a trimmed line equal to
+// "[workspace]" or starting with "[workspace." (covering
+// [workspace.package], [workspace.dependencies], etc). A read or parse
+// failure is treated as "not a workspace root" rather than an error —
+// discovery's job is finding directories, not validating Cargo.toml
+// correctness; a malformed Cargo.toml will fail loudly once cargo actually
+// runs against it.
+func isWorkspaceRoot(path string) bool {
+	data, err := os.ReadFile(path) // #nosec G304 -- path is resolved by bulwark's own detection walk, not user input
+	if err != nil {
+		return false
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "[workspace]" || strings.HasPrefix(line, "[workspace.") {
+			return true
+		}
+	}
+	return false
+}
+
+// coveredByAncestorWorkspace reports whether dir sits strictly below some
+// directory in workspaceRoots — i.e. whether an ancestor Cargo.toml already
+// declares [workspace], making dir's own Cargo.toml a workspace member cargo
+// already resolves from that ancestor.
+func coveredByAncestorWorkspace(dir string, workspaceRoots map[string]bool) bool {
+	for wsRoot := range workspaceRoots {
+		if wsRoot == dir {
+			continue
+		}
+		rel, err := filepath.Rel(wsRoot, dir)
+		if err != nil {
+			continue
+		}
+		if rel != "." && !strings.HasPrefix(rel, "..") {
+			return true
+		}
+	}
+	return false
 }

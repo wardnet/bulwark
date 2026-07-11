@@ -87,6 +87,8 @@ rust:
 typescript:
   enabled: true
   exclude: ["legacy-app"]
+  install: ""            # override coverage's install-command auto-detection, e.g.
+                          # "corepack enable && yarn install --immutable" (see Coverage below)
 go:
   enabled: true
   exclude: []
@@ -119,6 +121,14 @@ generated cache data, not source, needs no PR/review and never pollutes main's h
   `coverage-summary.json`, since unlike a linter there's no single canonical coverage-invocation
   convention to standardize on across arbitrary TS packages. A language whose coverage can't be
   measured is silently omitted from the report, not failed.
+- Rust never assumes `--dir` itself is the crate/workspace root — `internal/detect.RustCrateDirs`
+  discovers every independent Cargo crate/workspace root under `--dir` (deduping a workspace
+  member's own `Cargo.toml` under its ancestor workspace root), and both `internal/rust.Check` and
+  `internal/coverage.rustCoverage` iterate every discovered root, averaging coverage across them the
+  same way TypeScript averages across packages. `--rust-report`/`--rust-lcov-report` are therefore
+  repeatable, keyed flags (`--rust-report <crateDir>=<path>`, crateDir relative to `--dir`) rather
+  than a single path — a bare value (no `=`) is only honored when discovery finds exactly one crate,
+  preserving the original single-crate invocation unchanged.
 - A language with no prior baseline entry (new) is reported but doesn't fail the check on its own;
   a language whose current coverage is below its baseline does; a language dropped from the current
   run (baseline had it, current doesn't) is reported as `[DROPPED]` and also doesn't fail on its own.
@@ -150,6 +160,18 @@ One exception: computing a **baseline** at a historical main SHA (a cache miss) 
 no CI-produced report sitting in it, so there's nothing to skip to. This only costs a real test run
 once per main commit (cached afterward on `bulwark-state`), not once per PR, so it doesn't reintroduce
 the duplication `--tests=skip` exists to avoid.
+
+TypeScript's `ModeRun` path also runs a one-time dependency install per workspace root before
+executing each package's `test:coverage` script — a fresh checkout (baseline computation's throwaway
+worktree, but also any other `ModeRun` invocation) has no `node_modules` a prior step could have
+already installed. `internal/coverage.resolvePackageManager` auto-detects npm/yarn/pnpm from the
+root's lockfile (`package-lock.json`/`yarn.lock`/`pnpm-lock.yaml`); a root with more than one
+recognized lockfile is treated as ambiguous and install is skipped there rather than guessing a
+priority order. `typescript.install` in `.bulwark.yml` overrides auto-detection entirely with an
+explicit shell command (e.g. `corepack enable && yarn install --immutable`), for Corepack-pinned or
+otherwise nonstandard install flows auto-detection can't infer, or to resolve an ambiguous root.
+`internal/coverage.tsWorkspaceRoots` dedupes so a shared root serving multiple nested packages is
+only installed once, not once per package.
 
 ### Patch coverage
 
@@ -190,13 +212,19 @@ shape:
   `go test` run. `Compute`'s returned `PatchSources.GoProfile` is that resolved path, kept alive
   until the caller's `cleanup()` runs.
 - **Rust**: `cargo llvm-cov` doesn't emit per-line data in its `--json` export, so patch coverage
-  additionally produces an `--lcov` report. Under `--tests=run`, this doesn't cost a second test
-  execution: `cargo llvm-cov --no-report` runs the suite once and keeps raw profile data on disk,
-  then both `--no-run --json` (aggregate, unchanged) and `--no-run --lcov` (patch, new) regenerate
-  their reports from that same profile. Under `--tests=skip`, the lcov file is just another
-  `findReport` lookup — an explicit `--rust-lcov-report` override, else a candidate list
-  (`coverage/lcov.info`, `lcov.info`, `target/llvm-cov/lcov.info`), mirroring `--rust-report`
-  exactly; a missing file means Rust patch coverage is silently omitted, not a failure.
+  additionally produces an `--lcov` report, per discovered crate/workspace root (see the Coverage
+  section above). Under `--tests=run`, this doesn't cost a second test execution: `cargo llvm-cov
+  --no-report` runs each crate's suite once and keeps raw profile data on disk, then both `--no-run
+  --json` (aggregate, unchanged) and `--no-run --lcov` (patch, new) regenerate their reports from
+  that same profile. Under `--tests=skip`, the lcov file is another `findReportForCrate` lookup per
+  crate — an explicit `--rust-lcov-report <crateDir>=<path>` override, else a candidate list
+  (`coverage/lcov.info`, `lcov.info`, `target/llvm-cov/lcov.info`) resolved relative to that crate's
+  own directory, mirroring `--rust-report` exactly. `Compute`'s returned `PatchSources.RustLCOV` is
+  a `map[string]string` keyed by crate dir (like TypeScript's `TSLCOV`, not a single path) —
+  `cmd/bulwark/coverage.go`'s `rustPatchPercent` resolves each crate's contribution independently,
+  mirroring `tsPatchPercent`'s longest-prefix matching so two crates can't clobber each other's hit
+  data for a same-named file. A crate with no resolvable lcov file is silently omitted from patch
+  coverage, not a failure.
 - **TypeScript**: reads `<pkgDir>/coverage/lcov.info` (Istanbul/Vitest's native lcov output) — fixed
   convention, no override flag, matching the existing no-override precedent for TS aggregate
   coverage. This only works if the consumer's own test config already has an `lcov` reporter

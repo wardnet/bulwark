@@ -3,8 +3,10 @@ package coverage
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -109,6 +111,301 @@ func TestGoCoverageModeSkipDoesNotRunTests(t *testing.T) {
 	}
 	if pct != 100 {
 		t.Fatalf("got %v%%, want 100%% from the fixture profile", pct)
+	}
+}
+
+func writeNested(t *testing.T, dir, name, contents string) {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFindReportForCrateBareOverrideSoloCrate(t *testing.T) {
+	dir := t.TempDir()
+	crateDir := filepath.Join(dir, "daemon")
+	writeNested(t, dir, filepath.Join("daemon", "coverage", "daemon-llvm-cov.json"), "{}")
+
+	overrides := RustReportOverrides{"": "daemon/coverage/daemon-llvm-cov.json"}
+	got, ok := findReportForCrate(dir, crateDir, "daemon", overrides, true, nil)
+	want := filepath.Join(dir, "daemon", "coverage", "daemon-llvm-cov.json")
+	if !ok || got != want {
+		t.Fatalf("findReportForCrate = (%q, %v), want (%q, true)", got, ok, want)
+	}
+}
+
+func TestFindReportForCrateBareOverrideIgnoredWhenNotSolo(t *testing.T) {
+	dir := t.TempDir()
+	crateDir := filepath.Join(dir, "daemon")
+	writeNested(t, dir, filepath.Join("daemon", "coverage", "daemon-llvm-cov.json"), "{}")
+
+	overrides := RustReportOverrides{"": "daemon/coverage/daemon-llvm-cov.json"}
+	if _, ok := findReportForCrate(dir, crateDir, "daemon", overrides, false, nil); ok {
+		t.Fatal("bare override must only apply when solo is true (exactly one crate discovered)")
+	}
+}
+
+func TestFindReportForCrateKeyedOverrideResolvesMatchingCrateOnly(t *testing.T) {
+	dir := t.TempDir()
+	daemonDir := filepath.Join(dir, "daemon")
+	otherDir := filepath.Join(dir, "other")
+	writeNested(t, dir, filepath.Join("daemon", "report.json"), "{}")
+
+	overrides := RustReportOverrides{"daemon": "daemon/report.json"}
+
+	got, ok := findReportForCrate(dir, daemonDir, "daemon", overrides, false, nil)
+	want := filepath.Join(dir, "daemon", "report.json")
+	if !ok || got != want {
+		t.Fatalf("findReportForCrate for daemon = (%q, %v), want (%q, true)", got, ok, want)
+	}
+
+	if _, ok := findReportForCrate(dir, otherDir, "other", overrides, false, nil); ok {
+		t.Fatal("override keyed to daemon must not apply to a different crate")
+	}
+}
+
+func TestFindReportForCrateCandidateFallbackRelativeToCrateDir(t *testing.T) {
+	dir := t.TempDir()
+	crateDir := filepath.Join(dir, "daemon")
+	writeNested(t, dir, filepath.Join("daemon", "coverage", "llvm-cov.json"), "{}")
+
+	got, ok := findReportForCrate(dir, crateDir, "daemon", nil, false, rustReportCandidates)
+	want := filepath.Join(crateDir, "coverage", "llvm-cov.json")
+	if !ok || got != want {
+		t.Fatalf("findReportForCrate = (%q, %v), want (%q, true)", got, ok, want)
+	}
+}
+
+func TestResolvePackageManager(t *testing.T) {
+	cases := []struct {
+		name      string
+		lockfiles []string
+		wantMgr   string
+		wantOK    bool
+	}{
+		{"npm", []string{"package-lock.json"}, "npm", true},
+		{"yarn", []string{"yarn.lock"}, "yarn", true},
+		{"pnpm", []string{"pnpm-lock.yaml"}, "pnpm", true},
+		{"none", nil, "", false},
+		{"ambiguous both present", []string{"package-lock.json", "yarn.lock"}, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, lf := range tc.lockfiles {
+				write(t, dir, lf, "")
+			}
+			mgr, ok := resolvePackageManager(dir)
+			if ok != tc.wantOK || mgr != tc.wantMgr {
+				t.Fatalf("resolvePackageManager = (%q, %v), want (%q, %v)", mgr, ok, tc.wantMgr, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestTsWorkspaceRootsDedupesNestedPackages(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "yarn.lock", "")
+	a := filepath.Join(dir, "packages", "a")
+	b := filepath.Join(dir, "packages", "b")
+	for _, d := range []string{a, b} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	roots := tsWorkspaceRoots(dir, []string{a, b})
+	if len(roots) != 1 || roots[0] != dir {
+		t.Fatalf("got %v, want [%s] (both packages share the root lockfile)", roots, dir)
+	}
+}
+
+func TestTsWorkspaceRootsIndependentNestedLockfile(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "yarn.lock", "")
+	nested := filepath.Join(dir, "vendor-app")
+	if err := os.MkdirAll(nested, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	write(t, nested, "package-lock.json", "")
+
+	roots := tsWorkspaceRoots(dir, []string{dir, nested})
+	if len(roots) != 2 || roots[0] != dir || roots[1] != nested {
+		t.Fatalf("got %v, want [%s %s] (nested package has its own independent lockfile)", roots, dir, nested)
+	}
+}
+
+func TestTsWorkspaceRootsOmitsPkgWithNoLockfile(t *testing.T) {
+	dir := t.TempDir()
+	pkg := filepath.Join(dir, "pkg")
+	if err := os.MkdirAll(pkg, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	roots := tsWorkspaceRoots(dir, []string{pkg})
+	if len(roots) != 0 {
+		t.Fatalf("got %v, want none (no lockfile anywhere in ancestry)", roots)
+	}
+}
+
+// fakeBin writes an executable shell script named name into binDir that
+// appends "name args..." to sentinelLog, then exits with exitCode. Callers
+// prepend binDir to PATH via t.Setenv so executil.Run resolves name to this
+// script instead of any real binary — the standard way to assert an install
+// command was (or wasn't) invoked without depending on real
+// npm/yarn/pnpm/corepack being present in the test environment.
+func fakeBin(t *testing.T, binDir, name string, exitCode int, sentinelLog string) {
+	t.Helper()
+	script := fmt.Sprintf("#!/bin/sh\necho \"%s $*\" >> %s\nexit %d\n", name, sentinelLog, exitCode)
+	if err := os.WriteFile(filepath.Join(binDir, name), []byte(script), 0o755); err != nil { //nolint:gosec // intentionally executable test fixture
+		t.Fatal(err)
+	}
+}
+
+func TestTsInstallRunsNpmCiForNpmLockfile(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "package-lock.json", "")
+
+	binDir := t.TempDir()
+	sentinel := filepath.Join(t.TempDir(), "sentinel.log")
+	fakeBin(t, binDir, "npm", 0, sentinel)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	tsInstall(context.Background(), []string{root}, "")
+
+	data, err := os.ReadFile(sentinel)
+	if err != nil {
+		t.Fatalf("expected npm to be invoked, sentinel log missing: %v", err)
+	}
+	if !strings.Contains(string(data), "npm ci") {
+		t.Fatalf("sentinel log = %q, want it to contain %q", data, "npm ci")
+	}
+}
+
+func TestTsInstallRunsYarnWithCorepackForYarnLockfile(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "yarn.lock", "")
+
+	binDir := t.TempDir()
+	sentinel := filepath.Join(t.TempDir(), "sentinel.log")
+	fakeBin(t, binDir, "corepack", 0, sentinel)
+	fakeBin(t, binDir, "yarn", 0, sentinel)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	tsInstall(context.Background(), []string{root}, "")
+
+	data, err := os.ReadFile(sentinel)
+	if err != nil {
+		t.Fatalf("expected corepack and yarn to be invoked: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d invocation(s), want 2 (corepack enable, then yarn install): %v", len(lines), lines)
+	}
+	if !strings.Contains(lines[0], "corepack enable") {
+		t.Errorf("first invocation = %q, want it to contain %q", lines[0], "corepack enable")
+	}
+	if !strings.Contains(lines[1], "yarn install --immutable") {
+		t.Errorf("second invocation = %q, want it to contain %q", lines[1], "yarn install --immutable")
+	}
+}
+
+func TestTsInstallCorepackFailureNonFatal(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "yarn.lock", "")
+
+	binDir := t.TempDir()
+	sentinel := filepath.Join(t.TempDir(), "sentinel.log")
+	fakeBin(t, binDir, "corepack", 1, sentinel)
+	fakeBin(t, binDir, "yarn", 0, sentinel)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	tsInstall(context.Background(), []string{root}, "")
+
+	data, err := os.ReadFile(sentinel)
+	if err != nil {
+		t.Fatalf("expected yarn to still run despite corepack failing: %v", err)
+	}
+	if !strings.Contains(string(data), "yarn install --immutable") {
+		t.Fatalf("sentinel log = %q, want yarn install to have run", data)
+	}
+}
+
+func TestTsInstallOverrideUsesShellVerbatim(t *testing.T) {
+	root := t.TempDir()
+	marker := filepath.Join(root, "installed.marker")
+
+	tsInstall(context.Background(), []string{root}, "touch "+marker)
+
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("expected override command to run via a real shell, marker missing: %v", err)
+	}
+}
+
+func TestTsInstallNoLockfileNoOverrideRunsNothing(t *testing.T) {
+	root := t.TempDir()
+
+	binDir := t.TempDir()
+	sentinel := filepath.Join(t.TempDir(), "sentinel.log")
+	fakeBin(t, binDir, "npm", 0, sentinel)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	tsInstall(context.Background(), []string{root}, "")
+
+	if _, err := os.Stat(sentinel); err == nil {
+		t.Fatal("expected no install command to run when there's no lockfile and no override")
+	}
+}
+
+func TestTsInstallAmbiguousLockfilesRunsNothing(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "package-lock.json", "")
+	write(t, root, "yarn.lock", "")
+
+	binDir := t.TempDir()
+	sentinel := filepath.Join(t.TempDir(), "sentinel.log")
+	fakeBin(t, binDir, "npm", 0, sentinel)
+	fakeBin(t, binDir, "yarn", 0, sentinel)
+	fakeBin(t, binDir, "corepack", 0, sentinel)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	tsInstall(context.Background(), []string{root}, "")
+
+	if _, err := os.Stat(sentinel); err == nil {
+		t.Fatal("expected no install command to run for an ambiguous multi-lockfile root")
+	}
+}
+
+func TestTsInstallDedupesAcrossWorkspaceRoots(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "package-lock.json", "")
+	a := filepath.Join(dir, "packages", "a")
+	b := filepath.Join(dir, "packages", "b")
+	for _, d := range []string{a, b} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	binDir := t.TempDir()
+	sentinel := filepath.Join(t.TempDir(), "sentinel.log")
+	fakeBin(t, binDir, "npm", 0, sentinel)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	roots := tsWorkspaceRoots(dir, []string{a, b})
+	tsInstall(context.Background(), roots, "")
+
+	data, err := os.ReadFile(sentinel)
+	if err != nil {
+		t.Fatalf("expected npm to be invoked: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("got %d invocation(s), want exactly 1 (deduped across the shared workspace root): %v", len(lines), lines)
 	}
 }
 

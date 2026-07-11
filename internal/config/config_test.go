@@ -94,6 +94,34 @@ func TestLoadPatchCoverageOptOut(t *testing.T) {
 	}
 }
 
+func TestLoadTypeScriptInstallOverride(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "typescript:\n  install: \"corepack enable && yarn install --immutable\"\n")
+
+	got, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.TypeScript.Install != "corepack enable && yarn install --immutable" {
+		t.Fatalf("TypeScript.Install = %q, want the configured override", got.TypeScript.Install)
+	}
+	// TypeScriptLanguage's embedded Language fields must still merge onto
+	// Default() normally alongside the new Install field.
+	if !got.TypeScript.Enabled {
+		t.Fatal("setting typescript.install incorrectly disabled TypeScript")
+	}
+}
+
+func TestLoadTypeScriptInstallDefaultsEmpty(t *testing.T) {
+	got, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.TypeScript.Install != "" {
+		t.Fatalf("TypeScript.Install = %q, want empty (auto-detect) by default", got.TypeScript.Install)
+	}
+}
+
 func TestLoadInvalidYAML(t *testing.T) {
 	dir := t.TempDir()
 	write(t, dir, "rust: [this is not a mapping\n")
