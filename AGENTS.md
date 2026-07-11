@@ -31,6 +31,7 @@ internal/semgrep/                # pinned Semgrep, installed via pipx
 internal/coverage/               # per-language coverage percentage (see Coverage below)
 internal/gitstate/               # bulwark-state branch read/write (see Coverage below)
 internal/executil/              # shared external-command runner every scanner package uses
+assets/bulwark-logo.png         # logo — used by README and the action's PR comment (see below)
 .goreleaser.yml                 # build/release config (v2 schema)
 .golangci.yml                   # lint config (v2 schema)
 .github/workflows/{ci,release}.yml
@@ -253,6 +254,13 @@ auto-discovery rather than bulwark passing explicit `files:`/`directory:` paths 
 why a consumer's CI only needs to hand bulwark a token: bulwark owns the whole Codecov
 relationship (coverage *and* JUnit test-results), so the calling workflow never has to install a
 Codecov CLI or push to Codecov directly itself.
+
+The PR comment's header embeds `assets/bulwark-logo.png` by **absolute raw URL**
+(`raw.githubusercontent.com/wardnet/bulwark/main/...`), never a repo-relative path — the comment is
+posted into the *consuming* repo's PR, where a relative `assets/...` would resolve against that repo
+and 404. It's pinned to bulwark's default branch, not a release tag, so the image keeps resolving for
+consumers pinned to an older bulwark version. Renaming or moving that file therefore breaks the logo
+in every consumer's PR comment retroactively — treat its path as a public API.
 
 **Never interpolate `${{ inputs.* }}` or `${{ steps.*.outputs.* }}` directly into a `run:` script
 body** — pass it via that step's `env:` block instead, and reference the env var name (`"$DIR"`,
