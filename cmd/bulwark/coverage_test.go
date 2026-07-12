@@ -235,3 +235,16 @@ func TestParseRustReportOverrides(t *testing.T) {
 		})
 	}
 }
+
+func TestFormatReport(t *testing.T) {
+	// Sorted, so the recorded-baseline line on main doesn't reshuffle between
+	// runs over Go's map iteration order.
+	got := formatReport(map[string]float64{"typescript": 93.94, "go": 58.5, "rust": 85.7})
+	want := "go: 58.5%, rust: 85.7%, typescript: 93.9%"
+	if got != want {
+		t.Errorf("formatReport = %q, want %q", got, want)
+	}
+	if got := formatReport(map[string]float64{}); got != "" {
+		t.Errorf("formatReport(empty) = %q, want \"\"", got)
+	}
+}

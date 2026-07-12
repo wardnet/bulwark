@@ -74,6 +74,35 @@ func newCoverageCmd() *cobra.Command {
 				return err
 			}
 
+			// Running ON the merge-base (a push to main) rather than ahead of it
+			// (a PR): there is no baseline to gate against — the current commit
+			// *is* the baseline — so record what was just measured and stop.
+			//
+			// This is what makes the gate work at all for a repo whose coverage
+			// comes from a multi-job pipeline rather than from bulwark running the
+			// tests itself (exactly the case --tests=skip exists to serve). Such a
+			// repo can never recompute a historical baseline: computeBaselineAt's
+			// throwaway worktree is a bare checkout with none of the toolchain or
+			// staged reports the pipeline provides, so it measures nothing. wardnet
+			// hit precisely that — and the numbers it failed to reconstruct in a
+			// worktree were numbers it had already measured, and thrown away, when
+			// this same command ran on main. Recording them costs nothing: no
+			// re-run, no cargo-llvm-cov, no yarn — they are already in hand.
+			head, err := gitstate.HeadSHA(ctx, dir)
+			if err != nil {
+				return err
+			}
+			if head == sha {
+				if err := gitstate.WriteBaseline(ctx, dir, sha, current); err != nil {
+					// Best-effort, as everywhere else: a write race with a concurrent
+					// main build must not fail the build.
+					_, printErr := fmt.Fprintf(cmd.ErrOrStderr(), "warning: failed to record coverage baseline for %s: %v\n", sha, err)
+					return printErr
+				}
+				_, err := fmt.Fprintf(cmd.OutOrStdout(), "recorded coverage baseline for %s: %s\n", sha, formatReport(current))
+				return err
+			}
+
 			baseline, hit, err := gitstate.ReadBaseline(ctx, dir, sha)
 			if err != nil {
 				return err
@@ -205,6 +234,22 @@ func computeBaselineAt(ctx context.Context, cmd *cobra.Command, dir, sha string,
 		return nil, err
 	}
 	return report, nil
+}
+
+// formatReport renders a coverage report as a stable, sorted one-liner
+// ("go: 58.5%, rust: 85.7%") for the baseline-recorded message on main. Sorted
+// so the line doesn't reshuffle between runs over Go's map iteration order.
+func formatReport(report map[string]float64) string {
+	langs := make([]string, 0, len(report))
+	for lang := range report {
+		langs = append(langs, lang)
+	}
+	sort.Strings(langs)
+	parts := make([]string, 0, len(langs))
+	for _, lang := range langs {
+		parts = append(parts, fmt.Sprintf("%s: %.1f%%", lang, report[lang]))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // warnUnmeasured prints a warning for every ecosystem bulwark detected in dir

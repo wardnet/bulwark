@@ -107,6 +107,18 @@ Omitting the file, or omitting a section/key within it, keeps that value at its 
 per-main-commit-SHA baseline cached on a dedicated `bulwark-state` branch (never `main` — bot-owned
 generated cache data, not source, needs no PR/review and never pollutes main's history):
 
+- **A run on main records its own coverage as that commit's baseline.** When `HeadSHA == BaseSHA`
+  (bulwark is running on main, not ahead of it) there is nothing to gate against — the current commit
+  *is* the baseline — so `cmd/bulwark/coverage.go` writes what it just measured to `bulwark-state`
+  and stops. This is the *primary* way baselines get created, and the only one that works for a repo
+  whose coverage is produced by a multi-job CI pipeline rather than by bulwark running the tests
+  itself (precisely what `--tests=skip` exists to serve): such a repo can never *re*compute a
+  historical baseline, because `computeBaselineAt`'s throwaway worktree is a bare checkout with none
+  of the toolchain (`cargo-llvm-cov`, yarn/Node) or staged reports the pipeline provides — it
+  measures nothing. wardnet ran that way for months: the numbers it kept failing to reconstruct in a
+  worktree were numbers it had *already measured, and thrown away*, when this same command ran on
+  main. Recording them costs nothing — no test re-run, no extra tooling, they are already in hand.
+  **Consumers must therefore run `bulwark coverage` on pushes to main, not only on PRs.**
 - `internal/gitstate.BaseSHA` resolves `git merge-base HEAD origin/main`.
 - `internal/gitstate.ReadBaseline` fetches `bulwark-state` and reads `<sha>.json` via `git show`
   (no checkout) — a missing branch or missing file is a cache miss, not an error.
