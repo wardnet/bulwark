@@ -183,7 +183,9 @@ func TestParseGoProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := ParseGoProfile(path, "fixture")
+	// No main.go on disk beside the profile: an unreadable source degrades to
+	// counting every line in the block, which is the pre-filter behavior.
+	got, err := ParseGoProfile(path, "fixture", dir)
 	if err != nil {
 		t.Fatalf("ParseGoProfile: %v", err)
 	}
@@ -192,6 +194,49 @@ func TestParseGoProfile(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ParseGoProfile = %+v, want %+v", got, want)
+	}
+}
+
+// A Go profile records blocks, not statements, so every line between a
+// block's braces lands in the report — comments and blank lines included.
+// Left as-is, adding a comment inside an uncovered function reads as an
+// uncovered new line, and a comment-only PR scores 0% patch coverage and
+// fails the gate (wardnet/inforge#216). Those lines must not reach LineHits
+// at all, so PatchPercent skips them the same way it skips any line a
+// coverage report never mentions.
+func TestParseGoProfileExcludesCommentsAndBlanks(t *testing.T) {
+	dir := t.TempDir()
+	src := "package main\n" + // 1
+		"\n" + // 2
+		"func run() {\n" + // 3
+		"\t// nosemgrep: some.rule -- audited\n" + // 4  comment inside an uncovered block
+		"\n" + // 5  blank inside an uncovered block
+		"\tdoWork()\n" + // 6  the only executable line here
+		"}\n" // 7
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(src), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	profile := "mode: set\nfixture/main.go:3.13,7.2 1 0\n"
+	path := filepath.Join(dir, "cover.out")
+	if err := os.WriteFile(path, []byte(profile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ParseGoProfile(path, "fixture", dir)
+	if err != nil {
+		t.Fatalf("ParseGoProfile: %v", err)
+	}
+	want := LineHits{"main.go": {3: 0, 6: 0, 7: 0}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ParseGoProfile = %+v, want %+v", got, want)
+	}
+
+	// The regression itself: a PR that only adds a comment (line 4) and a
+	// blank (line 5) has nothing coverable in it, so patch coverage must
+	// report 0/0 — no coverable lines — not 0/2 uncovered.
+	hit, total := PatchPercent(map[string][]int{"main.go": {4, 5}}, got)
+	if hit != 0 || total != 0 {
+		t.Fatalf("PatchPercent over a comment-only diff = (%d, %d), want (0, 0)", hit, total)
 	}
 }
 
