@@ -124,6 +124,25 @@ runs:
         report_type: test_results
         fail_ci_if_error: false
 
+    - name: Upload bulwark output artifact
+      # Capture the full scan/coverage logs as a run artifact so the PR comment
+      # can link to them instead of inlining thousands of lines. A comment that
+      # large is unreadable and also exceeds GitHub's 65536-char limit, which
+      # hard-fails the sticky-comment step. `always()` so the logs are captured
+      # even when a check failed — that's exactly when the full log matters.
+      if: always() && (inputs.run-scan == 'true' || inputs.run-coverage == 'true')
+      id: output-artifact
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      with:
+        # Job-scoped name so two jobs in the same run don't collide (v4+ errors
+        # on a duplicate artifact name within a run).
+        name: bulwark-output-${{ github.job }}
+        path: |
+          ${{ runner.temp }}/bulwark-scan-output.txt
+          ${{ runner.temp }}/bulwark-coverage-output.txt
+        if-no-files-found: ignore
+        retention-days: 14
+
     - name: Build PR summary
       if: github.event_name == 'pull_request' && (inputs.run-scan == 'true' || inputs.run-coverage == 'true')
       id: summary
@@ -133,6 +152,7 @@ runs:
         RUN_COVERAGE: ${{ inputs.run-coverage }}
         SCAN_EXIT_CODE: ${{ steps.scan.outputs.exit-code }}
         COVERAGE_EXIT_CODE: ${{ steps.coverage.outputs.exit-code }}
+        ARTIFACT_URL: ${{ steps.output-artifact.outputs.artifact-url }}
       run: |
         set +e
         summary="${RUNNER_TEMP}/bulwark-pr-summary.md"
@@ -166,6 +186,40 @@ runs:
         # SCAN_EXIT_CODE only says "at least one check failed", not which one.
         tool_result() { grep -oE "^\[(PASS|FAIL)\] $2\$" "$1" | tail -1 | sed -E 's/^\[([A-Z]+)\].*/\1/'; }
 
+        # Max bytes of raw tool output to inline per section. GitHub caps a PR
+        # comment at 65536 chars, and the full logs (multi-thousand-line cargo /
+        # compile output) blow past that on their own — so the complete logs go
+        # to the run artifact instead. On failure we still inline the TAIL of the
+        # output, where the tool's error and summary surface, so the actual error
+        # is always visible in the comment without opening the artifact.
+        EXCERPT_CAP=20000
+
+        # Strip ANSI colour codes so the inlined excerpt is readable as plain
+        # text (and a touch smaller); the artifact keeps the raw log.
+        strip_ansi() { sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g'; }
+
+        # Inline a bounded excerpt of a failing tool's output. No-op on success:
+        # a passing multi-thousand-line log helps no one and risks the size cap.
+        emit_error_output() {
+          local file="$1" code="$2" size
+          [[ "$code" == "0" ]] && return 0
+          [[ -f "$file" ]] || return 0
+          size=$(wc -c < "$file" | tr -d ' ')
+          echo
+          echo "<details><summary>error output</summary>"
+          echo
+          echo '```'
+          if (( size > EXCERPT_CAP )); then
+            echo "… truncated to the last ${EXCERPT_CAP} bytes — full log in the run artifact linked below …"
+            tail -c "$EXCERPT_CAP" "$file" | strip_ansi
+          else
+            strip_ansi < "$file"
+          fi
+          echo '```'
+          echo
+          echo "</details>"
+        }
+
         {
           # The logo is referenced by absolute raw URL, not a repo-relative path: this comment is
           # posted into the *consuming* repo's PR, where `assets/...` would resolve against that
@@ -193,17 +247,12 @@ runs:
                 detail=$(IFS=,; echo "${parts[*]}" | sed 's/,/, /g')
                 echo "- ❌ **scan** — ${detail} findings"
               else
-                echo "- ❌ **scan** — failed, see details below"
+                echo "- ❌ **scan** — failed, see error output below"
               fi
+              # The error itself is always surfaced inline on failure, per the
+              # reporting contract — not just linked away in the artifact.
+              emit_error_output "$scan_out" "$SCAN_EXIT_CODE"
             fi
-            echo
-            echo "<details><summary>full output</summary>"
-            echo
-            echo '```'
-            cat "$scan_out"
-            echo '```'
-            echo
-            echo "</details>"
             echo
           fi
 
@@ -215,18 +264,26 @@ runs:
             # newline between them (e.g. "}[PASS]    go: 56.9% (baseline 56.9%)"),
             # so a `^`-anchored match silently finds nothing on a real run.
             cov_detail=$(grep -oE '\[(PASS|FAIL|NEW|DROPPED)\][[:space:]]+.*' "$coverage_out" | sed -E 's/^\[[A-Z]+\][[:space:]]+//' | paste -sd ';' - | sed 's/;/; /g')
-            [[ -z "$cov_detail" ]] && cov_detail="see details below"
+            [[ -z "$cov_detail" ]] && cov_detail="see error output below"
             echo "- ${cov_icon} **coverage** — ${cov_detail}"
+            emit_error_output "$coverage_out" "$COVERAGE_EXIT_CODE"
             echo
-            echo "<details><summary>full output</summary>"
-            echo
-            echo '```'
-            cat "$coverage_out"
-            echo '```'
-            echo
-            echo "</details>"
+          fi
+
+          if [[ -n "${ARTIFACT_URL}" ]]; then
+            echo "📦 [Full bulwark output](${ARTIFACT_URL}) — complete scan and coverage logs."
           fi
         } > "${summary}"
+
+        # Final safety net: never exceed GitHub's 65536-char comment limit, even
+        # if two bounded excerpts plus headers somehow approach it. Truncating
+        # here still leaves the full logs available in the artifact.
+        limit=65000
+        if (( $(wc -c < "$summary" | tr -d ' ') > limit )); then
+          head -c "$limit" "$summary" > "${summary}.tmp"
+          printf '\n\n… comment truncated to fit GitHub'"'"'s 65536-char limit — see the run artifact for full output …\n' >> "${summary}.tmp"
+          mv "${summary}.tmp" "$summary"
+        fi
         echo "summary-path=${summary}" >> "$GITHUB_OUTPUT"
 
     - name: Post PR summary
