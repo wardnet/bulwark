@@ -239,7 +239,7 @@ func patchReport(cmd *cobra.Command, ctx context.Context, dir string, want cover
 			if sources.GoProfile == "" || sources.ModuleName == "" {
 				continue
 			}
-			hits, err := coverage.ParseGoProfile(sources.GoProfile, sources.ModuleName)
+			hits, err := coverage.ParseGoProfile(sources.GoProfile, sources.ModuleName, dir)
 			if err != nil {
 				continue
 			}
