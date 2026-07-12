@@ -207,7 +207,17 @@ happens later, when changed lines are intersected with a coverage report's line-
 **A Go coverage profile is the exception, and it bit us.** lcov (Rust, TypeScript) lists only
 executable lines, so "absent from the report" safely means "not executable, don't count it". A Go
 profile records *blocks*, not statements — every line between a block's braces is in the report,
-comments and blank lines included. So a comment added inside an uncovered function counted as an
+comments and blank lines included.
+
+The dividing line is the *format*, not the tooling: lcov simply has no slot for a non-executable
+line, whereas a Go profile has no notion of a line at all, only a brace-to-brace span that bulwark
+itself expands. Don't infer it from how the tool measures — Vitest's default `v8` provider is
+range-based exactly like Go's profile, and `llvm-cov`'s own text report does print counts beside
+comment lines inside a function. Both still emit clean lcov (v8 maps ranges back onto statements via
+`v8-to-istanbul`; `llvm-cov --lcov` only emits `DA:` for lines carrying a coverage segment) —
+verified directly against both producers with a comment and a blank line inside an uncovered
+function, neither of which appeared in the resulting lcov. So Go needs the filtering below and the
+other two genuinely don't. So a comment added inside an uncovered function counted as an
 uncovered new line, and a comment-only PR scored 0% patch coverage and failed the gate
 (`wardnet/inforge#216`, whose entire diff was `nosemgrep` annotations and workflow YAML).
 `internal/coverage.ParseGoProfile` therefore reads each profiled source file and drops blank and
