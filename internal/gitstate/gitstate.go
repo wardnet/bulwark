@@ -21,6 +21,19 @@ import (
 // BranchName is the dedicated branch coverage baselines live on.
 const BranchName = "bulwark-state"
 
+// HeadSHA resolves the commit currently checked out. `bulwark coverage`
+// compares it against BaseSHA to tell a PR run (HEAD is ahead of the
+// merge-base — compare against a baseline) from a main run (HEAD *is* the
+// merge-base — there is nothing to compare against, but the coverage measured
+// right now IS that commit's baseline, and recording it is the whole point).
+func HeadSHA(ctx context.Context, dir string) (string, error) {
+	r := executil.Run(ctx, dir, "git", "rev-parse", "HEAD")
+	if !r.Ok() {
+		return "", fmt.Errorf("git rev-parse HEAD: %w", r.Err)
+	}
+	return strings.TrimSpace(r.Output), nil
+}
+
 // BaseSHA resolves the commit on origin/main this branch diverged from, so
 // bulwark coverage knows which baseline to compare against.
 func BaseSHA(ctx context.Context, dir string) (string, error) {
