@@ -201,9 +201,21 @@ Changed lines come from a hand-rolled unified-diff hunk parser (`internal/covera
 needed is a small, stable subset (hunk headers + `+` lines). `mergeBase` is the exact same SHA
 `gitstate.BaseSHA` already resolved for the aggregate baseline lookup, reused as-is rather than
 recomputed. The parser does no language-aware filtering of comments/blank lines/imports — that
-happens for free later, when changed lines are intersected with a coverage report's line-hit data
-(`internal/coverage.PatchPercent`), since non-executable lines never appear in a coverage report to
-begin with.
+happens later, when changed lines are intersected with a coverage report's line-hit data
+(`internal/coverage.PatchPercent` counts only lines the report actually mentions).
+
+**A Go coverage profile is the exception, and it bit us.** lcov (Rust, TypeScript) lists only
+executable lines, so "absent from the report" safely means "not executable, don't count it". A Go
+profile records *blocks*, not statements — every line between a block's braces is in the report,
+comments and blank lines included. So a comment added inside an uncovered function counted as an
+uncovered new line, and a comment-only PR scored 0% patch coverage and failed the gate
+(`wardnet/inforge#216`, whose entire diff was `nosemgrep` annotations and workflow YAML).
+`internal/coverage.ParseGoProfile` therefore reads each profiled source file and drops blank and
+`//`-comment lines before they ever reach `LineHits`. It deliberately does **not** try to track
+`/* */` comments (that needs a lexer — `/*` inside a string literal opens nothing) or treat a
+leading `*` as a comment continuation (`*p = x` is a pointer assignment): over-counting a rare block
+comment merely understates patch coverage, while wrongly dropping a statement would let genuinely
+untested code through the gate.
 
 Per-ecosystem line-hit sources, all converging on the same `LineHits` (`map[file]map[line]hits`)
 shape:

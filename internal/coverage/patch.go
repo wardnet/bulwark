@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -32,9 +33,12 @@ var hunkHeader = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
 // context lines never count; `--unified=0` already drops context lines from
 // the diff itself, so only "@@" headers and "+" lines need parsing. This
 // deliberately does no language-aware filtering (comments, blank lines,
-// imports) — that happens for free later, when these line numbers are
-// intersected with a coverage report, since non-executable lines never
-// appear in one.
+// imports) — that happens later, when these line numbers are intersected
+// with a coverage report, since PatchPercent counts only lines the report
+// actually mentions. Keeping the filtering there rather than here means it
+// happens once per report format, in the one place that knows whether that
+// format lists non-executable lines: lcov never does, a Go profile's block
+// spans do, so ParseGoProfile drops them explicitly.
 func ChangedLines(ctx context.Context, dir, mergeBase string, exts ...string) (map[string][]int, error) {
 	// -c diff.mnemonicPrefix=false pins the "+++ b/<path>" header form
 	// parseUnifiedDiff expects, regardless of the caller's own git config —
@@ -138,7 +142,17 @@ func ParseLCOV(data []byte, baseDir string) LineHits {
 // [StartLine, EndLine] range — the same block-level granularity `go tool
 // cover -html` itself uses, since the profile format doesn't record
 // per-statement line data any finer than that.
-func ParseGoProfile(path, moduleName string) (LineHits, error) {
+//
+// That block-level granularity is precisely why comment and blank lines have
+// to be excluded here, reading each profiled file from dir to do it. lcov —
+// which the Rust and TypeScript paths parse — only ever records executable
+// lines, so PatchPercent can safely treat "line absent from the report" as
+// "not executable, don't count it". A Go block's span makes no such
+// distinction: every line between its braces lands in the report, comments
+// included. Left unfiltered, adding a comment inside an uncovered function
+// counts as an uncovered new line, and a comment-only PR scores 0% patch
+// coverage and fails the gate — which is exactly what wardnet/inforge#216 hit.
+func ParseGoProfile(path, moduleName, dir string) (LineHits, error) {
 	profiles, err := cover.ParseProfiles(path)
 	if err != nil {
 		return nil, err
@@ -147,9 +161,13 @@ func ParseGoProfile(path, moduleName string) (LineHits, error) {
 	for _, p := range profiles {
 		rel := strings.TrimPrefix(p.FileName, moduleName+"/")
 		rel = filepath.ToSlash(rel)
+		skip := nonExecutableLines(filepath.Join(dir, filepath.FromSlash(rel)))
 		fileHits := map[int]int{}
 		for _, b := range p.Blocks {
 			for line := b.StartLine; line <= b.EndLine; line++ {
+				if skip[line] {
+					continue
+				}
 				if count, seen := fileHits[line]; !seen || b.Count > count {
 					fileHits[line] = b.Count
 				}
@@ -158,6 +176,42 @@ func ParseGoProfile(path, moduleName string) (LineHits, error) {
 		hits[rel] = fileHits
 	}
 	return hits, nil
+}
+
+// nonExecutableLines returns the 1-indexed lines of a Go source file that can
+// hold no statement: blank lines, and lines whose only content is a `//`
+// comment. An unreadable file yields an empty set, degrading to the old
+// count-every-line-in-the-block behavior rather than failing the whole patch
+// report over one missing source file.
+//
+// `/* */` comments are deliberately not tracked: doing it correctly means
+// lexing (a `/*` inside a string literal opens nothing), and the payoff is
+// small — inside a function body, where this matters, Go code overwhelmingly
+// uses `//`. A line starting with `*` is likewise left alone: `*p = x` is a
+// pointer assignment, not a comment continuation, and wrongly dropping an
+// executable line would understate the denominator and let real untested code
+// through the gate. Over-counting a rare block comment is the safe direction
+// to err in; under-counting a statement is not.
+func nonExecutableLines(path string) map[int]bool {
+	f, err := os.Open(path) // #nosec G304 -- path comes from bulwark's own coverage profile, not user input
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = f.Close() }()
+
+	skip := map[int]bool{}
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+	for line := 1; scanner.Scan(); line++ {
+		trimmed := strings.TrimSpace(scanner.Text())
+		if trimmed == "" || strings.HasPrefix(trimmed, "//") {
+			skip[line] = true
+		}
+	}
+	if scanner.Err() != nil {
+		return nil
+	}
+	return skip
 }
 
 // normalizeRelPath converts an absolute path under baseDir (as many coverage
