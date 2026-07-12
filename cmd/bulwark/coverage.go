@@ -63,6 +63,11 @@ func newCoverageCmd() *cobra.Command {
 				_, err := fmt.Fprintln(cmd.OutOrStdout(), msg)
 				return err
 			}
+			// A partially-measured current tree is just as invisible as an
+			// unmeasured one: the language simply doesn't appear in the report.
+			if err := warnUnmeasured(cmd, dir, cfg, current, "the current tree"); err != nil {
+				return err
+			}
 
 			sha, err := gitstate.BaseSHA(ctx, dir)
 			if err != nil {
@@ -77,15 +82,29 @@ func newCoverageCmd() *cobra.Command {
 				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "no cached baseline for %s — computing one now (first PR against this main commit pays this cost)\n", sha); err != nil {
 					return err
 				}
-				baseline, err = computeBaselineAt(ctx, dir, sha, cfg)
+				baseline, err = computeBaselineAt(ctx, cmd, dir, sha, cfg)
 				if err != nil {
 					return err
 				}
-				// Caching the baseline is best-effort: a write failure (worktree
-				// race, disk pressure, transient git error) must never fail this
-				// command outright — `current` and `baseline` are already
-				// computed, and diffReport below is what actually matters.
-				if err := gitstate.WriteBaseline(ctx, dir, sha, baseline); err != nil {
+				// Never cache a baseline that measured nothing. Compute silently
+				// omits any language whose tooling it couldn't run, so a runner
+				// missing (say) cargo-llvm-cov produces an empty report — and
+				// caching it makes every later PR hit a "valid" baseline of
+				// nothing, report every language as [NEW], and gate on nothing at
+				// all, silently and permanently. That is exactly what happened to
+				// wardnet: nine baselines on its bulwark-state branch, every one
+				// of them `{}`. A run that measured nothing has learned nothing,
+				// so there is nothing worth remembering; recomputing next time is
+				// the strictly better failure mode.
+				if len(baseline) == 0 {
+					if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "warning: computed no coverage at all for %s — not caching it as a baseline. The gate cannot compare against a baseline of nothing; fix the missing tooling above and it will recompute.\n", sha); err != nil {
+						return err
+					}
+				} else if err := gitstate.WriteBaseline(ctx, dir, sha, baseline); err != nil {
+					// Caching is otherwise best-effort: a write failure (worktree
+					// race, disk pressure, transient git error) must never fail this
+					// command outright — `current` and `baseline` are already
+					// computed, and diffReport below is what actually matters.
 					if _, printErr := fmt.Fprintf(cmd.ErrOrStderr(), "warning: failed to cache coverage baseline for %s: %v\n", sha, err); printErr != nil {
 						return printErr
 					}
@@ -157,7 +176,7 @@ func parseRustReportOverrides(values []string) coverage.RustReportOverrides {
 // main commit (cached afterward on the bulwark-state branch), not a
 // per-invocation cost, so it doesn't reintroduce the duplicate-test-run
 // problem --tests=skip exists to avoid.
-func computeBaselineAt(ctx context.Context, dir, sha string, cfg config.Config) (map[string]float64, error) {
+func computeBaselineAt(ctx context.Context, cmd *cobra.Command, dir, sha string, cfg config.Config) (map[string]float64, error) {
 	tmp, err := os.MkdirTemp("", "bulwark-baseline-*")
 	if err != nil {
 		return nil, err
@@ -174,7 +193,41 @@ func computeBaselineAt(ctx context.Context, dir, sha string, cfg config.Config) 
 	// zero value here, and the resolved sources/cleanup are discarded.
 	report, _, cleanup, err := coverage.Compute(ctx, tmp, cfg, coverage.ModeRun, coverage.ReportPaths{}, coverage.PatchWanted{})
 	defer cleanup()
-	return report, err
+	if err != nil {
+		return nil, err
+	}
+	// The baseline worktree is where measurement most often fails unnoticed: it
+	// is a bare checkout with no node_modules, no CI-staged report, and only
+	// whatever tooling the runner happens to have. Name what went unmeasured
+	// here, or the failure surfaces later as the far more confusing "no
+	// baseline yet" against a bulwark-state branch that visibly has files in it.
+	if err := warnUnmeasured(cmd, tmp, cfg, report, "at "+sha[:min(8, len(sha))]); err != nil {
+		return nil, err
+	}
+	return report, nil
+}
+
+// warnUnmeasured prints a warning for every ecosystem bulwark detected in dir
+// but produced no coverage number for. coverage.Compute drops such a language
+// silently — deliberately, since a repo with no coverage tooling shouldn't hard
+// fail — but silent omission is also how a whole ecosystem can vanish from the
+// gate without anyone noticing. Saying so out loud costs nothing and is the
+// difference between "rust is unmeasured because cargo-llvm-cov isn't
+// installed" and a mystery.
+func warnUnmeasured(cmd *cobra.Command, dir string, cfg config.Config, report map[string]float64, where string) error {
+	ecosystems, err := detect.Ecosystems(dir, cfg.AllExcludes())
+	if err != nil {
+		return err
+	}
+	for _, e := range ecosystems {
+		if _, measured := report[string(e)]; measured {
+			continue
+		}
+		if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s detected %s, but measured no coverage for it — its coverage tooling is missing or failed, so it is absent from the gate\n", where, e); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // statusPrefix renders a bracketed status tag padded to a fixed column width
