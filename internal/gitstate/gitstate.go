@@ -50,6 +50,18 @@ func ReadBaseline(ctx context.Context, dir, sha string) (map[string]float64, boo
 	if err := json.Unmarshal([]byte(r.Output), &report); err != nil {
 		return nil, false, fmt.Errorf("parsing cached baseline for %s: %w", sha, err)
 	}
+	// An empty baseline ("{}") is a cache miss, not a baseline of nothing.
+	// Coverage.Compute silently omits any language it couldn't measure, so a
+	// baseline computed on a runner missing that language's tooling comes back
+	// empty — and once written, it's indistinguishable from a valid entry:
+	// every later PR gets a cache *hit* on it, reports every language as [NEW],
+	// and the gate enforces nothing, permanently and silently. wardnet's
+	// bulwark-state branch accumulated nine of these. WriteBaseline now refuses
+	// to cache an empty report in the first place; treating one as a miss here
+	// heals the entries that were already written, without a manual purge.
+	if len(report) == 0 {
+		return nil, false, nil
+	}
 	return report, true, nil
 }
 

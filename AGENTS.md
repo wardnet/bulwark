@@ -130,6 +130,20 @@ generated cache data, not source, needs no PR/review and never pollutes main's h
   repeatable, keyed flags (`--rust-report <crateDir>=<path>`, crateDir relative to `--dir`) rather
   than a single path — a bare value (no `=`) is only honored when discovery finds exactly one crate,
   preserving the original single-crate invocation unchanged.
+- **An empty baseline is never cached, and an empty cached baseline is a miss.** `Compute` silently
+  omits any language whose tooling it can't run (deliberate — a repo with no coverage tooling
+  shouldn't hard fail). But baseline computation runs in a *bare worktree*: no `node_modules`, no
+  CI-staged report, only whatever tooling the runner happens to have. `internal/coverage.rustCoverage`
+  in `ModeRun` requires `cargo-llvm-cov` on `PATH` and bulwark does **not** install it (unlike
+  cargo-audit/cargo-deny/gosec/semgrep, which it pins and installs itself) — so on a runner without
+  it, the baseline computes to `{}`. Cached, that `{}` is indistinguishable from a real entry: every
+  later PR gets a cache *hit*, every language reports `[NEW]`, and the gate enforces **nothing**,
+  silently and permanently, with no way to self-heal. wardnet ran this way — all nine baselines on
+  its `bulwark-state` branch were `{}`, and its coverage gate had never once compared anything.
+  `cmd/bulwark/coverage.go` therefore refuses to cache an empty report, `gitstate.ReadBaseline`
+  treats a cached `{}` as a miss (which heals already-poisoned branches without a manual purge), and
+  `warnUnmeasured` names every detected-but-unmeasured ecosystem on stderr rather than dropping it in
+  silence. If a language is missing from the gate, bulwark now says so.
 - A language with no prior baseline entry (new) is reported but doesn't fail the check on its own;
   a language whose current coverage is below its baseline does; a language dropped from the current
   run (baseline had it, current doesn't) is reported as `[DROPPED]` and also doesn't fail on its own.
