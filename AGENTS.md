@@ -125,9 +125,16 @@ generated cache data, not source, needs no PR/review and never pollutes main's h
 - On a cache miss, `cmd/bulwark/coverage.go`'s `computeBaselineAt` checks out `origin/main` at that
   SHA into a throwaway `git worktree` (never disturbing the caller's own working tree/branch),
   computes coverage there, and `internal/gitstate.WriteBaseline` pushes it to `bulwark-state` (via
-  another throwaway worktree — creating the branch as an orphan the first time). A push race with
-  another concurrent cache-miss is non-fatal: caching is an optimization, the caller already has its
-  computed value regardless.
+  another throwaway worktree — creating the branch as an orphan the first time). `bulwark-state` is
+  shared and busy — every CI run on the repo may push to it — so `WriteBaseline` fetches the fresh
+  remote ref immediately before staging each attempt (the local tracking ref is as stale as the
+  job's checkout, minutes old by the time a scan finishes) and retries a rejected push from the
+  re-fetched ref, treating "the fetched branch already has this exact content" as success. A push
+  that never lands is returned as an error: the PR-side cache-miss caller downgrades it to a
+  warning (it already holds the computed baseline), but the record-on-main path must never print
+  "recorded" for a baseline that was lost — that exact silent loss (stale ref → non-fast-forward
+  rejection → swallowed) is how wardnet's main runs kept recording nothing while every PR
+  re-hit a cache miss.
 - `internal/coverage.Compute` gets the actual number per detected ecosystem: `go tool cover -func`'s
   total line for Go, `cargo llvm-cov --json`'s `data[0].totals.lines.percent` for Rust, and — for
   TypeScript, best-effort only — a package's own `test:coverage` script plus Vitest/Istanbul's
