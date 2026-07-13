@@ -80,15 +80,35 @@ func ReadBaseline(ctx context.Context, dir, sha string) (map[string]float64, boo
 
 // WriteBaseline caches report for sha on the bulwark-state branch, via a
 // throwaway worktree so the caller's own working tree/branch is untouched.
-// A push race (another PR wrote the same SHA's baseline concurrently) is
-// non-fatal — caching is an optimization, not a correctness requirement,
-// since the caller already has its computed report in memory regardless.
+//
+// The branch is shared and busy — every CI run on the repo may push to it —
+// so a non-fast-forward rejection is a routine event, not an edge case: the
+// local origin/bulwark-state tracking ref is as stale as the job's checkout
+// (wardnet's scan runs for minutes between the two), and any concurrent run
+// that lands a baseline in that window advances the remote. Each attempt
+// therefore fetches the fresh remote ref immediately before staging, and a
+// rejected push is retried from that fresh ref rather than swallowed. A push
+// that never lands is returned as an error — the caller decides whether
+// that's fatal, but it must never be reported as recorded (wardnet's main
+// run printed "recorded coverage baseline" while the push had been rejected,
+// and its PRs gated against nothing).
 func WriteBaseline(ctx context.Context, dir, sha string, report map[string]float64) error {
 	data, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
 		return err
 	}
+	const attempts = 3
+	var lastErr error
+	for range attempts {
+		if lastErr = pushBaseline(ctx, dir, sha, data); lastErr == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("pushing baseline for %s to %s (%d attempts): %w", sha, BranchName, attempts, lastErr)
+}
 
+// pushBaseline is one fetch → stage → commit → push attempt.
+func pushBaseline(ctx context.Context, dir, sha string, data []byte) error {
 	tmp, err := os.MkdirTemp("", "bulwark-state-*")
 	if err != nil {
 		return err
@@ -108,6 +128,13 @@ func WriteBaseline(ctx context.Context, dir, sha string, report map[string]float
 
 	branchExists := executil.Run(ctx, dir, "git", "ls-remote", "--exit-code", "--heads", "origin", BranchName).Ok()
 	if branchExists {
+		// Refresh origin/<BranchName> right before staging on it: the tracking
+		// ref left behind by the job's checkout (or a prior ReadBaseline) can
+		// be minutes stale, and a staging branch built on a stale ref pushes
+		// non-fast-forward and is rejected.
+		if r := executil.Run(ctx, dir, "git", "fetch", "origin", BranchName); !r.Ok() {
+			return fmt.Errorf("fetch %s: %w", BranchName, r.Err)
+		}
 		if r := executil.Run(ctx, dir, "git", "worktree", "add", "-b", staging, tmp, "origin/"+BranchName); !r.Ok() {
 			return fmt.Errorf("worktree add %s: %w", BranchName, r.Err)
 		}
@@ -130,6 +157,15 @@ func WriteBaseline(ctx context.Context, dir, sha string, report map[string]float
 	if r := executil.Run(ctx, tmp, "git", "add", sha+".json"); !r.Ok() {
 		return fmt.Errorf("git add: %w", r.Err)
 	}
+	// Nothing staged means the fetched branch already carries this exact
+	// content — a concurrent run recorded the same SHA's baseline first. The
+	// desired state is on the remote; committing here would fail ("nothing to
+	// commit"), so this is success, not an error. Different content (notably a
+	// poisoned `{}` entry being healed by a real report) stages a change and
+	// proceeds to overwrite as usual.
+	if executil.Run(ctx, tmp, "git", "diff", "--cached", "--quiet").Ok() {
+		return nil
+	}
 	commitR := executil.RunEnv(ctx, tmp, []string{
 		"GIT_AUTHOR_NAME=bulwark", "GIT_AUTHOR_EMAIL=bulwark@users.noreply.github.com",
 		"GIT_COMMITTER_NAME=bulwark", "GIT_COMMITTER_EMAIL=bulwark@users.noreply.github.com",
@@ -138,8 +174,7 @@ func WriteBaseline(ctx context.Context, dir, sha string, report map[string]float
 		return fmt.Errorf("git commit: %w", commitR.Err)
 	}
 	if r := executil.Run(ctx, tmp, "git", "push", "origin", staging+":refs/heads/"+BranchName); !r.Ok() {
-		// Non-fatal: see doc comment above — caching is best-effort.
-		return nil
+		return fmt.Errorf("git push: %w", r.Err)
 	}
 	return nil
 }

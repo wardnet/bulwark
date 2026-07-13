@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sync"
 )
 
 // Result is the outcome of running one external command.
@@ -43,11 +44,26 @@ func run(ctx context.Context, dir string, extraEnv []string, name string, args .
 	if len(extraEnv) > 0 {
 		cmd.Env = append(os.Environ(), extraEnv...)
 	}
+	// Stdout and Stderr being distinct writers makes os/exec copy each stream
+	// on its own goroutine, and both feed the same capture buffer — so the
+	// buffer writes must be locked.
 	var buf bytes.Buffer
-	cmd.Stdout = io.MultiWriter(os.Stdout, &buf)
-	cmd.Stderr = io.MultiWriter(os.Stderr, &buf)
+	captured := &lockedWriter{w: &buf}
+	cmd.Stdout = io.MultiWriter(os.Stdout, captured)
+	cmd.Stderr = io.MultiWriter(os.Stderr, captured)
 	err := cmd.Run()
 	return Result{Name: name, Args: args, Output: buf.String(), Err: err}
+}
+
+type lockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
 
 // Available reports whether name is resolvable on PATH.
