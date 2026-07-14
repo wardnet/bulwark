@@ -277,7 +277,11 @@ runs:
             # JSON blob and the "[PASS] go: ..." summary together with no
             # newline between them (e.g. "}[PASS]    go: 56.9% (baseline 56.9%)"),
             # so a `^`-anchored match silently finds nothing on a real run.
-            cov_detail=$(grep -oE '\[(PASS|FAIL|NEW|DROPPED)\][[:space:]]+.*' "$coverage_out" | sed -E 's/^\[[A-Z]+\][[:space:]]+//' | paste -sd ';' - | sed 's/;/; /g')
+            # The tag itself is deliberately generic ([A-Z]+, not an enumerated
+            # PASS|FAIL|... list): bulwark's gate output is the only bracketed
+            # text on coverage stdout, and enumerating tags silently dropped
+            # [UNMEASURED] lines from the comment when that tag was added.
+            cov_detail=$(grep -oE '\[[A-Z]+\][[:space:]]+.*' "$coverage_out" | sed -E 's/^\[[A-Z]+\][[:space:]]+//' | paste -sd ';' - | sed 's/;/; /g')
             [[ -z "$cov_detail" ]] && cov_detail="see error output below"
             echo "- ${cov_icon} **coverage** — ${cov_detail}"
             emit_error_output "$coverage_out" "$COVERAGE_EXIT_CODE"

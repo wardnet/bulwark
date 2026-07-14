@@ -78,6 +78,69 @@ func ReadBaseline(ctx context.Context, dir, sha string) (map[string]float64, boo
 	return report, true, nil
 }
 
+// PriorBaselines returns, for each language in langs, that language's entry
+// from the nearest prior cached baseline that has one. "Nearest" starts at
+// sha ITSELF — a re-run or a concurrent per-language job may already have
+// recorded a fresher entry for this very commit, which must beat any
+// ancestor's — and then walks first-parent ancestors, inspecting at most
+// maxDepth commits. It feeds the baseline writers' carry-forward of
+// detected-but-unmeasured languages, so it is entirely best-effort: a missing
+// state branch, shallow history, or an unparsable entry yields fewer (or no)
+// entries, never an error — the caller records what it measured either way,
+// and warns about what it couldn't fill.
+func PriorBaselines(ctx context.Context, dir, sha string, langs []string, maxDepth int) map[string]float64 {
+	found := make(map[string]float64, len(langs))
+	if len(langs) == 0 {
+		return found
+	}
+	if r := executil.Run(ctx, dir, "git", "fetch", "origin", BranchName); !r.Ok() {
+		return found
+	}
+	// One ls-tree up front so only commits that actually have a cached
+	// baseline cost a `git show`.
+	ls := executil.Run(ctx, dir, "git", "ls-tree", "--name-only", "origin/"+BranchName)
+	if !ls.Ok() {
+		return found
+	}
+	cached := make(map[string]bool)
+	for _, name := range strings.Fields(ls.Output) {
+		cached[name] = true
+	}
+	// rev-list from sha (not sha~1) keeps this working on a shallow checkout
+	// too: even at fetch-depth 1 it can still see the same-sha entry.
+	rev := executil.Run(ctx, dir, "git", "rev-list", "--first-parent", fmt.Sprintf("--max-count=%d", maxDepth), sha)
+	if !rev.Ok() {
+		return found
+	}
+	for _, commit := range strings.Fields(rev.Output) {
+		if !cached[commit+".json"] {
+			continue
+		}
+		r := executil.Run(ctx, dir, "git", "show", "origin/"+BranchName+":"+commit+".json")
+		if !r.Ok() {
+			continue
+		}
+		var report map[string]float64
+		// Same poison rule as ReadBaseline: an empty (or unparsable) entry
+		// carries no information worth forwarding.
+		if err := json.Unmarshal([]byte(r.Output), &report); err != nil || len(report) == 0 {
+			continue
+		}
+		for _, lang := range langs {
+			if _, have := found[lang]; have {
+				continue
+			}
+			if val, ok := report[lang]; ok {
+				found[lang] = val
+			}
+		}
+		if len(found) == len(langs) {
+			break
+		}
+	}
+	return found
+}
+
 // WriteBaseline caches report for sha on the bulwark-state branch, via a
 // throwaway worktree so the caller's own working tree/branch is untouched.
 //
