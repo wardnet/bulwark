@@ -136,7 +136,12 @@ generated cache data, not source, needs no PR/review and never pollutes main's h
   longer *detected*, so its entry still dies with it; only "the code is there but this run didn't
   measure it" carries forward. The `recorded coverage baseline` line names anything carried, and an
   unmeasured language *no* prior had is named in a stderr warning (shallow history is the usual
-  culprit) instead of vanishing silently.
+  culprit) instead of vanishing silently. This applies even when a main run measures **nothing**
+  (a docs-only merge: every producer path-filtered away, no reports for `--tests=skip` to read) —
+  the whole baseline is carried rather than skipping the record, because a main commit with no
+  baseline forces every PR against it into the recompute-nothing → all-`[NEW]` → gate-on-nothing
+  hole (wardnet/wardnet#899). "No coverage measured" is only printed when there was truly nothing
+  to record: nothing measured *and* no priors to carry.
 - `internal/gitstate.BaseSHA` resolves `git merge-base HEAD origin/main`.
 - `internal/gitstate.ReadBaseline` fetches `bulwark-state` and reads `<sha>.json` via `git show`
   (no checkout) — a missing branch or missing file is a cache miss, not an error.
