@@ -10,14 +10,75 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+
+	"wardnet/bulwark/internal/config"
+	"wardnet/bulwark/internal/detect"
 )
 
-func runDiffReport(t *testing.T, current, baseline map[string]float64) (string, error) {
+// unmeasuredLanguages is the single source of truth for "detected but not
+// measured this run" — the predicate the unmeasured warning, the
+// carry-forward trigger, and the merge all share, so it cannot drift between
+// them. An undetected language in the report (shouldn't happen, but) is not
+// unmeasured; a detected one absent from the report is.
+func TestUnmeasuredLanguages(t *testing.T) {
+	got := unmeasuredLanguages(
+		[]detect.Ecosystem{detect.Rust, detect.TypeScript, detect.Go},
+		map[string]float64{"rust": 86},
+	)
+	if !reflect.DeepEqual(got, []string{"go", "typescript"}) {
+		t.Errorf("unmeasuredLanguages = %v, want [go typescript] (sorted)", got)
+	}
+	if got := unmeasuredLanguages([]detect.Ecosystem{detect.Rust}, map[string]float64{"rust": 86}); len(got) != 0 {
+		t.Errorf("fully measured: unmeasuredLanguages = %v, want none", got)
+	}
+}
+
+// mergeCarried is what makes a partial run safe to record as a baseline: a
+// detected-but-unmeasured language keeps its entry from the prior lookup
+// (the code is still there; only this run's measurement is missing), while
+// anything the lookup couldn't fill is returned as missing so the caller
+// warns instead of shrinking the baseline in silence. Measured values are
+// never touched, and the input map is never mutated.
+func TestMergeCarried(t *testing.T) {
+	current := map[string]float64{"rust": 86}
+	record, carried, missing := mergeCarried(current, []string{"go", "typescript"}, map[string]float64{"typescript": 93.8})
+
+	want := map[string]float64{"rust": 86, "typescript": 93.8}
+	if !reflect.DeepEqual(record, want) {
+		t.Errorf("mergeCarried record = %v, want %v", record, want)
+	}
+	if !reflect.DeepEqual(carried, []string{"typescript"}) || !reflect.DeepEqual(missing, []string{"go"}) {
+		t.Errorf("carried = %v missing = %v, want [typescript] / [go]", carried, missing)
+	}
+	if len(current) != 1 {
+		t.Errorf("mergeCarried mutated its input: %v", current)
+	}
+
+	record, carried, missing = mergeCarried(current, nil, nil)
+	if !reflect.DeepEqual(record, current) || len(carried) != 0 || len(missing) != 0 {
+		t.Errorf("nothing unmeasured: record = %v carried = %v missing = %v, want record == current and empty lists", record, carried, missing)
+	}
+}
+
+// enabledEcosystems makes `enabled: false` in .bulwark.yml behave exactly
+// like source removal for the coverage gate: the language stops being
+// "detected", so its baseline entry dies on the next record instead of being
+// carried forward (and [UNMEASURED]-reported) forever.
+func TestEnabledEcosystemsDropsDisabledLanguages(t *testing.T) {
+	cfg := config.Default()
+	cfg.TypeScript.Enabled = false
+	got := enabledEcosystems([]detect.Ecosystem{detect.Rust, detect.TypeScript, detect.Go}, cfg)
+	if !reflect.DeepEqual(got, []detect.Ecosystem{detect.Rust, detect.Go}) {
+		t.Errorf("enabledEcosystems = %v, want [rust go] with typescript disabled", got)
+	}
+}
+
+func runDiffReport(t *testing.T, current, baseline map[string]float64, detected ...detect.Ecosystem) (string, error) {
 	t.Helper()
 	cmd := &cobra.Command{}
 	var buf bytes.Buffer
 	cmd.SetOut(&buf)
-	err := diffReport(cmd, current, baseline)
+	err := diffReport(cmd, current, baseline, detected)
 	return buf.String(), err
 }
 
@@ -43,6 +104,26 @@ func TestDiffReportDroppedLanguage(t *testing.T) {
 	}
 	if !strings.Contains(out, "[DROPPED]") || !strings.Contains(out, "typescript") {
 		t.Fatalf("expected a [DROPPED] line mentioning typescript, got: %q", out)
+	}
+}
+
+// A language that is still detected in the tree but produced no measurement
+// this run (a path-filtered CI job skipped its coverage step — wardnet PR
+// #892) is not "no longer measured": the code is right there. It must be
+// reported as [UNMEASURED], reserving [DROPPED] for a language whose source
+// actually left the tree. Neither fails the check on its own.
+func TestDiffReportUnmeasuredWhenLanguageStillDetected(t *testing.T) {
+	out, err := runDiffReport(t, map[string]float64{"rust": 86},
+		map[string]float64{"rust": 85.8, "typescript": 93.8},
+		detect.Rust, detect.TypeScript)
+	if err != nil {
+		t.Fatalf("an unmeasured-but-detected language must not fail the check, got error: %v", err)
+	}
+	if !strings.Contains(out, "[UNMEASURED]") || !strings.Contains(out, "not measured this run") {
+		t.Fatalf("expected an [UNMEASURED] line for typescript, got: %q", out)
+	}
+	if strings.Contains(out, "[DROPPED]") {
+		t.Fatalf("a detected language must not be reported as [DROPPED], got: %q", out)
 	}
 }
 

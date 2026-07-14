@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"wardnet/bulwark/internal/executil"
@@ -98,6 +100,78 @@ func seedStateBranch(t *testing.T, ctx context.Context, files map[string]string)
 	run(seed, "remote", "add", "origin", origin)
 	run(seed, "push", "origin", BranchName)
 	return origin
+}
+
+// PriorBaselines feeds the baseline writers' carry-forward: when a partial
+// run (path-filtered jobs, bare baseline worktree) measures only some of the
+// detected languages, the unmeasured ones keep their entry from the nearest
+// prior baseline instead of silently vanishing from the gate. Each language
+// must come from the nearest commit that has it — starting at sha ITSELF (a
+// re-run or a concurrent per-language job may already have recorded a fresher
+// entry for this very commit, which must beat any ancestor's), then
+// first-parent ancestors — skipping empty `{}` entries (poison, same as
+// ReadBaseline) and honoring maxDepth.
+func TestPriorBaselinesNearestCommitWinsPerLanguage(t *testing.T) {
+	ctx := context.Background()
+	run := gitRunner(t, ctx)
+
+	// A clone with a real main history c1 -> c2 -> c3 -> c4 (HEAD).
+	clone := t.TempDir()
+	run(clone, "init", "-b", "main", ".")
+	run(clone, "config", "user.email", "t@t")
+	run(clone, "config", "user.name", "t")
+	shas := make([]string, 0, 4)
+	for i := range 4 {
+		if err := os.WriteFile(filepath.Join(clone, "f.txt"), []byte{byte('a' + i)}, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		run(clone, "add", "-A")
+		run(clone, "commit", "-m", "c")
+		r := executil.Run(ctx, clone, "git", "rev-parse", "HEAD")
+		if !r.Ok() {
+			t.Fatalf("rev-parse: %v", r.Err)
+		}
+		shas = append(shas, strings.TrimSpace(r.Output))
+	}
+	c1, c2, c3, c4 := shas[0], shas[1], shas[2], shas[3]
+
+	// bulwark-state has baselines for c4 itself (a concurrent job's fresh
+	// entry), c3 (empty — must be skipped), c2, and c1.
+	origin := seedStateBranch(t, ctx, map[string]string{
+		c4 + ".json": `{"go":77}`,
+		c3 + ".json": "{}",
+		c2 + ".json": `{"rust":10}`,
+		c1 + ".json": `{"rust":20,"typescript":93.8}`,
+	})
+	run(clone, "remote", "add", "origin", origin)
+
+	got := PriorBaselines(ctx, clone, c4, []string{"go", "rust", "typescript"}, 10)
+	want := map[string]float64{"go": 77, "rust": 10, "typescript": 93.8}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("PriorBaselines = %v, want %v (go from c4 itself, rust from c2, typescript from c1)", got, want)
+	}
+
+	// maxDepth counts commits inspected starting at sha, so depth 2 only
+	// reaches c4 and c3 (empty, skipped): rust/typescript stay unfilled.
+	if got := PriorBaselines(ctx, clone, c4, []string{"go", "rust", "typescript"}, 2); !reflect.DeepEqual(got, map[string]float64{"go": 77}) {
+		t.Errorf("PriorBaselines with maxDepth=2 = %v, want just c4's go entry", got)
+	}
+
+	// Nothing needed means nothing looked up (and certainly nothing returned).
+	if got := PriorBaselines(ctx, clone, c4, nil, 10); len(got) != 0 {
+		t.Errorf("PriorBaselines with no needed languages = %v, want empty", got)
+	}
+
+	// Best-effort everywhere: no bulwark-state branch at all is no priors,
+	// not an error.
+	bare := t.TempDir()
+	run(bare, "init", "--bare", "-b", "main", ".")
+	orphan := t.TempDir()
+	run(orphan, "init", "-b", "main", ".")
+	run(orphan, "remote", "add", "origin", bare)
+	if got := PriorBaselines(ctx, orphan, c4, []string{"go"}, 10); len(got) != 0 {
+		t.Errorf("PriorBaselines with no state branch = %v, want empty", got)
+	}
 }
 
 // The exact race that lost wardnet's main-run baseline: the caller's local

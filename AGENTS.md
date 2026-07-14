@@ -119,6 +119,24 @@ generated cache data, not source, needs no PR/review and never pollutes main's h
   worktree were numbers it had *already measured, and thrown away*, when this same command ran on
   main. Recording them costs nothing — no test re-run, no extra tooling, they are already in hand.
   **Consumers must therefore run `bulwark coverage` on pushes to main, not only on PRs.**
+- **Baseline writes merge; a partial run never shrinks the baseline.** A consumer's CI may
+  path-filter its coverage jobs (wardnet skips frontend coverage on a Rust-only change), and the
+  cache-miss worktree routinely lacks tooling, so either write path can legitimately measure only
+  some of the detected languages. Recording only what was measured would silently drop the
+  unmeasured language's entry — every later PR would see it as `[NEW]`, compared against nothing,
+  permanently, and the "never cache an empty baseline" guard doesn't catch it because the report
+  isn't empty, just partial. So *both* writers (record-on-main and `computeBaselineAt`'s cache-miss
+  path) run `cmd/bulwark/coverage.go`'s `carryForwardBaseline` first: it copies the entry for every
+  *detected-but-unmeasured* language from the nearest prior baseline via `gitstate.PriorBaselines`,
+  which starts at the recorded SHA **itself** (so a re-run or a concurrent per-language job never
+  clobbers a fresher same-commit entry with an ancestor's stale value — and a shallow depth-1
+  checkout can still see it) before walking first-parent ancestors, best-effort, skipping poisoned
+  `{}` entries. A language that's genuinely gone — source deleted, or `enabled: false` in
+  `.bulwark.yml` (`enabledEcosystems` strips disabled languages from the detected set) — is no
+  longer *detected*, so its entry still dies with it; only "the code is there but this run didn't
+  measure it" carries forward. The `recorded coverage baseline` line names anything carried, and an
+  unmeasured language *no* prior had is named in a stderr warning (shallow history is the usual
+  culprit) instead of vanishing silently.
 - `internal/gitstate.BaseSHA` resolves `git merge-base HEAD origin/main`.
 - `internal/gitstate.ReadBaseline` fetches `bulwark-state` and reads `<sha>.json` via `git show`
   (no checkout) — a missing branch or missing file is a cache miss, not an error.
@@ -164,8 +182,12 @@ generated cache data, not source, needs no PR/review and never pollutes main's h
   `warnUnmeasured` names every detected-but-unmeasured ecosystem on stderr rather than dropping it in
   silence. If a language is missing from the gate, bulwark now says so.
 - A language with no prior baseline entry (new) is reported but doesn't fail the check on its own;
-  a language whose current coverage is below its baseline does; a language dropped from the current
-  run (baseline had it, current doesn't) is reported as `[DROPPED]` and also doesn't fail on its own.
+  a language whose current coverage is below its baseline does. A language the baseline has but the
+  current run doesn't splits on detection: still detected in the tree means its coverage step just
+  didn't run this time (path-filtered CI job, missing tooling) and it's reported as `[UNMEASURED]`;
+  no longer detected means the source actually left the tree and it's reported as `[DROPPED]`
+  (wardnet/wardnet#892 showed a Rust-only PR as "typescript: no longer measured" when the TS code
+  was untouched — only the frontend coverage job had been skipped). Neither fails on its own.
 
 ### `--tests=run` vs `--tests=skip`
 
