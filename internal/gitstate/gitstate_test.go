@@ -145,10 +145,21 @@ func TestPriorBaselinesNearestCommitWinsPerLanguage(t *testing.T) {
 	})
 	run(clone, "remote", "add", "origin", origin)
 
-	got := PriorBaselines(ctx, clone, c4, []string{"go", "rust", "typescript"}, 10)
+	// Run from a SUBDIRECTORY of the repo, not its root: consumers point
+	// --dir at a subfolder (wardnet uses --dir source), and every git
+	// plumbing call here must be cwd-independent. `git ls-tree <ref>` without
+	// --full-tree silently scopes to the cwd's path inside the ref's tree —
+	// bulwark-state has no such subtree, so the lookup found nothing and
+	// carry-forward silently no-opped on wardnet's real CI (PR #899's rerun).
+	subdir := filepath.Join(clone, "sub")
+	if err := os.Mkdir(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got := PriorBaselines(ctx, subdir, c4, []string{"go", "rust", "typescript"}, 10)
 	want := map[string]float64{"go": 77, "rust": 10, "typescript": 93.8}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("PriorBaselines = %v, want %v (go from c4 itself, rust from c2, typescript from c1)", got, want)
+		t.Errorf("PriorBaselines from a repo subdirectory = %v, want %v (go from c4 itself, rust from c2, typescript from c1)", got, want)
 	}
 
 	// maxDepth counts commits inspected starting at sha, so depth 2 only

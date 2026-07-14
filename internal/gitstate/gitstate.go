@@ -97,8 +97,13 @@ func PriorBaselines(ctx context.Context, dir, sha string, langs []string, maxDep
 		return found
 	}
 	// One ls-tree up front so only commits that actually have a cached
-	// baseline cost a `git show`.
-	ls := executil.Run(ctx, dir, "git", "ls-tree", "--name-only", "origin/"+BranchName)
+	// baseline cost a `git show`. --full-tree is load-bearing: dir is often a
+	// subdirectory of the repo (consumers pass --dir source), and without it
+	// ls-tree scopes to the cwd's path inside the ref's tree — bulwark-state
+	// has no such subtree, so the listing comes back empty and carry-forward
+	// silently finds nothing (`show ref:path` below is root-relative and
+	// unaffected).
+	ls := executil.Run(ctx, dir, "git", "ls-tree", "--full-tree", "--name-only", "origin/"+BranchName)
 	if !ls.Ok() {
 		return found
 	}
