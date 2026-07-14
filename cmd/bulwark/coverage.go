@@ -63,14 +63,6 @@ func newCoverageCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if len(current) == 0 {
-				msg := "no coverage measured — no coverage tooling detected/available for any ecosystem"
-				if mode == coverage.ModeSkip {
-					msg += " (--tests=skip only reads an existing report — did an earlier CI step produce one at the expected path?)"
-				}
-				_, err := fmt.Fprintln(cmd.OutOrStdout(), msg)
-				return err
-			}
 			// A partially-measured current tree is just as invisible as an
 			// unmeasured one: the language simply doesn't appear in the report.
 			detected, err := detect.Ecosystems(dir, cfg.AllExcludes())
@@ -82,10 +74,11 @@ func newCoverageCmd() *cobra.Command {
 				return err
 			}
 
-			sha, err := gitstate.BaseSHA(ctx, dir)
-			if err != nil {
-				return err
-			}
+			// Resolved leniently: with nothing measured (a repo without an
+			// origin/main, say) the answer below is "no coverage measured",
+			// not a merge-base error — the errors only surface once they
+			// block an actual gate.
+			sha, shaErr := gitstate.BaseSHA(ctx, dir)
 
 			// Running ON the merge-base (a push to main) rather than ahead of it
 			// (a PR): there is no baseline to gate against — the current commit
@@ -101,14 +94,23 @@ func newCoverageCmd() *cobra.Command {
 			// worktree were numbers it had already measured, and thrown away, when
 			// this same command ran on main. Recording them costs nothing: no
 			// re-run, no cargo-llvm-cov, no yarn — they are already in hand.
-			head, err := gitstate.HeadSHA(ctx, dir)
-			if err != nil {
-				return err
-			}
-			if head == sha {
+			//
+			// A main run that measured NOTHING (a docs-only merge: every
+			// coverage producer path-filtered away, no reports for
+			// --tests=skip to read) still records — the carry-forward fills
+			// every detected language from the nearest prior baseline. The
+			// old early-return here left such a commit with no baseline at
+			// all, so the first PR against it recomputed nothing, reported
+			// every language as [NEW], and gated on nothing
+			// (wardnet/wardnet#899).
+			head, headErr := gitstate.HeadSHA(ctx, dir)
+			if shaErr == nil && headErr == nil && head == sha {
 				record, carried, err := carryForwardBaseline(ctx, cmd, dir, sha, ecosystems, current)
 				if err != nil {
 					return err
+				}
+				if len(record) == 0 {
+					return printNoCoverage(cmd, mode)
 				}
 				if err := gitstate.WriteBaseline(ctx, dir, sha, record); err != nil {
 					// Best-effort, as everywhere else: a write race with a concurrent
@@ -122,6 +124,16 @@ func newCoverageCmd() *cobra.Command {
 				}
 				_, err = fmt.Fprintf(cmd.OutOrStdout(), "recorded coverage baseline for %s: %s%s\n", sha, formatReport(record), note)
 				return err
+			}
+
+			if len(current) == 0 {
+				return printNoCoverage(cmd, mode)
+			}
+			if shaErr != nil {
+				return shaErr
+			}
+			if headErr != nil {
+				return headErr
 			}
 
 			baseline, hit, err := gitstate.ReadBaseline(ctx, dir, sha)
@@ -605,6 +617,18 @@ func diffReport(cmd *cobra.Command, current, baseline map[string]float64, detect
 		return fmt.Errorf("coverage regressed for %d language(s)", regressed)
 	}
 	return nil
+}
+
+// printNoCoverage reports a run that measured nothing and — on main — had no
+// prior baseline entries to carry forward either: there is nothing to gate
+// and nothing worth recording.
+func printNoCoverage(cmd *cobra.Command, mode coverage.Mode) error {
+	msg := "no coverage measured — no coverage tooling detected/available for any ecosystem"
+	if mode == coverage.ModeSkip {
+		msg += " (--tests=skip only reads an existing report — did an earlier CI step produce one at the expected path?)"
+	}
+	_, err := fmt.Fprintln(cmd.OutOrStdout(), msg)
+	return err
 }
 
 // enabledEcosystems drops languages disabled in .bulwark.yml from the

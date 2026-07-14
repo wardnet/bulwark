@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,7 +14,93 @@ import (
 
 	"wardnet/bulwark/internal/config"
 	"wardnet/bulwark/internal/detect"
+	"wardnet/bulwark/internal/executil"
+	"wardnet/bulwark/internal/gitstate"
 )
+
+// A push to main that measures NOTHING must still record a baseline —
+// carried wholesale from the nearest prior one — not early-return "no
+// coverage measured". A docs-only merge measures nothing (every coverage
+// producer path-filtered away, no reports for --tests=skip to read), and
+// skipping the record leaves that main commit with no baseline at all: the
+// first PR against it recomputes nothing in a bare worktree, reports every
+// language as [NEW], and the gate enforces nothing (wardnet/wardnet#899).
+func TestCoverageOnMainRecordsFullyCarriedBaselineWhenNothingMeasured(t *testing.T) {
+	ctx := context.Background()
+	run := func(dir string, args ...string) {
+		t.Helper()
+		if r := executil.Run(ctx, dir, "git", args...); !r.Ok() {
+			t.Fatalf("git %v: %v\n%s", args, r.Err, r.Output)
+		}
+	}
+	revParse := func(dir, ref string) string {
+		t.Helper()
+		r := executil.Run(ctx, dir, "git", "rev-parse", ref)
+		if !r.Ok() {
+			t.Fatalf("rev-parse %s: %v", ref, r.Err)
+		}
+		return strings.TrimSpace(r.Output)
+	}
+
+	origin := t.TempDir()
+	run(origin, "init", "--bare", "-b", "main", ".")
+
+	// The consumer checkout: c1 (code) then c2 (docs-only) on main, with
+	// HEAD == origin/main — the record-on-main shape.
+	repo := t.TempDir()
+	run(repo, "init", "-b", "main", ".")
+	run(repo, "config", "user.email", "t@t")
+	run(repo, "config", "user.name", "t")
+	if err := os.WriteFile(filepath.Join(repo, "package.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run(repo, "add", "-A")
+	run(repo, "commit", "-m", "code")
+	c1 := revParse(repo, "HEAD")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("docs"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run(repo, "add", "-A")
+	run(repo, "commit", "-m", "docs only")
+	c2 := revParse(repo, "HEAD")
+	run(repo, "remote", "add", "origin", origin)
+	run(repo, "push", "origin", "main")
+	run(repo, "fetch", "origin")
+
+	// bulwark-state already carries c1's baseline.
+	seed := t.TempDir()
+	run(seed, "init", "-b", gitstate.BranchName, ".")
+	run(seed, "config", "user.email", "t@t")
+	run(seed, "config", "user.name", "t")
+	if err := os.WriteFile(filepath.Join(seed, c1+".json"), []byte(`{"typescript":93.8}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run(seed, "add", "-A")
+	run(seed, "commit", "-m", "baseline")
+	run(seed, "remote", "add", "origin", origin)
+	run(seed, "push", "origin", gitstate.BranchName)
+
+	cmd := newCoverageCmd()
+	var out, errOut bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	cmd.SetArgs([]string{"--dir", repo, "--tests", "skip"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("coverage on main with nothing measured: %v\nstdout: %s\nstderr: %s", err, out.String(), errOut.String())
+	}
+	if !strings.Contains(out.String(), "recorded coverage baseline") {
+		t.Errorf("expected a recorded-baseline line, got stdout: %q", out.String())
+	}
+
+	run(repo, "fetch", "origin", gitstate.BranchName)
+	r := executil.Run(ctx, repo, "git", "show", "origin/"+gitstate.BranchName+":"+c2+".json")
+	if !r.Ok() {
+		t.Fatalf("no baseline recorded for %s: %v\nstdout: %s\nstderr: %s", c2, r.Err, out.String(), errOut.String())
+	}
+	if !strings.Contains(r.Output, "93.8") {
+		t.Errorf("baseline for %s = %s, want typescript 93.8 carried from %s", c2, r.Output, c1)
+	}
+}
 
 // unmeasuredLanguages is the single source of truth for "detected but not
 // measured this run" — the predicate the unmeasured warning, the
