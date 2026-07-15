@@ -160,17 +160,17 @@ func TestEnabledEcosystemsDropsDisabledLanguages(t *testing.T) {
 	}
 }
 
-func runDiffReport(t *testing.T, current, baseline map[string]float64, detected ...detect.Ecosystem) (string, error) {
+func runDiffReport(t *testing.T, tolerance float64, current, baseline map[string]float64, detected ...detect.Ecosystem) (string, error) {
 	t.Helper()
 	cmd := &cobra.Command{}
 	var buf bytes.Buffer
 	cmd.SetOut(&buf)
-	err := diffReport(cmd, current, baseline, detected)
+	err := diffReport(cmd, current, baseline, tolerance, detected)
 	return buf.String(), err
 }
 
 func TestDiffReportNewLanguage(t *testing.T) {
-	out, err := runDiffReport(t, map[string]float64{"go": 50}, map[string]float64{})
+	out, err := runDiffReport(t, 0, map[string]float64{"go": 50}, map[string]float64{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestDiffReportNewLanguage(t *testing.T) {
 // reported, not silently omitted — regression for the bug where diffReport
 // only iterated current's keys and such a language was never mentioned at all.
 func TestDiffReportDroppedLanguage(t *testing.T) {
-	out, err := runDiffReport(t, map[string]float64{}, map[string]float64{"typescript": 85})
+	out, err := runDiffReport(t, 0, map[string]float64{}, map[string]float64{"typescript": 85})
 	if err != nil {
 		t.Fatalf("a dropped language must not fail the check on its own, got error: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestDiffReportDroppedLanguage(t *testing.T) {
 // reported as [UNMEASURED], reserving [DROPPED] for a language whose source
 // actually left the tree. Neither fails the check on its own.
 func TestDiffReportUnmeasuredWhenLanguageStillDetected(t *testing.T) {
-	out, err := runDiffReport(t, map[string]float64{"rust": 86},
+	out, err := runDiffReport(t, 0, map[string]float64{"rust": 86},
 		map[string]float64{"rust": 85.8, "typescript": 93.8},
 		detect.Rust, detect.TypeScript)
 	if err != nil {
@@ -215,7 +215,7 @@ func TestDiffReportUnmeasuredWhenLanguageStillDetected(t *testing.T) {
 }
 
 func TestDiffReportRegression(t *testing.T) {
-	out, err := runDiffReport(t, map[string]float64{"go": 40}, map[string]float64{"go": 50})
+	out, err := runDiffReport(t, 0, map[string]float64{"go": 40}, map[string]float64{"go": 50})
 	if err == nil {
 		t.Fatal("expected an error for a regressed language")
 	}
@@ -224,8 +224,92 @@ func TestDiffReportRegression(t *testing.T) {
 	}
 }
 
+// A dip smaller than the configured tolerance is measurement noise, not a
+// regression — regression test for the gate failing PRs with "rust: 86.1%
+// (baseline 86.1%, regressed 0.0%)", a sub-rounding-error dip, on PRs
+// containing no Rust changes at all.
+func TestDiffReportPassesWithinTolerance(t *testing.T) {
+	out, err := runDiffReport(t, 0.1, map[string]float64{"rust": 86.05}, map[string]float64{"rust": 86.1})
+	if err != nil {
+		t.Fatalf("a dip within the tolerance must not fail the gate, got error: %v", err)
+	}
+	if !strings.Contains(out, "[PASS]") {
+		t.Fatalf("expected a [PASS] line for a within-tolerance dip, got: %q", out)
+	}
+}
+
+// The tolerance only absorbs noise — a dip larger than it is still a real
+// regression and must fail.
+func TestDiffReportFailsBeyondTolerance(t *testing.T) {
+	out, err := runDiffReport(t, 0.1, map[string]float64{"rust": 85.6}, map[string]float64{"rust": 86.1})
+	if err == nil {
+		t.Fatal("expected an error for a dip beyond the tolerance")
+	}
+	if !strings.Contains(out, "[FAIL]") {
+		t.Fatalf("expected a [FAIL] line for a beyond-tolerance dip, got: %q", out)
+	}
+}
+
+// An exactly-at-tolerance dip must gate identically regardless of the
+// operands' float64 representation: 86.2-86.1 exceeds 0.1 in raw float math
+// while 86.1-86.0 does not, so a raw comparison failed one "regressed 0.1%"
+// and passed an identical-looking other. The gate compares at display
+// precision (regressedBeyond) so both pass.
+func TestDiffReportToleranceBoundaryIsRepresentationIndependent(t *testing.T) {
+	for _, pair := range [][2]float64{{86.1, 86.2}, {86.0, 86.1}, {50.0, 50.1}} {
+		out, err := runDiffReport(t, 0.1, map[string]float64{"go": pair[0]}, map[string]float64{"go": pair[1]})
+		if err != nil {
+			t.Fatalf("a 0.1pp dip with tolerance 0.1 must pass for %v vs %v, got error: %v (out: %q)", pair[0], pair[1], err, out)
+		}
+	}
+}
+
+func TestRegressedBeyond(t *testing.T) {
+	cases := []struct {
+		name           string
+		cur, base, tol float64
+		want           bool
+	}{
+		{"improvement never regresses", 86.2, 86.1, 0, false},
+		{"equal never regresses", 86.1, 86.1, 0, false},
+		{"sub-display dip with zero tolerance shows 0.0%, passes", 86.06, 86.1, 0, false},
+		{"visible dip with zero tolerance fails", 86.0, 86.1, 0, true},
+		{"dip equal to tolerance passes (either representation)", 86.1, 86.2, 0.1, false},
+		{"dip equal to tolerance passes (other representation)", 86.0, 86.1, 0.1, false},
+		{"dip beyond tolerance fails", 85.9, 86.1, 0.1, true},
+	}
+	for _, c := range cases {
+		if got := regressedBeyond(c.cur, c.base, c.tol); got != c.want {
+			t.Errorf("%s: regressedBeyond(%v, %v, %v) = %v, want %v", c.name, c.cur, c.base, c.tol, got, c.want)
+		}
+	}
+}
+
+// Recording a within-tolerance dip verbatim would let tolerated dips
+// compound: each merge lowers the baseline by up to the tolerance and the
+// next PR dips again from the lower floor. The baseline writers restore such
+// dips to the prior (high-water) value; only a beyond-tolerance drop — which
+// was FAIL-visible on the PR that introduced it — resets the baseline.
+func TestWithToleratedDipsRestored(t *testing.T) {
+	record := map[string]float64{"go": 86.01, "rust": 70.0, "typescript": 90.0, "kotlin": 55.5}
+	prior := map[string]float64{"go": 86.1, "rust": 71.0, "typescript": 89.5}
+	got := withToleratedDipsRestored(record, prior, 0.1)
+	want := map[string]float64{
+		"go":         86.1, // dipped 0.09, within tolerance → restored
+		"rust":       70.0, // dipped 1.0, beyond tolerance → deliberate reset, kept
+		"typescript": 90.0, // improved → kept (baseline ratchets up)
+		"kotlin":     55.5, // no prior → kept
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("withToleratedDipsRestored = %v, want %v", got, want)
+	}
+	if record["go"] != 86.01 {
+		t.Fatal("input map must not be mutated")
+	}
+}
+
 func TestDiffReportPass(t *testing.T) {
-	out, err := runDiffReport(t, map[string]float64{"go": 55}, map[string]float64{"go": 50})
+	out, err := runDiffReport(t, 0, map[string]float64{"go": 55}, map[string]float64{"go": 50})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -240,7 +324,7 @@ func TestDiffReportPass(t *testing.T) {
 func TestDiffReportOnlyCountsRealRegressions(t *testing.T) {
 	current := map[string]float64{"go": 40, "rust": 60}
 	baseline := map[string]float64{"go": 50, "typescript": 85}
-	out, err := runDiffReport(t, current, baseline)
+	out, err := runDiffReport(t, 0, current, baseline)
 	if err == nil || !strings.Contains(err.Error(), "1") {
 		t.Fatalf("expected exactly 1 regressed language reported in the error, got: %v", err)
 	}

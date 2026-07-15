@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -65,6 +66,59 @@ func TestLoadSemgrepConfigOverride(t *testing.T) {
 	}
 	if !got.Semgrep.Enabled {
 		t.Fatal("overriding config incorrectly disabled semgrep")
+	}
+}
+
+// Zero-config users get a small noise-absorbing tolerance on the coverage
+// gates, so a sub-rounding-error dip (86.1% vs baseline 86.1%) doesn't fail
+// unrelated PRs. The aggregate and patch knobs default independently.
+func TestDefaultCoverageTolerance(t *testing.T) {
+	if got := Default().Coverage.Tolerance; got != 0.1 {
+		t.Fatalf("Coverage.Tolerance default = %v, want 0.1", got)
+	}
+	if got := Default().Coverage.Patch.Tolerance; got != 0.1 {
+		t.Fatalf("Coverage.Patch.Tolerance default = %v, want 0.1", got)
+	}
+}
+
+// Tolerances that would invert the gate (negative) or silently disable it
+// (NaN, ±Inf are all valid YAML floats) must be rejected at load time with
+// an error naming the key, not flow into the comparison.
+func TestLoadRejectsInvalidTolerance(t *testing.T) {
+	cases := map[string]string{
+		"negative aggregate": "coverage:\n  tolerance: -0.1\n",
+		"nan aggregate":      "coverage:\n  tolerance: .nan\n",
+		"inf aggregate":      "coverage:\n  tolerance: .inf\n",
+		"negative patch":     "coverage:\n  patch:\n    tolerance: -1\n",
+		"nan patch":          "coverage:\n  patch:\n    tolerance: .nan\n",
+	}
+	for name, yml := range cases {
+		dir := t.TempDir()
+		write(t, dir, yml)
+		if _, err := Load(dir); err == nil {
+			t.Errorf("%s: Load accepted an invalid tolerance (%q), want an error", name, yml)
+		} else if !strings.Contains(err.Error(), "tolerance") {
+			t.Errorf("%s: error should name the offending key, got: %v", name, err)
+		}
+	}
+}
+
+// An explicit tolerance: 0 tightens the gate to "fail any dip the report can
+// display" — the merge must honor an explicitly-present zero, not treat it
+// as "keep the default".
+func TestLoadCoverageToleranceExplicitZero(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "coverage:\n  tolerance: 0\n")
+
+	got, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Coverage.Tolerance != 0 {
+		t.Fatalf("Coverage.Tolerance = %v, want 0 after explicit override", got.Coverage.Tolerance)
+	}
+	if !got.Coverage.Patch.Go.Enabled {
+		t.Fatalf("setting coverage.tolerance incorrectly disabled patch coverage: %+v", got.Coverage)
 	}
 }
 

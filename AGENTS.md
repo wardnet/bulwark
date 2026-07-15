@@ -76,8 +76,8 @@ exact `1.26.5`. If `go.mod`'s `toolchain` line is ever bumped, update every `go-
 ## Configuration
 
 `.bulwark.yml` at the scan root is optional and purely **opt-out** — its job is narrowing what
-bulwark's zero-config default already does (scan everything detected, every check enabled), not
-tuning severity or suppressing individual findings (that's what a fix-up pass + inline
+bulwark's zero-config default already does (scan everything detected, every check enabled), plus
+one numeric knob (`coverage.tolerance`), not tuning severity or suppressing individual findings (that's what a fix-up pass + inline
 `#nosec`/`nosemgrep` annotations in the scanned repo are for). See `internal/config/config.go` for
 the full schema; shape:
 
@@ -96,6 +96,15 @@ go:
 semgrep:
   enabled: true
   config: auto           # override to a custom registry ref/path if needed
+coverage:
+  tolerance: 0.1         # pp a language's aggregate coverage may dip below its baseline before
+                          # the gate fails; absorbs sub-tenth measurement noise ("86.1% vs
+                          # baseline 86.1%, regressed 0.0%"). Compared at display precision
+                          # (tenths); 0 = fail any dip the report can show. Must be finite and
+                          # non-negative — Load rejects anything else.
+  patch:
+    tolerance: 0.1       # the patch gate's own dip allowance — deliberately independent, so
+                          # loosening the aggregate knob never weakens the untested-new-code check
 ```
 
 Omitting the file, or omitting a section/key within it, keeps that value at its default — see
@@ -187,7 +196,12 @@ generated cache data, not source, needs no PR/review and never pollutes main's h
   `warnUnmeasured` names every detected-but-unmeasured ecosystem on stderr rather than dropping it in
   silence. If a language is missing from the gate, bulwark now says so.
 - A language with no prior baseline entry (new) is reported but doesn't fail the check on its own;
-  a language whose current coverage is below its baseline does. A language the baseline has but the
+  a language whose current coverage dipped below its baseline by more than `coverage.tolerance`
+  (default 0.1pp, compared at the report's tenth-of-a-point display precision) does. To keep
+  tolerated dips from compounding — each merge lowering the baseline the next PR gates against —
+  the baseline writers restore any within-tolerance dip to the prior (high-water) value when
+  recording; only a beyond-tolerance drop, which was FAIL-visible on the PR that introduced it,
+  resets the baseline. A language the baseline has but the
   current run doesn't splits on detection: still detected in the tree means its coverage step just
   didn't run this time (path-filtered CI job, missing tooling) and it's reported as `[UNMEASURED]`;
   no longer detected means the source actually left the tree and it's reported as `[DROPPED]`
@@ -244,7 +258,9 @@ bounds the other, so `bulwark coverage` computes and gates on both, not either/o
 is a second, independent check alongside `diffReport`'s existing aggregate gate, not a replacement.
 
 Patch coverage has **no baseline or threshold of its own** — it always gates against that same
-language's aggregate baseline already read from `bulwark-state` (`patch% >= baseline%`). A language
+language's aggregate baseline already read from `bulwark-state` (`patch% >= baseline% -
+coverage.patch.tolerance` — its own knob, deliberately independent of `coverage.tolerance`, so
+loosening the noisy aggregate gate never silently weakens this one). A language
 with no aggregate baseline yet is reported informationally (`[NEW]`), not failed, mirroring
 aggregate's own handling of a first-time-seen language. It's opt-out, not opt-in, per language, via
 `.bulwark.yml`:
