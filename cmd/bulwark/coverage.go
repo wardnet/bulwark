@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,7 +21,8 @@ import (
 )
 
 // priorBaselineDepth bounds how far back the baseline writers look for a
-// prior baseline to carry a detected-but-unmeasured language forward from.
+// prior baseline — to carry a detected-but-unmeasured language forward from,
+// and to anchor within-tolerance dips to (withToleratedDipsRestored).
 // With the carry-forward rule applied on every recorded baseline, the nearest
 // one already contains everything worth carrying, so this only needs to span
 // gaps (main commits whose CI never recorded), not real history.
@@ -105,7 +107,7 @@ func newCoverageCmd() *cobra.Command {
 			// (wardnet/wardnet#899).
 			head, headErr := gitstate.HeadSHA(ctx, dir)
 			if shaErr == nil && headErr == nil && head == sha {
-				record, carried, err := carryForwardBaseline(ctx, cmd, dir, sha, ecosystems, current)
+				record, carried, err := carryForwardBaseline(ctx, cmd, dir, sha, ecosystems, current, cfg.Coverage.Tolerance)
 				if err != nil {
 					return err
 				}
@@ -173,12 +175,12 @@ func newCoverageCmd() *cobra.Command {
 				}
 			}
 
-			aggregateErr := diffReport(cmd, current, baseline, ecosystems)
+			aggregateErr := diffReport(cmd, current, baseline, cfg.Coverage.Tolerance, ecosystems)
 			// sha is the same merge-base gitstate.BaseSHA already resolved for
 			// the aggregate baseline lookup above — patch coverage reuses it
 			// directly rather than recomputing "git merge-base HEAD origin/main"
 			// a second time.
-			patchErr := patchReport(cmd, ctx, dir, patchWanted, sources, sha, baseline)
+			patchErr := patchReport(cmd, ctx, dir, patchWanted, sources, sha, baseline, cfg.Coverage.Patch.Tolerance)
 			// errors.Join keeps both messages when aggregate AND patch coverage
 			// regress in the same run — AGENTS.md's documented "compute and gate
 			// on both, not either/or" contract must hold for the returned error
@@ -276,7 +278,7 @@ func computeBaselineAt(ctx context.Context, cmd *cobra.Command, dir, sha string,
 	// has), and a partial baseline cached here poisons every later PR against
 	// this SHA just as thoroughly as a partial record-on-main would — so it
 	// gets the same carry-forward, not just the record-on-main path.
-	record, _, err := carryForwardBaseline(ctx, cmd, dir, sha, ecosystems, report)
+	record, _, err := carryForwardBaseline(ctx, cmd, dir, sha, ecosystems, report, cfg.Coverage.Tolerance)
 	if err != nil {
 		return nil, err
 	}
@@ -325,6 +327,18 @@ func statusPrefix(tag string) string {
 	return bracket + strings.Repeat(" ", pad)
 }
 
+// regressedBeyond reports whether cur dipped below base by more than
+// tolerance percentage points, comparing at the report's display precision
+// (tenths) so what's shown and what's gated always agree: a raw float64
+// subtraction decides an exactly-at-tolerance dip by representation noise
+// (86.2-86.1 exceeds 0.1 but 86.1-86.0 does not), failing one "regressed
+// 0.1%" while passing an identical-looking other. Shared by diffReport and
+// patchReport so the two gates can't drift apart on the comparison, like
+// statusPrefix does for formatting.
+func regressedBeyond(cur, base, tolerance float64) bool {
+	return math.Round((base-cur)*10) > math.Round(tolerance*10)
+}
+
 // patchReport prints one bracketed status line per language whose patch
 // coverage was requested (cfg.Coverage.Patch.<lang>.Enabled) and whose
 // source Compute managed to resolve, gating patch% against that language's
@@ -338,7 +352,7 @@ func statusPrefix(tag string) string {
 // ChangedLines is called exactly once, for the union of every wanted
 // language's extensions, then partitioned per language — not once per
 // language — since all three langs diff the identical mergeBase..HEAD range.
-func patchReport(cmd *cobra.Command, ctx context.Context, dir string, want coverage.PatchWanted, sources coverage.PatchSources, mergeBase string, baseline map[string]float64) error {
+func patchReport(cmd *cobra.Command, ctx context.Context, dir string, want coverage.PatchWanted, sources coverage.PatchSources, mergeBase string, baseline map[string]float64, tolerance float64) error {
 	type language struct {
 		name   string
 		wanted bool
@@ -403,7 +417,10 @@ func patchReport(cmd *cobra.Command, ctx context.Context, dir string, want cover
 		switch {
 		case !baseOK:
 			tag, detail = "NEW", fmt.Sprintf("%s patch: %.1f%% (%d/%d new lines; no baseline yet)", lang.name, pct, hit, total)
-		case pct < base:
+		// The patch gate has its own tolerance knob
+		// (coverage.patch.tolerance) — deliberately not coverage.tolerance,
+		// so loosening the noisy aggregate gate never weakens this one.
+		case regressedBeyond(pct, base, tolerance):
 			regressed++
 			tag, detail = "FAIL", fmt.Sprintf("%s patch: %.1f%% (%d/%d new lines; baseline %.1f%%)", lang.name, pct, hit, total, base)
 		default:
@@ -568,8 +585,9 @@ func rustPatchPercent(dir string, rustLCOV map[string]string, changed map[string
 // one the baseline has but this run didn't measure is [UNMEASURED] while its
 // source is still detected (its coverage step just didn't run) and [DROPPED]
 // once it isn't (the source actually left the tree). None of those fail the
-// check on its own — only a measured decrease does.
-func diffReport(cmd *cobra.Command, current, baseline map[string]float64, detected []detect.Ecosystem) error {
+// check on its own — only a measured decrease beyond the configured noise
+// tolerance does (see regressedBeyond).
+func diffReport(cmd *cobra.Command, current, baseline map[string]float64, tolerance float64, detected []detect.Ecosystem) error {
 	detectedSet := make(map[string]bool, len(detected))
 	for _, e := range detected {
 		detectedSet[string(e)] = true
@@ -603,7 +621,9 @@ func diffReport(cmd *cobra.Command, current, baseline map[string]float64, detect
 			tag, detail = "UNMEASURED", fmt.Sprintf("%s: not measured this run (baseline %.1f%%)", lang, base)
 		case !curOK:
 			tag, detail = "DROPPED", fmt.Sprintf("%s: no longer measured (baseline was %.1f%%)", lang, base)
-		case cur < base:
+		// Dips within the configured noise tolerance don't count — see
+		// config.Coverage.Tolerance for the rationale.
+		case regressedBeyond(cur, base, tolerance):
 			regressed++
 			tag, detail = "FAIL", fmt.Sprintf("%s: %.1f%% (baseline %.1f%%, regressed %.1f%%)", lang, cur, base, base-cur)
 		default:
@@ -701,17 +721,43 @@ func mergeCarried(current map[string]float64, unmeasured []string, prior map[str
 // gate. An undetected language is never carried — its source left the tree
 // (or it was disabled in .bulwark.yml), so its entry dies with it. Anything
 // that stayed unfilled is named on stderr rather than dropped in silence.
-func carryForwardBaseline(ctx context.Context, cmd *cobra.Command, dir, sha string, detected []detect.Ecosystem, current map[string]float64) (map[string]float64, []string, error) {
+func carryForwardBaseline(ctx context.Context, cmd *cobra.Command, dir, sha string, detected []detect.Ecosystem, current map[string]float64, tolerance float64) (map[string]float64, []string, error) {
 	unmeasured := unmeasuredLanguages(detected, current)
-	if len(unmeasured) == 0 {
-		return current, nil, nil
+	// Priors are fetched for every detected language, not just unmeasured
+	// ones: measured values need them too, for the anti-ratchet restore
+	// below.
+	langs := make([]string, 0, len(detected))
+	for _, e := range detected {
+		langs = append(langs, string(e))
 	}
-	prior := gitstate.PriorBaselines(ctx, dir, sha, unmeasured, priorBaselineDepth)
+	prior := gitstate.PriorBaselines(ctx, dir, sha, langs, priorBaselineDepth)
 	record, carried, missing := mergeCarried(current, unmeasured, prior)
+	record = withToleratedDipsRestored(record, prior, tolerance)
 	for _, lang := range missing {
 		if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s is detected but was not measured this run, and no prior baseline entry was found to carry forward — recording a baseline without it (if this repo has prior baselines, is the checkout shallow? fetch-depth: 0 lets bulwark walk prior main commits)\n", lang); err != nil {
 			return nil, nil, err
 		}
 	}
 	return record, carried, nil
+}
+
+// withToleratedDipsRestored returns record with every measured value that
+// dipped below its prior baseline by no more than the gate's tolerance
+// restored to the prior value. Recording the dipped number verbatim would
+// turn the tolerance into an unbounded downward ratchet: each merged PR may
+// dip up to the tolerance and pass, the main run records the lower number as
+// the new baseline, and the next PR gets another free dip from that lower
+// floor — coverage bleeds one tolerance per merge with every gate green.
+// Restoring within-tolerance dips anchors the baseline to its high-water
+// mark, capping total tolerated drift at one tolerance. A dip beyond the
+// tolerance is recorded as measured: it was FAIL-visible on the PR that
+// introduced it, so accepting it on main is a deliberate reset, not leakage.
+func withToleratedDipsRestored(record, prior map[string]float64, tolerance float64) map[string]float64 {
+	out := maps.Clone(record)
+	for lang, val := range out {
+		if p, ok := prior[lang]; ok && val < p && !regressedBeyond(val, p, tolerance) {
+			out[lang] = p
+		}
+	}
+	return out
 }
