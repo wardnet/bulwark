@@ -180,7 +180,7 @@ func newCoverageCmd() *cobra.Command {
 			// the aggregate baseline lookup above — patch coverage reuses it
 			// directly rather than recomputing "git merge-base HEAD origin/main"
 			// a second time.
-			patchErr := patchReport(cmd, ctx, dir, patchWanted, sources, sha, baseline, cfg.Coverage.Patch.Tolerance)
+			patchErr := patchReport(cmd, ctx, dir, patchWanted, sources, sha, baseline, cfg.Coverage.Patch.Tolerance, ecosystems)
 			// errors.Join keeps both messages when aggregate AND patch coverage
 			// regress in the same run — AGENTS.md's documented "compute and gate
 			// on both, not either/or" contract must hold for the returned error
@@ -345,14 +345,22 @@ func regressedBeyond(cur, base, tolerance float64) bool {
 // aggregate baseline (patch coverage has no baseline of its own — see
 // CONTEXT.md). A language with no baseline yet is reported informationally,
 // not failed, mirroring diffReport's [NEW] handling. A language with zero
-// coverable changed lines (e.g. the diff only touched comments/imports, or
-// its source couldn't be resolved) is skipped entirely — there's nothing to
-// gate on.
+// coverable changed lines (the diff only touched comments/imports) is
+// skipped entirely — there's nothing to gate on.
+//
+// A detected language whose files the diff DID touch but whose per-line
+// source couldn't be resolved is reported as [UNMEASURED], not skipped in
+// silence: a silent skip here reads as "patch coverage passed" in the PR
+// comment, when in fact it never ran — wardnet/wardnet#957 shipped a green
+// bulwark comment that way while Codecov, fed the very same lcov export,
+// failed the diff's patch coverage. Like diffReport's [UNMEASURED], it never
+// fails the gate on its own; a stderr warning names the wiring that's
+// missing.
 //
 // ChangedLines is called exactly once, for the union of every wanted
 // language's extensions, then partitioned per language — not once per
 // language — since all three langs diff the identical mergeBase..HEAD range.
-func patchReport(cmd *cobra.Command, ctx context.Context, dir string, want coverage.PatchWanted, sources coverage.PatchSources, mergeBase string, baseline map[string]float64, tolerance float64) error {
+func patchReport(cmd *cobra.Command, ctx context.Context, dir string, want coverage.PatchWanted, sources coverage.PatchSources, mergeBase string, baseline map[string]float64, tolerance float64, detected []detect.Ecosystem) error {
 	type language struct {
 		name   string
 		wanted bool
@@ -378,6 +386,11 @@ func patchReport(cmd *cobra.Command, ctx context.Context, dir string, want cover
 		return err
 	}
 
+	detectedSet := make(map[string]bool, len(detected))
+	for _, e := range detected {
+		detectedSet[string(e)] = true
+	}
+
 	regressed := 0
 	for _, lang := range langs {
 		if !lang.wanted {
@@ -386,26 +399,43 @@ func patchReport(cmd *cobra.Command, ctx context.Context, dir string, want cover
 		langChanged := filterByExt(changed, lang.exts)
 
 		var hit, total int
+		resolved := true
 		switch lang.name {
 		case "go":
 			if sources.GoProfile == "" || sources.ModuleName == "" {
-				continue
+				resolved = false
+				break
 			}
 			hits, err := coverage.ParseGoProfile(sources.GoProfile, sources.ModuleName, dir)
 			if err != nil {
-				continue
+				resolved = false
+				break
 			}
 			hit, total = coverage.PatchPercent(langChanged, hits)
 		case "rust":
 			if len(sources.RustLCOV) == 0 {
-				continue
+				resolved = false
+				break
 			}
 			hit, total = rustPatchPercent(dir, sources.RustLCOV, langChanged)
 		case "typescript":
 			if len(sources.TSLCOV) == 0 {
-				continue
+				resolved = false
+				break
 			}
 			hit, total = tsPatchPercent(dir, sources.TSLCOV, langChanged)
+		}
+		// The unmeasured report is scoped to detected ecosystems: patch gates
+		// default to enabled for all three languages regardless of what the
+		// repo actually contains, and a stray .rs file changed in (say) a pure
+		// Go repo shouldn't produce a rust line.
+		if !resolved {
+			if detectedSet[lang.name] {
+				if err := reportPatchUnmeasured(cmd, lang.name, langChanged); err != nil {
+					return err
+				}
+			}
+			continue
 		}
 		if total == 0 {
 			continue
@@ -434,6 +464,37 @@ func patchReport(cmd *cobra.Command, ctx context.Context, dir string, want cover
 		return fmt.Errorf("patch coverage regressed for %d language(s)", regressed)
 	}
 	return nil
+}
+
+// patchSourceHints names, per language, the wiring that gets a per-line
+// coverage source resolved — what the stderr warning points at when the
+// patch gate had changed lines to measure but nothing to measure them with.
+var patchSourceHints = map[string]string{
+	"go":         "the same Go profile the aggregate gate reads (--go-report, or coverage.out/cover.out/c.out) also feeds patch coverage — if aggregate Go coverage was measured this run, this shouldn't happen",
+	"rust":       "pass --rust-lcov-report, or place a cargo-llvm-cov lcov export at coverage/lcov.info in the crate directory",
+	"typescript": "enable an lcov reporter in each package's coverage config so coverage/lcov.info is written alongside coverage-summary.json",
+}
+
+// reportPatchUnmeasured surfaces a patch gate that had changed lines to
+// measure but no per-line source to measure them with: an [UNMEASURED] line
+// on stdout (so it lands in the PR comment next to the aggregate result, via
+// action.yml's generic bracketed-tag grep) and a stderr warning naming the
+// missing wiring. A diff that touched none of the language's files stays
+// silent — nothing was skipped, there was simply nothing to gate.
+func reportPatchUnmeasured(cmd *cobra.Command, lang string, changed map[string][]int) error {
+	if len(changed) == 0 {
+		return nil
+	}
+	lines := 0
+	for _, l := range changed {
+		lines += len(l)
+	}
+	detail := fmt.Sprintf("%s patch: not measured (%d changed line(s) across %d file(s), but no per-line coverage source was resolved)", lang, lines, len(changed))
+	if _, err := fmt.Fprintln(cmd.OutOrStdout(), statusPrefix("UNMEASURED")+detail); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s patch coverage is enabled and this diff touches %s files, but no per-line coverage source was resolved — %s\n", lang, lang, patchSourceHints[lang])
+	return err
 }
 
 // filterByExt returns the subset of changed whose file name ends in one of
