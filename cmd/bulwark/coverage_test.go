@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"wardnet/bulwark/internal/config"
+	"wardnet/bulwark/internal/coverage"
 	"wardnet/bulwark/internal/detect"
 	"wardnet/bulwark/internal/executil"
 	"wardnet/bulwark/internal/gitstate"
@@ -444,6 +445,118 @@ func TestRustPatchPercentDoesNotClobberAcrossPackages(t *testing.T) {
 	}
 	if hit != 1 {
 		t.Fatalf("hit = %d, want 1 (crate a's line is hit, crate b's is not — a clobbered merge would report 0 or 2, not 1)", hit)
+	}
+}
+
+// patchReportRepo builds a repo with one committed base revision and one
+// commit on top of it touching the given files, returning the repo dir and
+// the base SHA to use as the merge-base for patchReport.
+func patchReportRepo(t *testing.T, files map[string]string) (string, string) {
+	t.Helper()
+	ctx := context.Background()
+	run := func(dir string, args ...string) {
+		t.Helper()
+		if r := executil.Run(ctx, dir, "git", args...); !r.Ok() {
+			t.Fatalf("git %v: %v\n%s", args, r.Err, r.Output)
+		}
+	}
+	repo := t.TempDir()
+	run(repo, "init", "-b", "main", ".")
+	run(repo, "config", "user.email", "t@t")
+	run(repo, "config", "user.name", "t")
+	for name, content := range files {
+		p := filepath.Join(repo, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run(repo, "add", "-A")
+	run(repo, "commit", "-m", "base")
+	r := executil.Run(ctx, repo, "git", "rev-parse", "HEAD")
+	if !r.Ok() {
+		t.Fatalf("rev-parse: %v", r.Err)
+	}
+	base := strings.TrimSpace(r.Output)
+	for name, content := range files {
+		p := filepath.Join(repo, filepath.FromSlash(name))
+		if err := os.WriteFile(p, []byte(content+"\nfn added() {}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run(repo, "add", "-A")
+	run(repo, "commit", "-m", "change")
+	return repo, base
+}
+
+// A detected language whose files the diff touches, with the patch gate
+// enabled but no per-line source resolved, must be reported as [UNMEASURED]
+// (with a stderr hint), not skipped in silence — the silent skip let
+// wardnet/wardnet#957 ship a green bulwark comment while Codecov, fed the
+// same lcov export, failed the very same diff's patch coverage. Like
+// diffReport's [UNMEASURED], it must not fail the gate on its own.
+func TestPatchReportUnmeasuredWhenSourceMissing(t *testing.T) {
+	repo, base := patchReportRepo(t, map[string]string{"src/lib.rs": "fn a() {}"})
+
+	cmd := &cobra.Command{}
+	var out, errOut bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	err := patchReport(cmd, context.Background(), repo,
+		coverage.PatchWanted{Rust: true}, coverage.PatchSources{}, base,
+		map[string]float64{"rust": 86.4}, 0.1, []detect.Ecosystem{detect.Rust})
+	if err != nil {
+		t.Fatalf("an unmeasured patch gate must not fail on its own, got: %v", err)
+	}
+	if !strings.Contains(out.String(), "[UNMEASURED]") || !strings.Contains(out.String(), "rust patch") {
+		t.Fatalf("expected an [UNMEASURED] rust patch line, got stdout: %q", out.String())
+	}
+	if !strings.Contains(errOut.String(), "rust-lcov-report") {
+		t.Fatalf("expected a stderr hint naming the missing wiring, got: %q", errOut.String())
+	}
+}
+
+// The unmeasured report is scoped to detected ecosystems: patch gates default
+// to enabled for all three languages regardless of what the repo contains, so
+// a changed file of an undetected language (a stray script in a repo that
+// isn't that language's ecosystem) must not produce a line for it.
+func TestPatchReportUndetectedLanguageStaysSilent(t *testing.T) {
+	repo, base := patchReportRepo(t, map[string]string{"tools/gen.go": "package main"})
+
+	cmd := &cobra.Command{}
+	var out, errOut bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	err := patchReport(cmd, context.Background(), repo,
+		coverage.PatchWanted{Go: true, Rust: true}, coverage.PatchSources{}, base,
+		map[string]float64{"rust": 86.4}, 0.1, []detect.Ecosystem{detect.Rust})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(out.String(), "go patch") || strings.Contains(errOut.String(), "go ") {
+		t.Fatalf("undetected go must stay silent, got stdout: %q stderr: %q", out.String(), errOut.String())
+	}
+}
+
+// A diff that touches none of a detected language's files has nothing to
+// gate — no [UNMEASURED] line, no warning, even with its source unresolved.
+func TestPatchReportNoChangedLinesStaysSilent(t *testing.T) {
+	repo, base := patchReportRepo(t, map[string]string{"README.md": "docs"})
+
+	cmd := &cobra.Command{}
+	var out, errOut bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	err := patchReport(cmd, context.Background(), repo,
+		coverage.PatchWanted{Rust: true}, coverage.PatchSources{}, base,
+		map[string]float64{"rust": 86.4}, 0.1, []detect.Ecosystem{detect.Rust})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.String() != "" || errOut.String() != "" {
+		t.Fatalf("expected silence for a diff with no rust changes, got stdout: %q stderr: %q", out.String(), errOut.String())
 	}
 }
 

@@ -44,7 +44,18 @@ func ChangedLines(ctx context.Context, dir, mergeBase string, exts ...string) (m
 	// parseUnifiedDiff expects, regardless of the caller's own git config —
 	// mnemonicPrefix=true would emit "+++ w/<path>" instead, which
 	// parseUnifiedDiff's "b/" strip wouldn't recognize.
-	args := []string{"-c", "diff.mnemonicPrefix=false", "diff", "--unified=0", mergeBase + "..HEAD"}
+	//
+	// --relative makes the emitted paths relative to dir rather than the
+	// repository root — they must line up with everything else patch coverage
+	// works in --dir-relative terms: crate/package prefixes, lcov paths
+	// normalized against dir, Go profile paths under the module at dir. When
+	// dir IS the repo root the flag changes nothing; when it's a subdirectory
+	// (wardnet runs bulwark with --dir source), root-relative "source/..."
+	// keys would match no crate prefix and every changed line silently
+	// vanished from the patch gate's denominator. It also scopes the diff to
+	// dir, which is exactly the gate's remit — changes outside --dir aren't
+	// measured, so they can't be gated.
+	args := []string{"-c", "diff.mnemonicPrefix=false", "diff", "--relative", "--unified=0", mergeBase + "..HEAD"}
 	if len(exts) > 0 {
 		args = append(args, "--")
 		for _, ext := range exts {

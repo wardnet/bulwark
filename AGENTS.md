@@ -273,8 +273,12 @@ coverage:
 ```
 
 Changed lines come from a hand-rolled unified-diff hunk parser (`internal/coverage.ChangedLines`,
-`git diff --unified=0 <merge-base>..HEAD`) — deliberately not a diff library, since the format
-needed is a small, stable subset (hunk headers + `+` lines). `mergeBase` is the exact same SHA
+`git diff --relative --unified=0 <merge-base>..HEAD`) — deliberately not a diff library, since the
+format needed is a small, stable subset (hunk headers + `+` lines). `--relative` matters: the
+command runs in `--dir`, and every consumer of the changed-line map works in `--dir`-relative
+paths (crate/package prefixes, lcov normalization). Without it, git emits repo-root-relative paths,
+so with `--dir` pointing at a subdirectory (wardnet's `--dir source`) every changed file failed the
+prefix match and the patch gate silently measured nothing. `mergeBase` is the exact same SHA
 `gitstate.BaseSHA` already resolved for the aggregate baseline lookup, reused as-is rather than
 recomputed. The parser does no language-aware filtering of comments/blank lines/imports — that
 happens later, when changed lines are intersected with a coverage report's line-hit data
@@ -322,19 +326,32 @@ shape:
   a `map[string]string` keyed by crate dir (like TypeScript's `TSLCOV`, not a single path) —
   `cmd/bulwark/coverage.go`'s `rustPatchPercent` resolves each crate's contribution independently,
   mirroring `tsPatchPercent`'s longest-prefix matching so two crates can't clobber each other's hit
-  data for a same-named file. A crate with no resolvable lcov file is silently omitted from patch
-  coverage, not a failure.
+  data for a same-named file. A crate with no resolvable lcov file is omitted from patch coverage,
+  not a failure — but not silently when it matters (see the `[UNMEASURED]` paragraph below).
 - **TypeScript**: reads `<pkgDir>/coverage/lcov.info` (Istanbul/Vitest's native lcov output) — fixed
   convention, no override flag, matching the existing no-override precedent for TS aggregate
   coverage. This only works if the consumer's own test config already has an `lcov` reporter
-  enabled; otherwise it's silently omitted, the same best-effort caveat AGENTS.md already documents
-  for TS aggregate coverage.
+  enabled; otherwise it's omitted, the same best-effort caveat AGENTS.md already documents for TS
+  aggregate coverage.
 
 `cmd/bulwark/coverage.go`'s `patchReport` prints one bracketed status line per language using the
 same `[PASS]/[FAIL]/[NEW]` vocabulary the aggregate gate already uses (e.g.
 `[FAIL]    go patch: 0.0% (0/9 new lines; baseline 55.68%)`) — this needs no changes to
 `action.yml`'s PR-comment builder, since its `cov_detail` regex is generic and already picks up any
 matching bracketed line.
+
+**A skipped patch gate must say so.** When a *detected* language's patch gate is enabled and the
+diff touches that language's files, but no per-line source was resolved (no lcov for the crate, no
+`lcov` reporter in a TS package), `patchReport` prints an `[UNMEASURED] <lang> patch: ...` line and
+a stderr warning naming the missing wiring — it never fails the gate on its own, mirroring
+`diffReport`'s `[UNMEASURED]` handling. The old behavior was a bare `continue`, and it read as
+"patch coverage passed" in the PR comment: wardnet/wardnet#957 shipped a green bulwark summary
+(aggregate flat, patch never ran for want of an lcov path) while Codecov — fed the very same lcov
+export the pipeline had already produced — failed that diff's patch coverage. The two reports can
+only stay aligned if a gate that didn't run is visibly distinct from a gate that passed. The
+report stays scoped to detected ecosystems, since the patch gates default to enabled for all three
+languages regardless of what the repo contains — a stray changed `.rs` file in a pure Go repo must
+not produce a rust line.
 
 ## Semgrep: token-bearing vs token-less runs
 
