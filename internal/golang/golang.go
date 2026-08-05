@@ -39,29 +39,40 @@ func Check(ctx context.Context, root string, exclude []string) ([]executil.Resul
 	if err != nil {
 		return nil, err
 	}
+	if len(modDirs) == 0 {
+		return nil, nil
+	}
 
+	multi := len(modDirs) > 1
 	var results []executil.Result
 	for _, dir := range modDirs {
-		results = append(results, checkModule(ctx, dir, len(modDirs) > 1)...)
+		results = append(results, checkModule(ctx, dir, moduleLabel(root, dir, multi))...)
 	}
 	return results, nil
 }
 
-// checkModule runs both tools inside a single module directory. When more
-// than one module was found, the directory is appended to each result name —
-// matching eslint(<dir>) — so a failure names the module it came from.
-func checkModule(ctx context.Context, dir string, qualify bool) []executil.Result {
-	name := func(tool string) string {
-		if qualify {
-			return tool + "(" + dir + ")"
-		}
-		return tool
+// moduleLabel mirrors rust.crateLabel: a "<relative dir>: " prefix, applied
+// only when more than one module was discovered, so single-module output keeps
+// the bare tool names. Relative to root rather than absolute, so results do not
+// carry a machine-specific path, and prefixed rather than suffixed so the
+// action's `^\[(PASS|FAIL)\] <label>?<tool>$` parsing keeps working.
+func moduleLabel(root, dir string, multi bool) string {
+	if !multi {
+		return ""
 	}
+	rel, err := filepath.Rel(root, dir)
+	if err != nil || rel == "." {
+		return ""
+	}
+	return rel + ": "
+}
 
+// checkModule runs both tools inside a single module directory.
+func checkModule(ctx context.Context, dir, label string) []executil.Result {
 	var results []executil.Result
 
 	if bin, err := ensure(ctx, "gosec", gosecVersion, gosecPkg); err != nil {
-		results = append(results, executil.Result{Name: name("gosec"), Err: err})
+		results = append(results, executil.Result{Name: label + "gosec", Err: err})
 	} else {
 		// -exclude-generated skips files carrying the standard
 		// "Code generated ... DO NOT EDIT." header. Findings there are not
@@ -71,15 +82,15 @@ func checkModule(ctx context.Context, dir string, qualify bool) []executil.Resul
 		// pipeline — golangci-lint's `exclusions: generated` and semgrep's own
 		// generated-file skip.
 		r := executil.Run(ctx, dir, bin, "-exclude-generated", "./...")
-		r.Name = name("gosec")
+		r.Name = label + "gosec"
 		results = append(results, r)
 	}
 
 	if bin, err := ensure(ctx, "govulncheck", govulncheckVersion, govulncheckPkg); err != nil {
-		results = append(results, executil.Result{Name: name("govulncheck"), Err: err})
+		results = append(results, executil.Result{Name: label + "govulncheck", Err: err})
 	} else {
 		r := executil.Run(ctx, dir, bin, "./...")
-		r.Name = name("govulncheck")
+		r.Name = label + "govulncheck"
 		results = append(results, r)
 	}
 

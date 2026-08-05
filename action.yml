@@ -184,7 +184,15 @@ runs:
         # tool_result reads a tool's own [PASS]/[FAIL] line (bulwark scan's own report()
         # output) — the ground truth for whether that specific tool failed, since a nonzero
         # SCAN_EXIT_CODE only says "at least one check failed", not which one.
-        tool_result() { grep -oE "^\[(PASS|FAIL)\] $2\$" "$1" | tail -1 | sed -E 's/^\[([A-Z]+)\].*/\1/'; }
+        # The optional "<dir>: " prefix matches how rust.crateLabel and
+        # golang.moduleLabel qualify a tool name once more than one crate or
+        # module is discovered ("sdk/wardnet-go: gosec"). Without it the
+        # anchored pattern silently matches nothing in exactly the multi-module
+        # repos that need attribution, leaving the comment unable to say which
+        # tool failed. FAIL anywhere wins: "FAIL" sorts before "PASS", so
+        # `sort | head -1` reports FAIL if any crate or module failed; taking
+        # the last line instead would let a passing module mask a failing one.
+        tool_result() { grep -oE "^\[(PASS|FAIL)\] (.*: )?$2\$" "$1" | sed -E 's/^\[([A-Z]+)\].*/\1/' | sort | head -1; }
 
         # Max bytes of raw tool output to inline per section. GitHub caps a PR
         # comment at 65536 chars, and the full logs (multi-thousand-line cargo /

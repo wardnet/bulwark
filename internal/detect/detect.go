@@ -157,7 +157,7 @@ func GoModuleDirs(root string, exclude []string) ([]string, error) {
 			}
 		}
 		for _, e := range entries {
-			if e.IsDir() && !skip[e.Name()] {
+			if e.IsDir() && !skip[e.Name()] && !goIgnoredDir(e.Name()) {
 				if err := visit(filepath.Join(dir, e.Name())); err != nil {
 					return err
 				}
@@ -169,6 +169,18 @@ func GoModuleDirs(root string, exclude []string) ([]string, error) {
 		return nil, err
 	}
 	return dirs, nil
+}
+
+// goIgnoredDir reports whether the Go toolchain itself ignores a directory
+// when resolving packages: "testdata", and any name beginning with "." or "_".
+//
+// Honouring this matters because a go.mod under testdata/ is a fixture, not a
+// project. Such modules are routinely unbuildable on purpose — no go.sum, or
+// deliberately pinned to a vulnerable dependency to exercise a scanner. The
+// parent's `./...` never compiles them, so treating one as a real scan root
+// would fail the whole run on code that is not shipped.
+func goIgnoredDir(name string) bool {
+	return name == "testdata" || strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_")
 }
 
 // RustCrateDirs returns every directory under root that is the effective

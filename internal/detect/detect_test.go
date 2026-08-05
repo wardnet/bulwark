@@ -193,3 +193,23 @@ func TestGoModuleDirsDefaultSkipDirsHonored(t *testing.T) {
 		t.Fatalf("got %v, want [%s]", got, root)
 	}
 }
+
+// A go.mod under testdata/ is a fixture, not a project — often deliberately
+// unbuildable or pinned to a vulnerable dependency to exercise a scanner. Go's
+// own package loading ignores testdata, "_"- and "."-prefixed directories, and
+// discovery has to agree or the scan fails on code that never ships.
+func TestGoModuleDirsSkipsGoIgnoredDirs(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "go.mod"), "module example.com/foo\n")
+	writeFile(t, filepath.Join(root, "testdata", "broken", "go.mod"), "module example.com/fixture\n")
+	writeFile(t, filepath.Join(root, "_scratch", "go.mod"), "module example.com/scratch\n")
+	writeFile(t, filepath.Join(root, ".tools", "go.mod"), "module example.com/tools\n")
+
+	dirs, err := GoModuleDirs(root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sorted(dirs); len(got) != 1 || got[0] != root {
+		t.Fatalf("got %v, want [%s]", got, root)
+	}
+}
