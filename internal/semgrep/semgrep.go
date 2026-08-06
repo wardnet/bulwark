@@ -32,13 +32,18 @@ const AppTokenEnv = "SEMGREP_APP_TOKEN" // #nosec G101 -- this is an env var NAM
 // instead of `semgrep scan` — Semgrep's own diff-aware CI mode, which both
 // scopes findings to what the current change actually introduced and
 // uploads results to the Semgrep AppSec Platform dashboard, in one
-// invocation. Without a token (the common case for local dev), behavior is
-// unchanged: a plain `semgrep scan` against the configured ruleset.
-func Check(ctx context.Context, dir, rulesetConfig string) executil.Result {
+// invocation. Without a token (local dev, but also any CI run GitHub
+// withholds secrets from — a Dependabot PR being the standing example),
+// behavior falls back to a plain `semgrep scan`.
+//
+// baseSHA, when non-empty, makes that fallback diff-aware too: Semgrep only
+// reports findings absent at that commit. Empty means scan everything, which
+// is what a local `bulwark scan` wants.
+func Check(ctx context.Context, dir, rulesetConfig, baseSHA string) executil.Result {
 	if r := ensure(ctx); !r.Ok() {
 		return r
 	}
-	return executil.Run(ctx, dir, "semgrep", buildArgs(rulesetConfig, os.Getenv(AppTokenEnv) != "")...)
+	return executil.Run(ctx, dir, "semgrep", buildArgs(rulesetConfig, os.Getenv(AppTokenEnv) != "", baseSHA)...)
 }
 
 // buildArgs decides the semgrep subcommand and flags: `ci` (diff-aware,
@@ -46,8 +51,16 @@ func Check(ctx context.Context, dir, rulesetConfig string) executil.Result {
 // `scan`. `ci` mode omits --config entirely for the "auto" sentinel, since
 // semgrep ci already applies the org's configured platform policy by
 // default — passing "--config auto" would override that with the plain
-// community ruleset instead of layering on top of it.
-func buildArgs(rulesetConfig string, appToken bool) []string {
+// community ruleset instead of layering on top of it. It also ignores
+// baseSHA: `semgrep ci` already derives its own diff base from the CI
+// environment, and passing --baseline-commit on top of that is redundant.
+//
+// The `scan` fallback takes --baseline-commit so that, in a PR, it blocks on
+// the same thing `semgrep ci` would — findings the PR itself introduces —
+// rather than on every pre-existing finding in the repo. Without this, whether
+// a PR is green depends on whether the run happened to have a token, which is
+// not a property of the code under review.
+func buildArgs(rulesetConfig string, appToken bool, baseSHA string) []string {
 	if appToken {
 		args := []string{"ci"}
 		if rulesetConfig != "" && rulesetConfig != "auto" {
@@ -55,7 +68,11 @@ func buildArgs(rulesetConfig string, appToken bool) []string {
 		}
 		return args
 	}
-	return []string{"scan", "--config", rulesetConfig, "--error"}
+	args := []string{"scan", "--config", rulesetConfig, "--error"}
+	if baseSHA != "" {
+		args = append(args, "--baseline-commit", baseSHA)
+	}
+	return args
 }
 
 // ensure installs the pinned Semgrep version via pipx unless it's already

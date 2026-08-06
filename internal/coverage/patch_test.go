@@ -183,7 +183,9 @@ func TestParseGoProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := ParseGoProfile(path, "fixture")
+	// No main.go on disk beside the profile: an unreadable source degrades to
+	// counting every line in the block, which is the pre-filter behavior.
+	got, err := ParseGoProfile(path, "fixture", dir)
 	if err != nil {
 		t.Fatalf("ParseGoProfile: %v", err)
 	}
@@ -192,6 +194,49 @@ func TestParseGoProfile(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ParseGoProfile = %+v, want %+v", got, want)
+	}
+}
+
+// A Go profile records blocks, not statements, so every line between a
+// block's braces lands in the report — comments and blank lines included.
+// Left as-is, adding a comment inside an uncovered function reads as an
+// uncovered new line, and a comment-only PR scores 0% patch coverage and
+// fails the gate (wardnet/inforge#216). Those lines must not reach LineHits
+// at all, so PatchPercent skips them the same way it skips any line a
+// coverage report never mentions.
+func TestParseGoProfileExcludesCommentsAndBlanks(t *testing.T) {
+	dir := t.TempDir()
+	src := "package main\n" + // 1
+		"\n" + // 2
+		"func run() {\n" + // 3
+		"\t// nosemgrep: some.rule -- audited\n" + // 4  comment inside an uncovered block
+		"\n" + // 5  blank inside an uncovered block
+		"\tdoWork()\n" + // 6  the only executable line here
+		"}\n" // 7
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(src), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	profile := "mode: set\nfixture/main.go:3.13,7.2 1 0\n"
+	path := filepath.Join(dir, "cover.out")
+	if err := os.WriteFile(path, []byte(profile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ParseGoProfile(path, "fixture", dir)
+	if err != nil {
+		t.Fatalf("ParseGoProfile: %v", err)
+	}
+	want := LineHits{"main.go": {3: 0, 6: 0, 7: 0}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ParseGoProfile = %+v, want %+v", got, want)
+	}
+
+	// The regression itself: a PR that only adds a comment (line 4) and a
+	// blank (line 5) has nothing coverable in it, so patch coverage must
+	// report 0/0 — no coverable lines — not 0/2 uncovered.
+	hit, total := PatchPercent(map[string][]int{"main.go": {4, 5}}, got)
+	if hit != 0 || total != 0 {
+		t.Fatalf("PatchPercent over a comment-only diff = (%d, %d), want (0, 0)", hit, total)
 	}
 }
 
@@ -246,6 +291,66 @@ func TestChangedLinesEndToEnd(t *testing.T) {
 	want := map[string][]int{"main.go": {4, 5, 6, 7}}
 	if !reflect.DeepEqual(changed, want) {
 		t.Fatalf("ChangedLines = %+v, want %+v", changed, want)
+	}
+}
+
+// ChangedLines must emit paths relative to dir, not to the repository root:
+// every consumer works in --dir-relative terms (crate/package prefixes, lcov
+// normalization, the module at dir), so when dir is a subdirectory of the
+// repo (bulwark run with --dir source), root-relative "source/..." keys match
+// no prefix and every changed line silently vanishes from the patch gate's
+// denominator — the gate reports nothing while a tool reading the same lcov
+// (Codecov) grades the diff for real. It must also ignore changes outside
+// dir entirely.
+func TestChangedLinesRelativeToSubdir(t *testing.T) {
+	root := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = root
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t.com",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	write := func(rel, content string) {
+		t.Helper()
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run("init", "-q")
+	write("source/daemon/src/lib.rs", "fn a() {}\n")
+	write("elsewhere/other.rs", "fn x() {}\n")
+	run("add", "-A")
+	run("commit", "-q", "-m", "base")
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := trimNL(string(out))
+
+	write("source/daemon/src/lib.rs", "fn a() {}\nfn b() {}\n")
+	write("elsewhere/other.rs", "fn x() {}\nfn y() {}\n")
+	run("add", "-A")
+	run("commit", "-q", "-m", "change")
+
+	changed, err := ChangedLines(context.Background(), filepath.Join(root, "source"), base, ".rs")
+	if err != nil {
+		t.Fatalf("ChangedLines: %v", err)
+	}
+	want := map[string][]int{"daemon/src/lib.rs": {2}}
+	if !reflect.DeepEqual(changed, want) {
+		t.Fatalf("ChangedLines from a subdir = %+v, want %+v (dir-relative path, outside-dir change excluded)", changed, want)
 	}
 }
 

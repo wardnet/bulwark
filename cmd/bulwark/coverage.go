@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,6 +19,14 @@ import (
 	"wardnet/bulwark/internal/executil"
 	"wardnet/bulwark/internal/gitstate"
 )
+
+// priorBaselineDepth bounds how far back the baseline writers look for a
+// prior baseline — to carry a detected-but-unmeasured language forward from,
+// and to anchor within-tolerance dips to (withToleratedDipsRestored).
+// With the carry-forward rule applied on every recorded baseline, the nearest
+// one already contains everything worth carrying, so this only needs to span
+// gaps (main commits whose CI never recorded), not real history.
+const priorBaselineDepth = 50
 
 func newCoverageCmd() *cobra.Command {
 	var dir string
@@ -55,18 +65,77 @@ func newCoverageCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if len(current) == 0 {
-				msg := "no coverage measured — no coverage tooling detected/available for any ecosystem"
-				if mode == coverage.ModeSkip {
-					msg += " (--tests=skip only reads an existing report — did an earlier CI step produce one at the expected path?)"
-				}
-				_, err := fmt.Fprintln(cmd.OutOrStdout(), msg)
+			// A partially-measured current tree is just as invisible as an
+			// unmeasured one: the language simply doesn't appear in the report.
+			detected, err := detect.Ecosystems(dir, cfg.AllExcludes())
+			if err != nil {
+				return err
+			}
+			ecosystems := enabledEcosystems(detected, cfg)
+			if err := warnUnmeasured(cmd, ecosystems, current, "the current tree"); err != nil {
 				return err
 			}
 
-			sha, err := gitstate.BaseSHA(ctx, dir)
-			if err != nil {
+			// Resolved leniently: with nothing measured (a repo without an
+			// origin/main, say) the answer below is "no coverage measured",
+			// not a merge-base error — the errors only surface once they
+			// block an actual gate.
+			sha, shaErr := gitstate.BaseSHA(ctx, dir)
+
+			// Running ON the merge-base (a push to main) rather than ahead of it
+			// (a PR): there is no baseline to gate against — the current commit
+			// *is* the baseline — so record what was just measured and stop.
+			//
+			// This is what makes the gate work at all for a repo whose coverage
+			// comes from a multi-job pipeline rather than from bulwark running the
+			// tests itself (exactly the case --tests=skip exists to serve). Such a
+			// repo can never recompute a historical baseline: computeBaselineAt's
+			// throwaway worktree is a bare checkout with none of the toolchain or
+			// staged reports the pipeline provides, so it measures nothing. wardnet
+			// hit precisely that — and the numbers it failed to reconstruct in a
+			// worktree were numbers it had already measured, and thrown away, when
+			// this same command ran on main. Recording them costs nothing: no
+			// re-run, no cargo-llvm-cov, no yarn — they are already in hand.
+			//
+			// A main run that measured NOTHING (a docs-only merge: every
+			// coverage producer path-filtered away, no reports for
+			// --tests=skip to read) still records — the carry-forward fills
+			// every detected language from the nearest prior baseline. The
+			// old early-return here left such a commit with no baseline at
+			// all, so the first PR against it recomputed nothing, reported
+			// every language as [NEW], and gated on nothing
+			// (wardnet/wardnet#899).
+			head, headErr := gitstate.HeadSHA(ctx, dir)
+			if shaErr == nil && headErr == nil && head == sha {
+				record, carried, err := carryForwardBaseline(ctx, cmd, dir, sha, ecosystems, current, cfg.Coverage.Tolerance)
+				if err != nil {
+					return err
+				}
+				if len(record) == 0 {
+					return printNoCoverage(cmd, mode)
+				}
+				if err := gitstate.WriteBaseline(ctx, dir, sha, record); err != nil {
+					// Best-effort, as everywhere else: a write race with a concurrent
+					// main build must not fail the build.
+					_, printErr := fmt.Fprintf(cmd.ErrOrStderr(), "warning: failed to record coverage baseline for %s: %v\n", sha, err)
+					return printErr
+				}
+				note := ""
+				if len(carried) > 0 {
+					note = fmt.Sprintf(" (%s carried forward from a prior baseline — detected but not measured this run)", strings.Join(carried, ", "))
+				}
+				_, err = fmt.Fprintf(cmd.OutOrStdout(), "recorded coverage baseline for %s: %s%s\n", sha, formatReport(record), note)
 				return err
+			}
+
+			if len(current) == 0 {
+				return printNoCoverage(cmd, mode)
+			}
+			if shaErr != nil {
+				return shaErr
+			}
+			if headErr != nil {
+				return headErr
 			}
 
 			baseline, hit, err := gitstate.ReadBaseline(ctx, dir, sha)
@@ -77,27 +146,41 @@ func newCoverageCmd() *cobra.Command {
 				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "no cached baseline for %s — computing one now (first PR against this main commit pays this cost)\n", sha); err != nil {
 					return err
 				}
-				baseline, err = computeBaselineAt(ctx, dir, sha, cfg)
+				baseline, err = computeBaselineAt(ctx, cmd, dir, sha, cfg)
 				if err != nil {
 					return err
 				}
-				// Caching the baseline is best-effort: a write failure (worktree
-				// race, disk pressure, transient git error) must never fail this
-				// command outright — `current` and `baseline` are already
-				// computed, and diffReport below is what actually matters.
-				if err := gitstate.WriteBaseline(ctx, dir, sha, baseline); err != nil {
+				// Never cache a baseline that measured nothing. Compute silently
+				// omits any language whose tooling it couldn't run, so a runner
+				// missing (say) cargo-llvm-cov produces an empty report — and
+				// caching it makes every later PR hit a "valid" baseline of
+				// nothing, report every language as [NEW], and gate on nothing at
+				// all, silently and permanently. That is exactly what happened to
+				// wardnet: nine baselines on its bulwark-state branch, every one
+				// of them `{}`. A run that measured nothing has learned nothing,
+				// so there is nothing worth remembering; recomputing next time is
+				// the strictly better failure mode.
+				if len(baseline) == 0 {
+					if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "warning: computed no coverage at all for %s — not caching it as a baseline. The gate cannot compare against a baseline of nothing; fix the missing tooling above and it will recompute.\n", sha); err != nil {
+						return err
+					}
+				} else if err := gitstate.WriteBaseline(ctx, dir, sha, baseline); err != nil {
+					// Caching is otherwise best-effort: a write failure (worktree
+					// race, disk pressure, transient git error) must never fail this
+					// command outright — `current` and `baseline` are already
+					// computed, and diffReport below is what actually matters.
 					if _, printErr := fmt.Fprintf(cmd.ErrOrStderr(), "warning: failed to cache coverage baseline for %s: %v\n", sha, err); printErr != nil {
 						return printErr
 					}
 				}
 			}
 
-			aggregateErr := diffReport(cmd, current, baseline)
+			aggregateErr := diffReport(cmd, current, baseline, cfg.Coverage.Tolerance, ecosystems)
 			// sha is the same merge-base gitstate.BaseSHA already resolved for
 			// the aggregate baseline lookup above — patch coverage reuses it
 			// directly rather than recomputing "git merge-base HEAD origin/main"
 			// a second time.
-			patchErr := patchReport(cmd, ctx, dir, patchWanted, sources, sha, baseline)
+			patchErr := patchReport(cmd, ctx, dir, patchWanted, sources, sha, baseline, cfg.Coverage.Patch.Tolerance, ecosystems)
 			// errors.Join keeps both messages when aggregate AND patch coverage
 			// regress in the same run — AGENTS.md's documented "compute and gate
 			// on both, not either/or" contract must hold for the returned error
@@ -157,7 +240,7 @@ func parseRustReportOverrides(values []string) coverage.RustReportOverrides {
 // main commit (cached afterward on the bulwark-state branch), not a
 // per-invocation cost, so it doesn't reintroduce the duplicate-test-run
 // problem --tests=skip exists to avoid.
-func computeBaselineAt(ctx context.Context, dir, sha string, cfg config.Config) (map[string]float64, error) {
+func computeBaselineAt(ctx context.Context, cmd *cobra.Command, dir, sha string, cfg config.Config) (map[string]float64, error) {
 	tmp, err := os.MkdirTemp("", "bulwark-baseline-*")
 	if err != nil {
 		return nil, err
@@ -174,7 +257,64 @@ func computeBaselineAt(ctx context.Context, dir, sha string, cfg config.Config) 
 	// zero value here, and the resolved sources/cleanup are discarded.
 	report, _, cleanup, err := coverage.Compute(ctx, tmp, cfg, coverage.ModeRun, coverage.ReportPaths{}, coverage.PatchWanted{})
 	defer cleanup()
-	return report, err
+	if err != nil {
+		return nil, err
+	}
+	// The baseline worktree is where measurement most often fails unnoticed: it
+	// is a bare checkout with no node_modules, no CI-staged report, and only
+	// whatever tooling the runner happens to have. Name what went unmeasured
+	// here, or the failure surfaces later as the far more confusing "no
+	// baseline yet" against a bulwark-state branch that visibly has files in it.
+	detected, err := detect.Ecosystems(tmp, cfg.AllExcludes())
+	if err != nil {
+		return nil, err
+	}
+	ecosystems := enabledEcosystems(detected, cfg)
+	if err := warnUnmeasured(cmd, ecosystems, report, "at "+sha[:min(8, len(sha))]); err != nil {
+		return nil, err
+	}
+	// The bare worktree is the write path MOST likely to be partial (no
+	// node_modules, no CI-staged reports, only whatever tooling the runner
+	// has), and a partial baseline cached here poisons every later PR against
+	// this SHA just as thoroughly as a partial record-on-main would — so it
+	// gets the same carry-forward, not just the record-on-main path.
+	record, _, err := carryForwardBaseline(ctx, cmd, dir, sha, ecosystems, report, cfg.Coverage.Tolerance)
+	if err != nil {
+		return nil, err
+	}
+	return record, nil
+}
+
+// formatReport renders a coverage report as a stable, sorted one-liner
+// ("go: 58.5%, rust: 85.7%") for the baseline-recorded message on main. Sorted
+// so the line doesn't reshuffle between runs over Go's map iteration order.
+func formatReport(report map[string]float64) string {
+	langs := make([]string, 0, len(report))
+	for lang := range report {
+		langs = append(langs, lang)
+	}
+	sort.Strings(langs)
+	parts := make([]string, 0, len(langs))
+	for _, lang := range langs {
+		parts = append(parts, fmt.Sprintf("%s: %.1f%%", lang, report[lang]))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// warnUnmeasured prints a warning for every ecosystem bulwark detected in dir
+// but produced no coverage number for. coverage.Compute drops such a language
+// silently — deliberately, since a repo with no coverage tooling shouldn't hard
+// fail — but silent omission is also how a whole ecosystem can vanish from the
+// gate without anyone noticing. Saying so out loud costs nothing and is the
+// difference between "rust is unmeasured because cargo-llvm-cov isn't
+// installed" and a mystery.
+func warnUnmeasured(cmd *cobra.Command, ecosystems []detect.Ecosystem, report map[string]float64, where string) error {
+	for _, lang := range unmeasuredLanguages(ecosystems, report) {
+		if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s detected %s, but measured no coverage for it — its coverage tooling is missing or failed, so it is absent from the gate\n", where, lang); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // statusPrefix renders a bracketed status tag padded to a fixed column width
@@ -187,20 +327,40 @@ func statusPrefix(tag string) string {
 	return bracket + strings.Repeat(" ", pad)
 }
 
+// regressedBeyond reports whether cur dipped below base by more than
+// tolerance percentage points, comparing at the report's display precision
+// (tenths) so what's shown and what's gated always agree: a raw float64
+// subtraction decides an exactly-at-tolerance dip by representation noise
+// (86.2-86.1 exceeds 0.1 but 86.1-86.0 does not), failing one "regressed
+// 0.1%" while passing an identical-looking other. Shared by diffReport and
+// patchReport so the two gates can't drift apart on the comparison, like
+// statusPrefix does for formatting.
+func regressedBeyond(cur, base, tolerance float64) bool {
+	return math.Round((base-cur)*10) > math.Round(tolerance*10)
+}
+
 // patchReport prints one bracketed status line per language whose patch
 // coverage was requested (cfg.Coverage.Patch.<lang>.Enabled) and whose
 // source Compute managed to resolve, gating patch% against that language's
 // aggregate baseline (patch coverage has no baseline of its own — see
 // CONTEXT.md). A language with no baseline yet is reported informationally,
 // not failed, mirroring diffReport's [NEW] handling. A language with zero
-// coverable changed lines (e.g. the diff only touched comments/imports, or
-// its source couldn't be resolved) is skipped entirely — there's nothing to
-// gate on.
+// coverable changed lines (the diff only touched comments/imports) is
+// skipped entirely — there's nothing to gate on.
+//
+// A detected language whose files the diff DID touch but whose per-line
+// source couldn't be resolved is reported as [UNMEASURED], not skipped in
+// silence: a silent skip here reads as "patch coverage passed" in the PR
+// comment, when in fact it never ran — wardnet/wardnet#957 shipped a green
+// bulwark comment that way while Codecov, fed the very same lcov export,
+// failed the diff's patch coverage. Like diffReport's [UNMEASURED], it never
+// fails the gate on its own; a stderr warning names the wiring that's
+// missing.
 //
 // ChangedLines is called exactly once, for the union of every wanted
 // language's extensions, then partitioned per language — not once per
 // language — since all three langs diff the identical mergeBase..HEAD range.
-func patchReport(cmd *cobra.Command, ctx context.Context, dir string, want coverage.PatchWanted, sources coverage.PatchSources, mergeBase string, baseline map[string]float64) error {
+func patchReport(cmd *cobra.Command, ctx context.Context, dir string, want coverage.PatchWanted, sources coverage.PatchSources, mergeBase string, baseline map[string]float64, tolerance float64, detected []detect.Ecosystem) error {
 	type language struct {
 		name   string
 		wanted bool
@@ -226,6 +386,11 @@ func patchReport(cmd *cobra.Command, ctx context.Context, dir string, want cover
 		return err
 	}
 
+	detectedSet := make(map[string]bool, len(detected))
+	for _, e := range detected {
+		detectedSet[string(e)] = true
+	}
+
 	regressed := 0
 	for _, lang := range langs {
 		if !lang.wanted {
@@ -234,26 +399,43 @@ func patchReport(cmd *cobra.Command, ctx context.Context, dir string, want cover
 		langChanged := filterByExt(changed, lang.exts)
 
 		var hit, total int
+		resolved := true
 		switch lang.name {
 		case "go":
 			if sources.GoProfile == "" || sources.ModuleName == "" {
-				continue
+				resolved = false
+				break
 			}
-			hits, err := coverage.ParseGoProfile(sources.GoProfile, sources.ModuleName)
+			hits, err := coverage.ParseGoProfile(sources.GoProfile, sources.ModuleName, dir)
 			if err != nil {
-				continue
+				resolved = false
+				break
 			}
 			hit, total = coverage.PatchPercent(langChanged, hits)
 		case "rust":
 			if len(sources.RustLCOV) == 0 {
-				continue
+				resolved = false
+				break
 			}
 			hit, total = rustPatchPercent(dir, sources.RustLCOV, langChanged)
 		case "typescript":
 			if len(sources.TSLCOV) == 0 {
-				continue
+				resolved = false
+				break
 			}
 			hit, total = tsPatchPercent(dir, sources.TSLCOV, langChanged)
+		}
+		// The unmeasured report is scoped to detected ecosystems: patch gates
+		// default to enabled for all three languages regardless of what the
+		// repo actually contains, and a stray .rs file changed in (say) a pure
+		// Go repo shouldn't produce a rust line.
+		if !resolved {
+			if detectedSet[lang.name] {
+				if err := reportPatchUnmeasured(cmd, lang.name, langChanged); err != nil {
+					return err
+				}
+			}
+			continue
 		}
 		if total == 0 {
 			continue
@@ -265,7 +447,10 @@ func patchReport(cmd *cobra.Command, ctx context.Context, dir string, want cover
 		switch {
 		case !baseOK:
 			tag, detail = "NEW", fmt.Sprintf("%s patch: %.1f%% (%d/%d new lines; no baseline yet)", lang.name, pct, hit, total)
-		case pct < base:
+		// The patch gate has its own tolerance knob
+		// (coverage.patch.tolerance) — deliberately not coverage.tolerance,
+		// so loosening the noisy aggregate gate never weakens this one.
+		case regressedBeyond(pct, base, tolerance):
 			regressed++
 			tag, detail = "FAIL", fmt.Sprintf("%s patch: %.1f%% (%d/%d new lines; baseline %.1f%%)", lang.name, pct, hit, total, base)
 		default:
@@ -279,6 +464,37 @@ func patchReport(cmd *cobra.Command, ctx context.Context, dir string, want cover
 		return fmt.Errorf("patch coverage regressed for %d language(s)", regressed)
 	}
 	return nil
+}
+
+// patchSourceHints names, per language, the wiring that gets a per-line
+// coverage source resolved — what the stderr warning points at when the
+// patch gate had changed lines to measure but nothing to measure them with.
+var patchSourceHints = map[string]string{
+	"go":         "the same Go profile the aggregate gate reads (--go-report, or coverage.out/cover.out/c.out) also feeds patch coverage — if aggregate Go coverage was measured this run, this shouldn't happen",
+	"rust":       "pass --rust-lcov-report, or place a cargo-llvm-cov lcov export at coverage/lcov.info in the crate directory",
+	"typescript": "enable an lcov reporter in each package's coverage config so coverage/lcov.info is written alongside coverage-summary.json",
+}
+
+// reportPatchUnmeasured surfaces a patch gate that had changed lines to
+// measure but no per-line source to measure them with: an [UNMEASURED] line
+// on stdout (so it lands in the PR comment next to the aggregate result, via
+// action.yml's generic bracketed-tag grep) and a stderr warning naming the
+// missing wiring. A diff that touched none of the language's files stays
+// silent — nothing was skipped, there was simply nothing to gate.
+func reportPatchUnmeasured(cmd *cobra.Command, lang string, changed map[string][]int) error {
+	if len(changed) == 0 {
+		return nil
+	}
+	lines := 0
+	for _, l := range changed {
+		lines += len(l)
+	}
+	detail := fmt.Sprintf("%s patch: not measured (%d changed line(s) across %d file(s), but no per-line coverage source was resolved)", lang, lines, len(changed))
+	if _, err := fmt.Fprintln(cmd.OutOrStdout(), statusPrefix("UNMEASURED")+detail); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s patch coverage is enabled and this diff touches %s files, but no per-line coverage source was resolved — %s\n", lang, lang, patchSourceHints[lang])
+	return err
 }
 
 // filterByExt returns the subset of changed whose file name ends in one of
@@ -426,11 +642,17 @@ func rustPatchPercent(dir string, rustLCOV map[string]string, changed map[string
 
 // diffReport prints current vs. baseline per language, covering every
 // language mentioned by either side (not just current's), and fails if any
-// language's coverage regressed. A language with no baseline entry (newly
-// added) or a language dropped from current (no longer measurable) is
-// reported but doesn't fail the check on its own — only a measured decrease
-// does.
-func diffReport(cmd *cobra.Command, current, baseline map[string]float64) error {
+// language's coverage regressed. A language with no baseline entry is [NEW];
+// one the baseline has but this run didn't measure is [UNMEASURED] while its
+// source is still detected (its coverage step just didn't run) and [DROPPED]
+// once it isn't (the source actually left the tree). None of those fail the
+// check on its own — only a measured decrease beyond the configured noise
+// tolerance does (see regressedBeyond).
+func diffReport(cmd *cobra.Command, current, baseline map[string]float64, tolerance float64, detected []detect.Ecosystem) error {
+	detectedSet := make(map[string]bool, len(detected))
+	for _, e := range detected {
+		detectedSet[string(e)] = true
+	}
 	langs := make(map[string]struct{}, len(current)+len(baseline))
 	for lang := range current {
 		langs[lang] = struct{}{}
@@ -452,9 +674,17 @@ func diffReport(cmd *cobra.Command, current, baseline map[string]float64) error 
 		switch {
 		case !baseOK:
 			tag, detail = "NEW", fmt.Sprintf("%s: %.1f%% (no baseline yet)", lang, cur)
+		// A language still detected in the tree but absent from this run's
+		// measurements isn't gone — its coverage step just didn't run (a
+		// path-filtered CI job, missing tooling). Say that, and reserve
+		// DROPPED for a language whose source actually left the tree.
+		case !curOK && detectedSet[lang]:
+			tag, detail = "UNMEASURED", fmt.Sprintf("%s: not measured this run (baseline %.1f%%)", lang, base)
 		case !curOK:
 			tag, detail = "DROPPED", fmt.Sprintf("%s: no longer measured (baseline was %.1f%%)", lang, base)
-		case cur < base:
+		// Dips within the configured noise tolerance don't count — see
+		// config.Coverage.Tolerance for the rationale.
+		case regressedBeyond(cur, base, tolerance):
 			regressed++
 			tag, detail = "FAIL", fmt.Sprintf("%s: %.1f%% (baseline %.1f%%, regressed %.1f%%)", lang, cur, base, base-cur)
 		default:
@@ -468,4 +698,127 @@ func diffReport(cmd *cobra.Command, current, baseline map[string]float64) error 
 		return fmt.Errorf("coverage regressed for %d language(s)", regressed)
 	}
 	return nil
+}
+
+// printNoCoverage reports a run that measured nothing and — on main — had no
+// prior baseline entries to carry forward either: there is nothing to gate
+// and nothing worth recording.
+func printNoCoverage(cmd *cobra.Command, mode coverage.Mode) error {
+	msg := "no coverage measured — no coverage tooling detected/available for any ecosystem"
+	if mode == coverage.ModeSkip {
+		msg += " (--tests=skip only reads an existing report — did an earlier CI step produce one at the expected path?)"
+	}
+	_, err := fmt.Fprintln(cmd.OutOrStdout(), msg)
+	return err
+}
+
+// enabledEcosystems drops languages disabled in .bulwark.yml from the
+// detected set. For the coverage gate, `enabled: false` means "stop gating
+// this language", so it must behave exactly like source removal: undetected,
+// its baseline entry dies on the next record instead of being carried
+// forward (and [UNMEASURED]-reported) forever.
+func enabledEcosystems(detected []detect.Ecosystem, cfg config.Config) []detect.Ecosystem {
+	var out []detect.Ecosystem
+	for _, e := range detected {
+		enabled := true
+		switch e {
+		case detect.Rust:
+			enabled = cfg.Rust.Enabled
+		case detect.TypeScript:
+			enabled = cfg.TypeScript.Enabled
+		case detect.Go:
+			enabled = cfg.Go.Enabled
+		}
+		if enabled {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// unmeasuredLanguages returns, sorted, every detected language the report has
+// no entry for. It is the single source of truth for "detected but not
+// measured this run" — the unmeasured warning, the carry-forward, and the
+// missing-entry warning all key off this one predicate so they cannot drift.
+func unmeasuredLanguages(detected []detect.Ecosystem, report map[string]float64) []string {
+	var out []string
+	for _, e := range detected {
+		if _, measured := report[string(e)]; !measured {
+			out = append(out, string(e))
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// mergeCarried returns a copy of current with each unmeasured language filled
+// from prior where possible: carried lists what was filled, missing what no
+// prior baseline had. Measured values are never overwritten.
+func mergeCarried(current map[string]float64, unmeasured []string, prior map[string]float64) (map[string]float64, []string, []string) {
+	if len(unmeasured) == 0 {
+		return current, nil, nil
+	}
+	record := make(map[string]float64, len(current)+len(prior))
+	maps.Copy(record, current)
+	var carried, missing []string
+	for _, lang := range unmeasured {
+		if val, ok := prior[lang]; ok {
+			record[lang] = val
+			carried = append(carried, lang)
+		} else {
+			missing = append(missing, lang)
+		}
+	}
+	return record, carried, missing
+}
+
+// carryForwardBaseline returns the report to record as sha's baseline: every
+// measured value, plus — for each detected-but-unmeasured language — its
+// entry from the nearest prior baseline that has one (starting at sha itself,
+// so a re-run or concurrent job's fresher same-commit entry beats any
+// ancestor's). A partial run (a path-filtered CI job, a bare baseline
+// worktree missing tooling) must not shrink the baseline: recording only what
+// was measured silently drops the unmeasured language from every later PR's
+// gate. An undetected language is never carried — its source left the tree
+// (or it was disabled in .bulwark.yml), so its entry dies with it. Anything
+// that stayed unfilled is named on stderr rather than dropped in silence.
+func carryForwardBaseline(ctx context.Context, cmd *cobra.Command, dir, sha string, detected []detect.Ecosystem, current map[string]float64, tolerance float64) (map[string]float64, []string, error) {
+	unmeasured := unmeasuredLanguages(detected, current)
+	// Priors are fetched for every detected language, not just unmeasured
+	// ones: measured values need them too, for the anti-ratchet restore
+	// below.
+	langs := make([]string, 0, len(detected))
+	for _, e := range detected {
+		langs = append(langs, string(e))
+	}
+	prior := gitstate.PriorBaselines(ctx, dir, sha, langs, priorBaselineDepth)
+	record, carried, missing := mergeCarried(current, unmeasured, prior)
+	record = withToleratedDipsRestored(record, prior, tolerance)
+	for _, lang := range missing {
+		if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s is detected but was not measured this run, and no prior baseline entry was found to carry forward — recording a baseline without it (if this repo has prior baselines, is the checkout shallow? fetch-depth: 0 lets bulwark walk prior main commits)\n", lang); err != nil {
+			return nil, nil, err
+		}
+	}
+	return record, carried, nil
+}
+
+// withToleratedDipsRestored returns record with every measured value that
+// dipped below its prior baseline by no more than the gate's tolerance
+// restored to the prior value. Recording the dipped number verbatim would
+// turn the tolerance into an unbounded downward ratchet: each merged PR may
+// dip up to the tolerance and pass, the main run records the lower number as
+// the new baseline, and the next PR gets another free dip from that lower
+// floor — coverage bleeds one tolerance per merge with every gate green.
+// Restoring within-tolerance dips anchors the baseline to its high-water
+// mark, capping total tolerated drift at one tolerance. A dip beyond the
+// tolerance is recorded as measured: it was FAIL-visible on the PR that
+// introduced it, so accepting it on main is a deliberate reset, not leakage.
+func withToleratedDipsRestored(record, prior map[string]float64, tolerance float64) map[string]float64 {
+	out := maps.Clone(record)
+	for lang, val := range out {
+		if p, ok := prior[lang]; ok && val < p && !regressedBeyond(val, p, tolerance) {
+			out[lang] = p
+		}
+	}
+	return out
 }

@@ -84,6 +84,8 @@ go:
 semgrep:
   enabled: true
   config: auto
+coverage:
+  tolerance: 0.1  # pp the aggregate gate tolerates below baseline (patch gate: coverage.patch.tolerance)
 ```
 
 See [AGENTS.md](AGENTS.md#configuration) for the full schema and merge semantics.
