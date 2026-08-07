@@ -64,7 +64,11 @@ func newScanCmd() *cobra.Command {
 					if !cfg.Go.Enabled {
 						continue
 					}
-					results = append(results, golang.Check(ctx, dir)...)
+					goResults, err := golang.Check(ctx, dir, cfg.Go.Exclude)
+					if err != nil {
+						return err
+					}
+					results = append(results, goResults...)
 				}
 			}
 			if cfg.Semgrep.Enabled {
