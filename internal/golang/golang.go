@@ -1,4 +1,5 @@
-// Package golang runs gosec and govulncheck against a Go module. Both are
+// Package golang runs gosec and govulncheck against every Go module found
+// under the scan root. Both are
 // installed via `go install` into a bulwark-managed, version-keyed bin
 // directory (never trusting whatever gosec/govulncheck might already be on
 // PATH) — the same "pin the exact toolchain, don't reuse ambient installs"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"wardnet/bulwark/internal/detect"
 	"wardnet/bulwark/internal/executil"
 )
 
@@ -24,23 +26,71 @@ const (
 	govulncheckPkg = "golang.org/x/vuln/cmd/govulncheck@" + govulncheckVersion
 )
 
-// Check runs gosec and govulncheck against the Go module rooted at dir.
-func Check(ctx context.Context, dir string) []executil.Result {
+// Check runs gosec and govulncheck against every Go module under root,
+// skipping any directory named in exclude.
+//
+// Both tools are module-scoped: govulncheck exits with "no go.mod file" when
+// run anywhere but a module root, so running once at the scan root only ever
+// worked when the module happened to sit exactly there. A monorepo that keeps
+// its Go modules in subdirectories got a hard failure from govulncheck and a
+// misleading pass from gosec, which walks a tree happily without a module.
+func Check(ctx context.Context, root string, exclude []string) ([]executil.Result, error) {
+	modDirs, err := detect.GoModuleDirs(root, exclude)
+	if err != nil {
+		return nil, err
+	}
+	if len(modDirs) == 0 {
+		return nil, nil
+	}
+
+	multi := len(modDirs) > 1
+	var results []executil.Result
+	for _, dir := range modDirs {
+		results = append(results, checkModule(ctx, dir, moduleLabel(root, dir, multi))...)
+	}
+	return results, nil
+}
+
+// moduleLabel mirrors rust.crateLabel: a "<relative dir>: " prefix, applied
+// only when more than one module was discovered, so single-module output keeps
+// the bare tool names. Relative to root rather than absolute, so results do not
+// carry a machine-specific path, and prefixed rather than suffixed so the
+// action's `^\[(PASS|FAIL)\] <label>?<tool>$` parsing keeps working.
+func moduleLabel(root, dir string, multi bool) string {
+	if !multi {
+		return ""
+	}
+	rel, err := filepath.Rel(root, dir)
+	if err != nil || rel == "." {
+		return ""
+	}
+	return rel + ": "
+}
+
+// checkModule runs both tools inside a single module directory.
+func checkModule(ctx context.Context, dir, label string) []executil.Result {
 	var results []executil.Result
 
 	if bin, err := ensure(ctx, "gosec", gosecVersion, gosecPkg); err != nil {
-		results = append(results, executil.Result{Name: "gosec", Err: err})
+		results = append(results, executil.Result{Name: label + "gosec", Err: err})
 	} else {
-		r := executil.Run(ctx, dir, bin, "./...")
-		r.Name = "gosec"
+		// -exclude-generated skips files carrying the standard
+		// "Code generated ... DO NOT EDIT." header. Findings there are not
+		// actionable: the only fix is to change the generator or its input,
+		// and a `#nosec` annotation would be erased by the next regeneration.
+		// This matches how generated code is already treated elsewhere in the
+		// pipeline — golangci-lint's `exclusions: generated` and semgrep's own
+		// generated-file skip.
+		r := executil.Run(ctx, dir, bin, "-exclude-generated", "./...")
+		r.Name = label + "gosec"
 		results = append(results, r)
 	}
 
 	if bin, err := ensure(ctx, "govulncheck", govulncheckVersion, govulncheckPkg); err != nil {
-		results = append(results, executil.Result{Name: "govulncheck", Err: err})
+		results = append(results, executil.Result{Name: label + "govulncheck", Err: err})
 	} else {
 		r := executil.Run(ctx, dir, bin, "./...")
-		r.Name = "govulncheck"
+		r.Name = label + "govulncheck"
 		results = append(results, r)
 	}
 

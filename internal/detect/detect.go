@@ -131,6 +131,58 @@ func TSPackageDirs(root string, exclude []string) ([]string, error) {
 	return dirs, nil
 }
 
+// GoModuleDirs returns every directory under root containing a go.mod, so
+// each Go module can be scanned independently. Directories named in exclude
+// (in addition to the built-in defaults) are skipped, matching TSPackageDirs.
+//
+// Unlike RustCrateDirs, there is no ancestor/member relationship to resolve:
+// a nested go.mod starts a genuinely separate module and is *excluded* from
+// its parent's package graph, so `./...` at an ancestor would never reach it.
+// Every go.mod is therefore its own scan root. A `go.work` file does not
+// change this — it affects local resolution, not module boundaries, and
+// gosec/govulncheck still need to run inside each module.
+func GoModuleDirs(root string, exclude []string) ([]string, error) {
+	skip := skipSet(exclude)
+	var dirs []string
+	var visit func(dir string) error
+	visit = func(dir string) error {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			if !e.IsDir() && e.Name() == "go.mod" {
+				dirs = append(dirs, dir)
+				break
+			}
+		}
+		for _, e := range entries {
+			if e.IsDir() && !skip[e.Name()] && !goIgnoredDir(e.Name()) {
+				if err := visit(filepath.Join(dir, e.Name())); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := visit(root); err != nil {
+		return nil, err
+	}
+	return dirs, nil
+}
+
+// goIgnoredDir reports whether the Go toolchain itself ignores a directory
+// when resolving packages: "testdata", and any name beginning with "." or "_".
+//
+// Honouring this matters because a go.mod under testdata/ is a fixture, not a
+// project. Such modules are routinely unbuildable on purpose — no go.sum, or
+// deliberately pinned to a vulnerable dependency to exercise a scanner. The
+// parent's `./...` never compiles them, so treating one as a real scan root
+// would fail the whole run on code that is not shipped.
+func goIgnoredDir(name string) bool {
+	return name == "testdata" || strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_")
+}
+
 // RustCrateDirs returns every directory under root that is the effective
 // root of an independent Cargo invocation: each directory containing a
 // Cargo.toml, except a nested Cargo.toml whose nearest Cargo.toml ancestor
