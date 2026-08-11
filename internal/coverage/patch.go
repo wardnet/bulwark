@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -163,16 +164,23 @@ func ParseLCOV(data []byte, baseDir string) LineHits {
 // included. Left unfiltered, adding a comment inside an uncovered function
 // counts as an uncovered new line, and a comment-only PR scores 0% patch
 // coverage and fails the gate — which is exactly what wardnet/inforge#216 hit.
-func ParseGoProfile(path, moduleName, dir string) (LineHits, error) {
-	profiles, err := cover.ParseProfiles(path)
+func ParseGoProfile(src GoModuleProfile, dir string) (LineHits, error) {
+	profiles, err := cover.ParseProfiles(src.Profile)
 	if err != nil {
 		return nil, err
 	}
 	hits := LineHits{}
 	for _, p := range profiles {
-		rel := strings.TrimPrefix(p.FileName, moduleName+"/")
-		rel = filepath.ToSlash(rel)
-		skip := nonExecutableLines(filepath.Join(dir, filepath.FromSlash(rel)))
+		rel := goRelPath(p.FileName, src)
+		abs := filepath.Join(dir, filepath.FromSlash(rel))
+		// Generated code is nobody's to hand-test, and it lands in large,
+		// entirely-uncovered blocks — wardnet's regenerated REST client alone
+		// accounts for 983 of one PR's 1007 changed Go lines. Counting it
+		// would make the patch gate a measure of how much code was generated.
+		if isGeneratedGoFile(abs) {
+			continue
+		}
+		skip := nonExecutableLines(abs)
 		fileHits := map[int]int{}
 		for _, b := range p.Blocks {
 			for line := b.StartLine; line <= b.EndLine; line++ {
@@ -187,6 +195,58 @@ func ParseGoProfile(path, moduleName, dir string) (LineHits, error) {
 		hits[rel] = fileHits
 	}
 	return hits, nil
+}
+
+// goRelPath turns a profile entry's package-qualified file name into a path
+// relative to --dir: strip the module path every entry in that module's
+// profile is prefixed with, then put back the module's own directory.
+//
+// The two are unrelated strings. `wardnet.network/go/anomalies.go` in a
+// module rooted at `sdk/wardnet-go` is `sdk/wardnet-go/anomalies.go` on disk,
+// and nothing about the module path says so — which is why RelDir is carried
+// alongside rather than derived.
+func goRelPath(fileName string, src GoModuleProfile) string {
+	rel := filepath.ToSlash(strings.TrimPrefix(fileName, src.ModuleName+"/"))
+	if src.RelDir == "" {
+		return rel
+	}
+	return path.Join(filepath.ToSlash(src.RelDir), rel)
+}
+
+// generatedGoHeader matches the comment Go reserves for machine-written
+// files (https://golang.org/s/generatedcode). Keying off that line is what
+// the rest of the ecosystem does — golangci-lint and Codecov both do — so
+// bulwark follows the convention rather than inventing a filename pattern
+// like `*.gen.go`, which only catches whatever one generator happens to be
+// configured to emit.
+var generatedGoHeader = regexp.MustCompile(`^// Code generated .* DO NOT EDIT\.$`)
+
+// isGeneratedGoFile reports whether path carries the generated-code header.
+//
+// The convention puts that line before the package clause, so the scan stops
+// there rather than reading whole files — the line is only meaningful in the
+// header, and a matching string further down (this file's own doc comment,
+// say) means nothing. An unreadable file is treated as not generated: the
+// safe direction is to keep counting a file bulwark can't classify.
+func isGeneratedGoFile(path string) bool {
+	f, err := os.Open(path) // #nosec G304 -- path is derived from bulwark's own coverage profile, not user input
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "package ") {
+			return false
+		}
+		if generatedGoHeader.MatchString(line) {
+			return true
+		}
+	}
+	return false
 }
 
 // nonExecutableLines returns the 1-indexed lines of a Go source file that can

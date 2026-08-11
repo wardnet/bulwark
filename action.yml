@@ -31,7 +31,11 @@ inputs:
       instrumentation on, so tests aren't executed a second time.
     default: run
   go-report:
-    description: path (relative to dir) to an existing Go coverage profile; only used with tests-mode=skip
+    description: >
+      path (relative to dir) to an existing Go coverage profile; only used with tests-mode=skip.
+      Newline-separated for a repo with more than one Go module, one "<moduleDir>=<path>" per line
+      (moduleDir relative to dir). Usually unnecessary: each discovered module's own
+      coverage.out/cover.out/c.out is found without a flag.
     default: ""
   rust-report:
     description: path (relative to dir) to an existing cargo-llvm-cov JSON export; only used with tests-mode=skip
@@ -116,9 +120,21 @@ runs:
       run: |
         set +e
         args=(coverage --dir "$DIR" --tests="$TESTS_MODE")
-        if [[ -n "$GO_REPORT" ]]; then args+=(--go-report "$GO_REPORT"); fi
-        if [[ -n "$RUST_REPORT" ]]; then args+=(--rust-report "$RUST_REPORT"); fi
-        if [[ -n "$RUST_LCOV_REPORT" ]]; then args+=(--rust-lcov-report "$RUST_LCOV_REPORT"); fi
+        # These flags are repeatable — one per discovered crate/module — but a
+        # composite-action input is a single string, so each is read as
+        # newline-separated values. That lets a multi-module repo pass one
+        # "<dir>=<path>" per line; a single-line value behaves as before.
+        add_reports() {
+          local flag="$1" line
+          while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [[ -n "$line" ]] && args+=("$flag" "$line")
+          done <<< "$2"
+        }
+        add_reports --go-report "$GO_REPORT"
+        add_reports --rust-report "$RUST_REPORT"
+        add_reports --rust-lcov-report "$RUST_LCOV_REPORT"
         bulwark "${args[@]}" 2>&1 | tee "${RUNNER_TEMP}/bulwark-coverage-output.txt"
         echo "exit-code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 

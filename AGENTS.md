@@ -181,6 +181,23 @@ generated cache data, not source, needs no PR/review and never pollutes main's h
   repeatable, keyed flags (`--rust-report <crateDir>=<path>`, crateDir relative to `--dir`) rather
   than a single path — a bare value (no `=`) is only honored when discovery finds exactly one crate,
   preserving the original single-crate invocation unchanged.
+- Go never assumes `--dir` itself is a module root either, for the same reason and by the same
+  shape (see [ADR 0002](docs/adr/0002-go-multi-module-coverage.md)) — `internal/detect.GoModuleDirs`
+  discovers every module under `--dir` and `internal/coverage.goCoverage` measures each in turn,
+  averaging across them. `--go-report` is likewise repeatable and keyed
+  (`--go-report <moduleDir>=<path>`). This one bit for real: `go test`, `go list -m` and `go tool
+  cover -func` are all module-scoped, so running them at a monorepo root measured *nothing* — and
+  said so only in a warning, leaving Go absent from wardnet's gate, aggregate and patch both, while
+  CI stayed green. Two guards keep that from recurring quietly: the aggregate is computed from the
+  profile itself rather than by shelling out to `go tool cover -func` (same number, but it works
+  from any directory), and `moduleName` rejects `go list -m`'s `command-line-arguments` answer
+  instead of treating it as a module path that strips nothing.
+- Generated Go files are excluded from both the aggregate and the patch gate, matched on Go's
+  `// Code generated ... DO NOT EDIT.` convention (<https://golang.org/s/generatedcode>) rather than
+  a filename pattern — the same signal golangci-lint and Codecov use. Without it the gate measures
+  code generation rather than testing: wardnet's regenerated REST client was 983 of one PR's 1007
+  changed Go lines and pinned its SDK module's aggregate at 2%. Note `go.exclude` in `.bulwark.yml`
+  cannot do this job — it narrows module *discovery*, not what is inside a module.
 - **An empty baseline is never cached, and an empty cached baseline is a miss.** `Compute` silently
   omits any language whose tooling it can't run (deliberate — a repo with no coverage tooling
   shouldn't hard fail). But baseline computation runs in a *bare worktree*: no `node_modules`, no
@@ -220,8 +237,10 @@ twice: once plain for pass/fail, once instrumented for coverage; `bulwark covera
 run would make it worse, not better).
 
 `--tests=skip` fixes this: it never executes anything, only looks for a report file a prior step
-already produced — `internal/coverage.findReport` checks an explicit `--go-report`/`--rust-report`
-override first, then a built-in candidate list (`coverage.out`/`cover.out`/`c.out` for Go;
+already produced — `internal/coverage.findReportForUnit` checks an explicit
+`--go-report`/`--rust-report` override first (keyed by the discovered module/crate directory it
+applies to), then a built-in candidate list resolved relative to that directory
+(`coverage.out`/`cover.out`/`c.out` for Go;
 `coverage/llvm-cov.json`/`llvm-cov.json`/`target/llvm-cov/llvm-cov.json` for Rust — TypeScript has
 no override, since `coverage/coverage-summary.json` is already Istanbul's own fixed convention, not
 something projects vary). In CI, the intended shape is: the existing test job already produces
@@ -310,10 +329,15 @@ untested code through the gate.
 Per-ecosystem line-hit sources, all converging on the same `LineHits` (`map[file]map[line]hits`)
 shape:
 
-- **Go**: `internal/coverage.ParseGoProfile` reads the same `coverage.out` profile
-  `go tool cover -func` already parses for the aggregate percentage — no separate format, no second
-  `go test` run. `Compute`'s returned `PatchSources.GoProfile` is that resolved path, kept alive
-  until the caller's `cleanup()` runs.
+- **Go**: `internal/coverage.ParseGoProfile` reads the same `coverage.out` profile the aggregate
+  percentage is computed from — no separate format, no second `go test` run. `Compute`'s returned
+  `PatchSources.GoProfiles` is a `map[string]GoModuleProfile` keyed by module dir (like Rust's
+  `RustLCOV`, not a single path), each entry carrying the profile path, the module path, and the
+  module's directory relative to `--dir`. Both of the latter are needed to turn a profile's
+  package-qualified names into `--dir`-relative paths, and neither generalises across modules —
+  wardnet's are `github.com/wardnet/wardnet/source/wctl` under `wctl/` and `wardnet.network/go`
+  under `sdk/wardnet-go/`. `goPatchPercent` merges every module's hits; no per-module prefix scoping
+  is needed (unlike Rust's), because the keys are already `--dir`-relative and cannot collide.
 - **Rust**: `cargo llvm-cov` doesn't emit per-line data in its `--json` export, so patch coverage
   additionally produces an `--lcov` report, per discovered crate/workspace root (see the Coverage
   section above). Under `--tests=run`, this doesn't cost a second test execution: `cargo llvm-cov
