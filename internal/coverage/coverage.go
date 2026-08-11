@@ -9,8 +9,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
+
+	"golang.org/x/tools/cover"
 
 	"wardnet/bulwark/internal/config"
 	"wardnet/bulwark/internal/detect"
@@ -38,22 +39,30 @@ const (
 	ModeSkip Mode = "skip"
 )
 
-// RustReportOverrides maps a discovered Rust crate directory (relative to
-// --dir) to an explicit report path override (also relative to --dir), for
-// use with ModeSkip. The empty-string key ("") is the override applied when
-// Rust discovery (detect.RustCrateDirs) finds exactly one crate — this
-// preserves the single-crate CLI usage of a bare `--rust-report <path>`
-// unchanged even though the flag is now repeatable/keyed for multi-crate
-// repos.
-type RustReportOverrides map[string]string
+// ReportOverrides maps a discovered unit directory — a Rust crate/workspace
+// root, or a Go module root — relative to --dir, to an explicit report path
+// override (also relative to --dir), for use with ModeSkip. The empty-string
+// key ("") is the override applied when discovery finds exactly one such unit
+// — this preserves the single-unit CLI usage of a bare `--rust-report <path>`
+// or `--go-report <path>` unchanged even though those flags are now
+// repeatable/keyed for multi-unit repos.
+type ReportOverrides map[string]string
+
+// RustReportOverrides and GoReportOverrides name ReportOverrides at the call
+// sites carrying one language's overrides, so a signature says which language
+// it is about.
+type (
+	RustReportOverrides = ReportOverrides
+	GoReportOverrides   = ReportOverrides
+)
 
 // ReportPaths overrides the default report-file search candidates per
 // language, for a repo whose coverage output doesn't land at one of the
-// conventional locations findReport/findReportForCrate checks. A zero value
+// conventional locations findReport/findReportForUnit checks. A zero value
 // uses the built-in candidate list for that language. Only meaningful with
 // ModeSkip.
 type ReportPaths struct {
-	Go       string
+	Go       GoReportOverrides
 	Rust     RustReportOverrides
 	RustLCOV RustReportOverrides
 }
@@ -75,10 +84,30 @@ type PatchWanted struct {
 // language", the same soft-omission Compute already applies to aggregate
 // percentages.
 type PatchSources struct {
-	GoProfile  string
-	RustLCOV   map[string]string // Rust crate dir -> its cargo-llvm-cov lcov export
-	TSLCOV     map[string]string // TS package dir -> its coverage/lcov.info
-	ModuleName string            // this module's path, needed to resolve GoProfile's package-qualified file names
+	GoProfiles map[string]GoModuleProfile // Go module dir -> its profile and module path
+	RustLCOV   map[string]string          // Rust crate dir -> its cargo-llvm-cov lcov export
+	TSLCOV     map[string]string          // TS package dir -> its coverage/lcov.info
+}
+
+// GoModuleProfile locates one discovered Go module's coverage profile,
+// together with what turning that profile's package-qualified file names into
+// --dir-relative paths takes: the module path to strip off the front, and the
+// module's own directory to put back on.
+//
+// Both halves are per-module because neither generalises. A repo's modules
+// need share no prefix and a module path need not resemble its directory —
+// wardnet's two are `github.com/wardnet/wardnet/source/wctl` (under
+// `wctl/`) and `wardnet.network/go` (under `sdk/wardnet-go/`) — so one global
+// module path, which is what bulwark used to carry, can only ever resolve one
+// module's entries and silently drops the rest.
+type GoModuleProfile struct {
+	// Profile is the path to the module's `go test -coverprofile` output.
+	Profile string
+	// ModuleName is the module's path, as `go list -m` reports it.
+	ModuleName string
+	// RelDir is the module's directory relative to --dir, "" when the module
+	// root is --dir itself.
+	RelDir string
 }
 
 // Compute returns a coverage percentage per detected ecosystem under dir,
@@ -130,11 +159,10 @@ func Compute(ctx context.Context, dir string, cfg config.Config, mode Mode, repo
 				sources.RustLCOV = lcovPaths
 			}
 		case detect.Go:
-			var profilePath string
-			pct, profilePath, ok = goCoverage(ctx, dir, workDir, mode, reports.Go)
+			var goProfiles map[string]GoModuleProfile
+			pct, goProfiles, ok = goCoverage(ctx, dir, workDir, mode, cfg.Go.Exclude, reports.Go)
 			if ok && want.Go {
-				sources.GoProfile = profilePath
-				sources.ModuleName = moduleName(ctx, dir)
+				sources.GoProfiles = goProfiles
 			}
 		case detect.TypeScript:
 			pct, ok = tsCoverage(ctx, dir, cfg.TypeScript.Exclude, mode, cfg.TypeScript.Install)
@@ -150,17 +178,28 @@ func Compute(ctx context.Context, dir string, cfg config.Config, mode Mode, repo
 	return report, sources, cleanup, nil
 }
 
-// moduleName returns this repo's Go module path (e.g. "wardnet/bulwark"),
-// needed to strip the package-qualified prefix `go tool cover`/x/tools/cover
-// put on each file name in a coverage profile. A lookup failure just means
-// Go patch coverage can't be computed (ModuleName stays empty) — never a
-// fatal error, matching PatchSources' overall soft-omission contract.
-func moduleName(ctx context.Context, dir string) string {
-	r := executil.Run(ctx, dir, "go", "list", "-m")
+// moduleName returns the Go module path rooted at moduleDir (e.g.
+// "wardnet/bulwark"), needed to strip the package-qualified prefix
+// x/tools/cover puts on each file name in a coverage profile. A lookup
+// failure just means this module can't be measured — never a fatal error,
+// matching PatchSources' overall soft-omission contract.
+//
+// moduleDir must be a module root, not a directory that merely contains one:
+// `go list -m` run above a module answers "command-line-arguments", which is
+// not an error and not a prefix any profile entry carries, so a caller that
+// passed the wrong directory gets silent nonsense rather than a failure.
+func moduleName(ctx context.Context, moduleDir string) string {
+	r := executil.Run(ctx, moduleDir, "go", "list", "-m")
 	if !r.Ok() {
 		return ""
 	}
-	return strings.TrimSpace(r.Output)
+	name := strings.TrimSpace(r.Output)
+	// A workspace prints one module per line; a non-module root prints the
+	// placeholder. Neither identifies a single module to strip.
+	if name == "" || name == "command-line-arguments" || strings.Contains(name, "\n") {
+		return ""
+	}
+	return name
 }
 
 // tsLCOVSources looks for an lcov.info Istanbul/Vitest may have already
@@ -203,59 +242,115 @@ func findReport(dir, override string, candidates []string) (string, bool) {
 // produces one.
 var goReportCandidates = []string{"coverage.out", "cover.out", "c.out"}
 
-// goCoverage gets the total percentage from `go tool cover -func`'s summary
-// line, either running `go test -coverprofile` itself into workDir (ModeRun)
-// or parsing an existing profile another step already produced (ModeSkip) —
-// either way the profile is fed through the same `go tool cover -func`
-// formatting step, which does not re-run any tests. The resolved profile
-// path is also returned (workDir under ModeRun persists until the caller's
-// Compute-returned cleanup runs, so patch coverage can reparse it later
-// without a second `go test` invocation).
-func goCoverage(ctx context.Context, dir, workDir string, mode Mode, reportPath string) (float64, string, bool) {
+// goCoverage reads the statement coverage percentage for every independent Go
+// module discovered under dir (see detect.GoModuleDirs), averaging across the
+// modules that produced a result — mirroring how rustCoverage averages across
+// crates and tsCoverage across packages. Returns a map of module dir -> what
+// patch coverage needs to read that module's profile back.
+//
+// Discovering modules rather than treating dir as one is what makes a
+// monorepo work at all: `go test` and `go list -m` are both module-scoped, so
+// running them at a dir that merely *contains* modules measures nothing.
+func goCoverage(ctx context.Context, dir, workDir string, mode Mode, exclude []string, overrides GoReportOverrides) (float64, map[string]GoModuleProfile, bool) {
+	moduleDirs, err := detect.GoModuleDirs(dir, exclude)
+	if err != nil || len(moduleDirs) == 0 {
+		return 0, nil, false
+	}
+	solo := len(moduleDirs) == 1
+
+	var total, count float64
+	profiles := map[string]GoModuleProfile{}
+	for i, moduleDir := range moduleDirs {
+		rel, err := filepath.Rel(dir, moduleDir)
+		if err != nil {
+			continue
+		}
+		if rel == "." {
+			rel = ""
+		}
+		pct, src, ok := goCoverageOne(ctx, dir, moduleDir, rel, workDir, mode, overrides, solo, i)
+		if !ok {
+			continue
+		}
+		total += pct
+		count++
+		profiles[moduleDir] = src
+	}
+	if count == 0 {
+		return 0, nil, false
+	}
+	return total / count, profiles, true
+}
+
+// goCoverageOne measures one module, either running `go test -coverprofile`
+// inside it (ModeRun) or parsing a profile another step already produced
+// (ModeSkip). Every command runs in moduleDir rather than dir, because that
+// is the only place a module-scoped Go command works.
+func goCoverageOne(ctx context.Context, dir, moduleDir, moduleRelDir, workDir string, mode Mode, overrides GoReportOverrides, solo bool, idx int) (float64, GoModuleProfile, bool) {
 	var profile string
 	switch mode {
 	case ModeSkip:
-		found, ok := findReport(dir, reportPath, goReportCandidates)
+		found, ok := findReportForUnit(dir, moduleDir, moduleRelDir, overrides, solo, goReportCandidates)
 		if !ok {
-			return 0, "", false
+			return 0, GoModuleProfile{}, false
 		}
 		profile = found
 	default:
-		profile = filepath.Join(workDir, "cover.out")
-		if r := executil.Run(ctx, dir, "go", "test", "-coverprofile="+profile, "./..."); !r.Ok() {
-			return 0, "", false
+		// Distinct file per module: one shared cover.out would have each
+		// module overwrite the last, leaving only the final module measured.
+		profile = filepath.Join(workDir, fmt.Sprintf("cover-%d.out", idx))
+		if r := executil.Run(ctx, moduleDir, "go", "test", "-coverprofile="+profile, "./..."); !r.Ok() {
+			return 0, GoModuleProfile{}, false
 		}
 	}
 
-	r := executil.Run(ctx, dir, "go", "tool", "cover", "-func="+profile)
-	if !r.Ok() {
-		return 0, "", false
+	name := moduleName(ctx, moduleDir)
+	if name == "" {
+		return 0, GoModuleProfile{}, false
 	}
-	pct, ok := parseGoTotalPercent(r.Output)
-	return pct, profile, ok
+	src := GoModuleProfile{Profile: profile, ModuleName: name, RelDir: moduleRelDir}
+	pct, ok := goProfilePercent(src, dir)
+	if !ok {
+		return 0, GoModuleProfile{}, false
+	}
+	return pct, src, true
 }
 
-// parseGoTotalPercent extracts the percentage from `go tool cover -func`'s
-// final summary line, which has the fixed form:
+// goProfilePercent computes a module's statement coverage straight from its
+// profile: the covered-statements-over-total-statements ratio `go tool cover
+// -func` prints on its `total:` line, minus generated files.
 //
-//	total:						(statements)		87.3%
-func parseGoTotalPercent(output string) (float64, bool) {
-	for _, line := range strings.Split(output, "\n") {
-		if !strings.HasPrefix(strings.TrimSpace(line), "total:") {
+// Parsing rather than shelling out to `go tool cover -func` is what lets this
+// work from anywhere. That command resolves each profile entry's
+// package-qualified name through the module graph, so it only succeeds when
+// run from inside the module the profile came from — from a monorepo root it
+// fails outright ("no required module provides package ...: go.mod file not
+// found"), which is how Go coverage came to be silently absent from the gate
+// in wardnet. The number is the same either way; it is already in the file.
+//
+// It is also the only place a generated file can be dropped from the
+// denominator, which `go tool cover` offers no way to do.
+func goProfilePercent(src GoModuleProfile, dir string) (float64, bool) {
+	profiles, err := cover.ParseProfiles(src.Profile)
+	if err != nil {
+		return 0, false
+	}
+	var covered, total int
+	for _, p := range profiles {
+		if isGeneratedGoFile(filepath.Join(dir, filepath.FromSlash(goRelPath(p.FileName, src)))) {
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			return 0, false
+		for _, b := range p.Blocks {
+			total += b.NumStmt
+			if b.Count > 0 {
+				covered += b.NumStmt
+			}
 		}
-		last := strings.TrimSuffix(fields[len(fields)-1], "%")
-		pct, err := strconv.ParseFloat(last, 64)
-		if err != nil {
-			return 0, false
-		}
-		return pct, true
 	}
-	return 0, false
+	if total == 0 {
+		return 0, false
+	}
+	return float64(covered) / float64(total) * 100, true
 }
 
 // llvmCovExport is the subset of `cargo llvm-cov --json`'s export format
@@ -278,17 +373,17 @@ var rustReportCandidates = []string{"coverage/llvm-cov.json", "llvm-cov.json", "
 // for an existing cargo-llvm-cov lcov export another step already produced.
 var rustLCOVReportCandidates = []string{"coverage/lcov.info", "lcov.info", "target/llvm-cov/lcov.info"}
 
-// findReportForCrate resolves a coverage report path for one discovered Rust
-// crate directory: first any override keyed by crateRelDir (crateDir's path
-// relative to dir), then — only when solo is true, i.e. exactly one crate
-// was discovered — the override keyed by "", then the candidate list
-// resolved relative to crateDir itself (matching where cargo llvm-cov
-// naturally writes output when run in-place inside each crate directory).
-// Override path values are resolved relative to dir, preserving the
-// documented "relative to --dir" contract for the override strings
-// themselves.
-func findReportForCrate(dir, crateDir, crateRelDir string, overrides RustReportOverrides, solo bool, candidates []string) (string, bool) {
-	if override, ok := overrides[crateRelDir]; ok {
+// findReportForUnit resolves a coverage report path for one discovered unit
+// directory — a Rust crate/workspace root, or a Go module root: first any
+// override keyed by unitRelDir (unitDir's path relative to dir), then — only
+// when solo is true, i.e. exactly one such unit was discovered — the override
+// keyed by "", then the candidate list resolved relative to unitDir itself
+// (matching where the language's own tooling writes output when run in-place
+// inside each unit directory). Override path values are resolved relative to
+// dir, preserving the documented "relative to --dir" contract for the
+// override strings themselves.
+func findReportForUnit(dir, unitDir, unitRelDir string, overrides ReportOverrides, solo bool, candidates []string) (string, bool) {
+	if override, ok := overrides[unitRelDir]; ok {
 		p := filepath.Join(dir, override)
 		if _, err := os.Stat(p); err == nil {
 			return p, true
@@ -305,7 +400,7 @@ func findReportForCrate(dir, crateDir, crateRelDir string, overrides RustReportO
 		}
 	}
 	for _, c := range candidates {
-		p := filepath.Join(crateDir, c)
+		p := filepath.Join(unitDir, c)
 		if _, err := os.Stat(p); err == nil {
 			return p, true
 		}
@@ -370,7 +465,7 @@ func rustCoverageOne(ctx context.Context, dir, crateDir, crateRelDir, workDir st
 	var lcovPath string
 	switch mode {
 	case ModeSkip:
-		found, ok := findReportForCrate(dir, crateDir, crateRelDir, reportOverrides, solo, rustReportCandidates)
+		found, ok := findReportForUnit(dir, crateDir, crateRelDir, reportOverrides, solo, rustReportCandidates)
 		if !ok {
 			return 0, "", false
 		}
@@ -380,7 +475,7 @@ func rustCoverageOne(ctx context.Context, dir, crateDir, crateRelDir, workDir st
 		}
 		data = d
 		if wantLCOV {
-			if p, ok := findReportForCrate(dir, crateDir, crateRelDir, lcovReportOverrides, solo, rustLCOVReportCandidates); ok {
+			if p, ok := findReportForUnit(dir, crateDir, crateRelDir, lcovReportOverrides, solo, rustLCOVReportCandidates); ok {
 				lcovPath = p
 			}
 		}

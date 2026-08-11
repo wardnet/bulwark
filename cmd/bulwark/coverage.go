@@ -31,7 +31,7 @@ const priorBaselineDepth = 50
 func newCoverageCmd() *cobra.Command {
 	var dir string
 	var testsMode string
-	var goReport string
+	var goReport []string
 	var rustReport []string
 	var rustLCOVReport []string
 	cmd := &cobra.Command{
@@ -45,9 +45,9 @@ func newCoverageCmd() *cobra.Command {
 				return fmt.Errorf("--tests must be %q or %q, got %q", coverage.ModeRun, coverage.ModeSkip, testsMode)
 			}
 			reports := coverage.ReportPaths{
-				Go:       goReport,
-				Rust:     parseRustReportOverrides(rustReport),
-				RustLCOV: parseRustReportOverrides(rustLCOVReport),
+				Go:       parseReportOverrides(goReport),
+				Rust:     parseReportOverrides(rustReport),
+				RustLCOV: parseReportOverrides(rustLCOVReport),
 			}
 
 			cfg, err := config.Load(dir)
@@ -193,8 +193,12 @@ func newCoverageCmd() *cobra.Command {
 		`whether to execute tests ("run", the default — good for local dev) or only parse an
 existing report a prior CI step already produced ("skip" — use in CI once that step already
 runs with coverage instrumentation on, so tests aren't executed a second/third time)`)
-	cmd.Flags().StringVar(&goReport, "go-report", "",
-		"path (relative to --dir) to an existing go coverage profile; only used with --tests=skip. Default: search coverage.out, cover.out, c.out")
+	cmd.Flags().StringArrayVar(&goReport, "go-report", nil,
+		`path (relative to --dir) to an existing go coverage profile; only used with --tests=skip.
+Repeatable. A bare path applies only when exactly one Go module is discovered under --dir; for
+multiple modules, disambiguate with "<moduleDir>=<path>" (moduleDir relative to --dir), e.g.
+--go-report wctl=coverage/wctl.out. Default per module: search coverage.out, cover.out, c.out
+relative to that module's directory`)
 	cmd.Flags().StringArrayVar(&rustReport, "rust-report", nil,
 		`path (relative to --dir) to an existing cargo-llvm-cov JSON export; only used with --tests=skip.
 Repeatable. A bare path applies only when exactly one Rust crate/workspace is discovered under --dir;
@@ -209,17 +213,18 @@ crate's directory`)
 	return cmd
 }
 
-// parseRustReportOverrides parses repeated --rust-report/--rust-lcov-report
-// flag values into a coverage.RustReportOverrides map. Each value is either a
-// bare path (stored under the "" key, consulted only when Rust discovery
-// finds exactly one crate — preserving the original single-crate CLI usage
-// unchanged) or a "<crateDir>=<path>" pair disambiguating which discovered
-// crate directory (relative to --dir) the override applies to.
-func parseRustReportOverrides(values []string) coverage.RustReportOverrides {
+// parseReportOverrides parses repeated --go-report/--rust-report/
+// --rust-lcov-report flag values into a coverage.ReportOverrides map. Each
+// value is either a bare path (stored under the "" key, consulted only when
+// discovery finds exactly one crate/module — preserving the original
+// single-unit CLI usage unchanged) or a "<unitDir>=<path>" pair
+// disambiguating which discovered directory (relative to --dir) the override
+// applies to.
+func parseReportOverrides(values []string) coverage.ReportOverrides {
 	if len(values) == 0 {
 		return nil
 	}
-	overrides := make(coverage.RustReportOverrides, len(values))
+	overrides := make(coverage.ReportOverrides, len(values))
 	for _, v := range values {
 		if key, path, ok := strings.Cut(v, "="); ok {
 			overrides[key] = path
@@ -402,16 +407,11 @@ func patchReport(cmd *cobra.Command, ctx context.Context, dir string, want cover
 		resolved := true
 		switch lang.name {
 		case "go":
-			if sources.GoProfile == "" || sources.ModuleName == "" {
+			if len(sources.GoProfiles) == 0 {
 				resolved = false
 				break
 			}
-			hits, err := coverage.ParseGoProfile(sources.GoProfile, sources.ModuleName, dir)
-			if err != nil {
-				resolved = false
-				break
-			}
-			hit, total = coverage.PatchPercent(langChanged, hits)
+			hit, total = goPatchPercent(dir, sources.GoProfiles, langChanged)
 		case "rust":
 			if len(sources.RustLCOV) == 0 {
 				resolved = false
@@ -576,6 +576,31 @@ func tsPatchPercent(dir string, tsLCOV map[string]string, changed map[string][]i
 		total += t
 	}
 	return hit, total
+}
+
+// goPatchPercent merges every discovered Go module's per-line hits into one
+// set and scores the changed lines against it. A module whose profile can't
+// be parsed is skipped rather than failing the gate, matching how the Rust
+// path treats an unreadable lcov — the remaining modules still get measured.
+//
+// The per-crate prefix scoping rustPatchPercent needs doesn't apply here:
+// ParseGoProfile already returns --dir-relative paths (it puts each module's
+// own directory back on), so two modules cannot collide on one key.
+func goPatchPercent(dir string, goProfiles map[string]coverage.GoModuleProfile, changed map[string][]int) (hit, total int) {
+	merged := coverage.LineHits{}
+	for _, src := range goProfiles {
+		hits, err := coverage.ParseGoProfile(src, dir)
+		if err != nil {
+			continue
+		}
+		for file, lines := range hits {
+			merged[file] = lines
+		}
+	}
+	if len(merged) == 0 {
+		return 0, 0
+	}
+	return coverage.PatchPercent(changed, merged)
 }
 
 // rustPatchPercent sums patch coverage across every discovered Rust crate

@@ -588,7 +588,7 @@ func TestParseRustReportOverrides(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := parseRustReportOverrides(tc.values)
+			got := parseReportOverrides(tc.values)
 			if len(got) != len(tc.want) {
 				t.Fatalf("got %v, want %v", got, tc.want)
 			}
