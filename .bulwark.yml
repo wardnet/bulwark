@@ -17,3 +17,14 @@ typescript:
   exclude: ["eslint-pin", "biome-pin", "cargo-audit-pin", "cargo-deny-pin", "go-pin"]
 go:
   exclude: ["eslint-pin", "biome-pin", "cargo-audit-pin", "cargo-deny-pin", "go-pin"]
+
+# Who produces the coverage this repo is gated on.
+#
+# `report`, because ci-test runs the suite with -coverprofile and uploads it as
+# the `gt-coverage` artifact, which the bulwark stage places before bulwark
+# runs. The default is `run`, which would execute the suite a second time.
+#
+# This must not be set to `report` before something actually writes a report:
+# bulwark exits rather than shrugging when told to read one that is not there.
+coverage:
+  source: report
