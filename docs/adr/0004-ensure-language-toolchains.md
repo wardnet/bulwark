@@ -74,14 +74,37 @@ Only one of the three involves bulwark downloading anything.
   equivalent of GOTOOLCHAIN or rustup: nvm, fnm and volta are all optional and
   mutually exclusive.
 
-Setting `GOTOOLCHAIN` has a second effect worth naming. Its default (`auto`)
-consults `go.mod` only when the go command runs *inside* that module, and
-`internal/golang` runs `go install <tool>@<version>` outside any module — so
-gosec and govulncheck were built with whatever Go the runner shipped, and a
+Setting `GOTOOLCHAIN` has a second effect worth naming, and it applies even
+when bulwark installs nothing. Its default (`auto`) does not only *upgrade*:
+`go install <tool>@<version>` run outside a module makes the go command
+consult that **tool's** own `go.mod` and switch to whatever minimum it
+declares. `golang.org/x/vuln@v1.6.0` declares `go >= 1.25.0`, so an `auto`
+runner with Go 1.26 installed builds govulncheck with go1.25 — and a
 govulncheck built by an older Go rejects newer source outright. That is the
 failure AGENTS.md records against wardnet's CI, worked around there by pinning
-`go-version` in every workflow. Consumers no longer need that pin on bulwark's
-account.
+`go-version` in every workflow, and it reproduces on a runner whose ambient
+toolchain is entirely correct.
+
+So Go is pinned in every case, not only when provisioning:
+
+- ambient satisfies the declaration → `GOTOOLCHAIN=local`. Not the declared
+  version: a declaration is a *minimum*, so `go 1.26` resolves to `go1.26.0`
+  and pinning it would downgrade a runner already on 1.26.6 — backwards, when
+  the newer patch carries the security fix.
+- ambient is too old but is Go 1.21+ → `GOTOOLCHAIN=go<declared>`, and the go
+  command fetches it.
+- no usable Go → the tarball is downloaded onto PATH and `GOTOOLCHAIN=local`
+  selects it.
+
+The ambient probe runs `go version` with `GOTOOLCHAIN=local` for the same
+reason: inside a module, `go version` honours that module's `toolchain`
+directive and reports the version it would switch *to*, which is not the one
+`local` would subsequently select. Measuring and pinning have to come from the
+same place, or bulwark concludes "ambient already satisfies" and then lands on
+an older toolchain than the one it just measured. Verified against a real
+machine whose `go` reported 1.26.6 in-module but was 1.24.7 locally.
+
+Consumers no longer need to pin `go-version` on bulwark's account.
 
 ## Failures warn rather than fail the scan
 

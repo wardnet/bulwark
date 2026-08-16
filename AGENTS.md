@@ -64,7 +64,7 @@ every other command). `bulwark coverage` has been verified end-to-end against th
 only job that exercises the actual scan/report path end-to-end against a real repo, and it already
 caught a real bug once (see the git history around the `go-version: "1.26.5"` pin below).
 
-**Pin the exact Go patch version in workflows (`"1.26.5"`), never a bare minor (`"1.26"`).**
+**Pin the exact Go patch version in workflows (currently `"1.26.6"`), never a bare minor (`"1.26"`).**
 `actions/setup-go`'s `go-version: "1.26"` resolves to whatever `1.26.x` patch it has
 cached/available, which is not necessarily the version this repo's `go.mod` `toolchain` directive
 pins — and critically, `go install`-ing an *external* tool (gosec, govulncheck) does **not** consult
@@ -195,12 +195,24 @@ Each ecosystem provisions differently, and only one of the three downloads anyth
   module proxy and verified against Go's checksum database — better provenance than bulwark could
   hand-roll — so bulwark just names the version. Only with no Go at all, or one older than 1.21,
   does it download a tarball from `go.dev`, taking the SHA-256 from the release index.
-  This also fixes the `go install` gap recorded under CI above: `GOTOOLCHAIN`'s default (`auto`)
-  consults `go.mod` only when the go command runs *inside* that module, and `internal/golang` runs
-  `go install <tool>@<version>` outside any module — so gosec and govulncheck were built with
-  whatever Go the runner shipped, and a govulncheck built by an older Go rejects newer source
-  outright. Setting `GOTOOLCHAIN` explicitly fixes that at the source rather than in each
-  consumer's workflow YAML.
+  **Go is pinned even when the ambient toolchain already satisfies the declaration** — the one
+  ecosystem where "satisfied" is not the same as "nothing to do". `GOTOOLCHAIN`'s default (`auto`)
+  does not only *upgrade*: `go install <tool>@<version>` run outside a module, which
+  `internal/golang` does to fetch gosec and govulncheck, makes the go command consult that
+  **tool's** own `go.mod` and switch to whatever minimum it declares. `golang.org/x/vuln@v1.6.0`
+  declares `go >= 1.25.0`, so an `auto` runner with Go 1.26 installed builds govulncheck with
+  go1.25 — and a govulncheck built by an older Go rejects newer source outright. That is the exact
+  failure recorded under CI above, and it reproduces on a runner whose ambient toolchain is
+  perfectly correct. `pinAmbientGo` therefore sets `GOTOOLCHAIN=local` in that case.
+  `local`, not the declared version: the declaration is a *minimum*, so a `go 1.26` directive
+  resolves to `go1.26.0` and pinning it would downgrade a runner already on 1.26.6 — backwards,
+  when the newer patch is the one carrying the security fix. bulwark's own `ci.yml` sets
+  `GOTOOLCHAIN: local` by hand for exactly this reason; consumers now get it automatically.
+  The probe reads the ambient version with `GOTOOLCHAIN=local` set for the same reason: `go
+  version` inside a module honours that module's `toolchain` directive and reports the version it
+  would switch *to*, which is not the one `local` would then select — measure and pin have to come
+  from the same place, or bulwark concludes "ambient is fine" and lands on an older toolchain than
+  it just measured.
 - **Rust** delegates to rustup, which already reads the same `rust-toolchain.toml` bulwark does.
   This extends rather than contradicts `internal/rust`'s existing stance that the toolchain version
   "is the target repo's responsibility via its own rust-toolchain.toml". What it adds is

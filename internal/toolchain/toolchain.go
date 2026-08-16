@@ -150,6 +150,19 @@ func Ensure(ctx context.Context, root string, ecosystems []detect.Ecosystem, ov 
 				req.Ecosystem, p.bin, display(ambient), declaredBy(req)); err != nil {
 				return nil, err
 			}
+			// Satisfied is not the same as nothing to do. Go still needs its
+			// toolchain pinned so that installing an external tool cannot
+			// silently switch away from the version just verified — see
+			// pinAmbientGo. This costs no download and is why the branch
+			// doesn't simply `continue`.
+			if req.Ecosystem == detect.Go {
+				if st := pinAmbientGo(req); st != nil {
+					env.Vars = append(env.Vars, st.vars...)
+					if err := logf(w, "%s\n", st.note); err != nil {
+						return nil, err
+					}
+				}
+			}
 			continue
 		}
 		if ov.Disabled {

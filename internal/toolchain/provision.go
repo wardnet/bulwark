@@ -64,12 +64,49 @@ func provisionGo(ctx context.Context, req Requirement, ambient string, present b
 	}
 	return &step{
 		pathDirs: []string{filepath.Join(dir, "bin")},
-		// The downloaded toolchain is exactly what was asked for, so pin
-		// GOTOOLCHAIN to it rather than leaving `auto` free to fetch a third
-		// one on first use.
-		vars: []string{"GOTOOLCHAIN=" + want},
+		// The downloaded toolchain is exactly what was asked for and is now
+		// first on PATH, so "local" both selects it and stops the go command
+		// switching away from it. See pinAmbientGo for why not switching
+		// matters as much as switching to the right one.
+		vars: []string{"GOTOOLCHAIN=local"},
 		note: fmt.Sprintf("go: installed %s (declared in %s; %s)", want, req.Source, absentOrOld(ambient, present)),
 	}, nil
+}
+
+// pinAmbientGo pins GOTOOLCHAIN when the ambient Go already satisfies the
+// declared version — the case where bulwark installs nothing at all.
+//
+// Doing nothing here would leave the headline bug this package claims to fix
+// still present in its most common path. GOTOOLCHAIN defaults to `auto`, and
+// `auto` does not only *upgrade*: running `go install <tool>@<version>`
+// outside a module, which internal/golang does to fetch gosec and
+// govulncheck, makes the go command consult that TOOL's own go.mod and
+// silently switch to whatever minimum it declares. golang.org/x/vuln@v1.6.0
+// declares `go >= 1.25.0`, so an `auto` runner with Go 1.26 installed builds
+// govulncheck with go1.25 — and a govulncheck built by an older Go rejects
+// newer source outright. That is the exact failure AGENTS.md records against
+// wardnet's CI, and it reproduces on a runner whose ambient toolchain is
+// perfectly correct.
+//
+// "local" is the right pin, not the declared version. The declared version is
+// a *minimum*: a `go 1.26` directive resolves to go1.26.0, and pinning that
+// on a runner with 1.26.6 would downgrade a toolchain that was already fine —
+// which, when the newer patch is the one carrying a security fix, is exactly
+// backwards. "local" says "use the toolchain we just verified satisfies the
+// declaration, and never switch away from it".
+//
+// Only Go needs this. cargo and node have no equivalent of a tool's own
+// manifest silently re-selecting the runtime mid-invocation.
+func pinAmbientGo(req Requirement) *step {
+	if req.Unpinned() {
+		// Nothing was declared, so nothing was verified, so there is no
+		// ground for overriding whatever the environment already chose.
+		return nil
+	}
+	return &step{
+		vars: []string{"GOTOOLCHAIN=local"},
+		note: "go: pinned GOTOOLCHAIN=local so installing an external tool cannot silently downgrade the toolchain",
+	}
 }
 
 // toolchainName renders a canonical version as a Go toolchain name.

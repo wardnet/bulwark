@@ -47,10 +47,10 @@ func TestSatisfied(t *testing.T) {
 	}
 }
 
-// With every ecosystem's toolchain already good enough, Ensure must be a
-// no-op: nothing added to PATH, no variables set, and — critically — no
-// network access, which is what makes this test safe to run offline at all.
-func TestEnsureIsANoOpWhenAmbientSatisfies(t *testing.T) {
+// With the ambient toolchain already good enough, Ensure must install
+// nothing: no PATH entry, and — critically — no network access, which is what
+// makes this test safe to run offline at all.
+func TestEnsureInstallsNothingWhenAmbientSatisfies(t *testing.T) {
 	dir := t.TempDir()
 	// A go.mod pinning something ancient, so whatever Go is running these
 	// tests necessarily satisfies it.
@@ -61,11 +61,52 @@ func TestEnsureIsANoOpWhenAmbientSatisfies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
-	if len(env.PathDirs) != 0 || len(env.Vars) != 0 {
-		t.Fatalf("expected an empty env for an already-satisfied toolchain, got %+v", env)
+	if len(env.PathDirs) != 0 {
+		t.Fatalf("a satisfied toolchain must add nothing to PATH, got %+v", env.PathDirs)
 	}
 	if !strings.Contains(log.String(), "using ambient go") {
 		t.Errorf("Ensure should say it reused the ambient toolchain; log was %q", log.String())
+	}
+}
+
+// Satisfied is not the same as nothing to do, and this is the case that bit
+// for real. GOTOOLCHAIN=auto does not only upgrade: `go install <tool>@<ver>`
+// outside a module consults that TOOL's go.mod and switches to the minimum it
+// declares, so golang.org/x/vuln (go >= 1.25.0) builds govulncheck with go1.25
+// on a runner whose Go is 1.26 — and a govulncheck built by an older Go
+// rejects newer source outright. Verified against the real thing: an
+// unpinned `go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...` in this
+// repo downgrades to go1.25.13 and fails to load the packages, while the same
+// command with GOTOOLCHAIN set completes cleanly.
+func TestEnsurePinsGoToolchainEvenWhenAmbientSatisfies(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "go.mod", "module x\n\ngo 1.16\n")
+
+	env, err := Ensure(context.Background(), dir, []detect.Ecosystem{detect.Go}, Overrides{}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	// "local", not the declared version: the declaration is a minimum, so
+	// pinning it would downgrade a newer ambient toolchain — precisely
+	// backwards when the newer patch is the one carrying a security fix.
+	want := "GOTOOLCHAIN=local"
+	if len(env.Vars) != 1 || env.Vars[0] != want {
+		t.Fatalf("Vars = %+v, want exactly [%s]", env.Vars, want)
+	}
+}
+
+// With nothing declared, nothing was verified, so there is no ground for
+// overriding whatever the environment already chose.
+func TestEnsureDoesNotPinGoWhenNothingIsDeclared(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "go.mod", "module x\n")
+
+	env, err := Ensure(context.Background(), dir, []detect.Ecosystem{detect.Go}, Overrides{}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if len(env.Vars) != 0 {
+		t.Fatalf("Vars = %+v, want none when the repo declares no Go version", env.Vars)
 	}
 }
 

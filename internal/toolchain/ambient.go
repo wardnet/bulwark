@@ -2,6 +2,7 @@ package toolchain
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -17,6 +18,8 @@ type probe struct {
 	bin string
 	// versionArgs asks that command to identify itself.
 	versionArgs []string
+	// env is added to the probe's environment. Only Go needs it; see below.
+	env []string
 	// parse extracts a canonical version from the command's output.
 	parse func(output string) string
 }
@@ -25,6 +28,17 @@ var probes = map[detect.Ecosystem]probe{
 	detect.Go: {
 		bin:         "go",
 		versionArgs: []string{"version"},
+		// GOTOOLCHAIN=local is load-bearing, not tidiness. `go version` run
+		// inside a module honours that module's `toolchain` directive and
+		// reports the version it would switch *to*, downloading it if
+		// necessary. Probing that way measures a toolchain that is not the
+		// one `GOTOOLCHAIN=local` would subsequently select, so bulwark would
+		// conclude "ambient already satisfies the declaration", pin `local`,
+		// and land on an older toolchain than the one it just measured — the
+		// two answers have to come from the same place. Probing with `local`
+		// reports the genuinely installed toolchain, which is exactly what
+		// the pin will use.
+		env: []string{"GOTOOLCHAIN=local"},
 		// "go version go1.26.5 linux/amd64"
 		parse: func(out string) string { return fieldAfter(out, "version") },
 	},
@@ -59,7 +73,11 @@ func installed(ctx context.Context, p probe) (version string, present bool) {
 	// Deliberately not executil.Run: that streams the child's output to the
 	// terminal, and `go version` chatter ahead of every scan is noise. This
 	// is a probe, not a check whose output the user wants.
-	out, err := exec.CommandContext(ctx, p.bin, p.versionArgs...).Output() // #nosec G204 -- p.bin/versionArgs come from this file's own static probes table, not user input
+	cmd := exec.CommandContext(ctx, p.bin, p.versionArgs...) // #nosec G204 -- nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command -- p.bin/versionArgs come from this file's own static probes table, not user input
+	if len(p.env) > 0 {
+		cmd.Env = append(os.Environ(), p.env...)
+	}
+	out, err := cmd.Output()
 	if err != nil {
 		return "", true
 	}
