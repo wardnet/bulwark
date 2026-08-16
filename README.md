@@ -145,10 +145,10 @@ action, so it's stated once in the repo rather than restated at each call site. 
 thing that can't move there, since the file lives *at* the scan root and bulwark has to be told the
 root before it can read its own config.
 
-(No release has been cut yet, so `@v1` doesn't resolve to anything until the first `v1.x.y` tag is
-pushed and the floating `v1` alias is moved to it — see the `bump-version` skill for that process.
-The action also can't be exercised end-to-end in bulwark's own CI until then, since its first step
-downloads whatever's the *latest released* binary.)
+`@v1` is a floating major alias, moved onto each new `v1.x.y` release rather than pinned — so
+consumers pick up scanner fixes without a bump PR every time. Pin an exact `@v1.x.y` instead if you
+need a release to stay put. See the `bump-version` skill for how a release is cut and the alias
+moved.
 
 ## Contributing
 
