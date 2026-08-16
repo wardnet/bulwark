@@ -57,6 +57,25 @@ func newCoverageCmd() *cobra.Command {
 				TypeScript: cfg.Coverage.Patch.TypeScript.Enabled,
 			}
 
+			// Detection runs before Compute, not after, because the toolchain
+			// each ecosystem needs has to be in place before Compute shells
+			// out to `go test` / `cargo llvm-cov` / a package's
+			// test:coverage. Compute detects again internally; the walk is
+			// cheap and idempotent, and duplicating it is the smaller cost
+			// against threading a pre-detected list through its signature.
+			//
+			// This also covers the SourceReport path, which executes no tests
+			// but still needs `go list -m` to resolve a profile's module
+			// paths.
+			detected, err := detect.Ecosystems(dir, cfg.AllExcludes())
+			if err != nil {
+				return err
+			}
+			ecosystems := enabledEcosystems(detected, cfg)
+			if err := ensureToolchains(ctx, cmd, dir, cfg, ecosystems); err != nil {
+				return err
+			}
+
 			current, sources, cleanup, err := coverage.Compute(ctx, dir, cfg, source, reports, patchWanted)
 			defer cleanup()
 			if err != nil {
@@ -64,11 +83,6 @@ func newCoverageCmd() *cobra.Command {
 			}
 			// A partially-measured current tree is just as invisible as an
 			// unmeasured one: the language simply doesn't appear in the report.
-			detected, err := detect.Ecosystems(dir, cfg.AllExcludes())
-			if err != nil {
-				return err
-			}
-			ecosystems := enabledEcosystems(detected, cfg)
 			if err := warnUnmeasured(cmd, ecosystems, current, "the current tree"); err != nil {
 				return err
 			}

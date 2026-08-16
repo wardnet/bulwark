@@ -24,6 +24,7 @@ go run github.com/goreleaser/goreleaser/v2@latest release --snapshot --clean
 cmd/bulwark/                    # the bulwark CLI (scan, coverage, version, update)
 internal/detect/                # ecosystem + TS-package detection (walks for Cargo.toml/package.json/go.mod)
 internal/config/                # .bulwark.yml loading (opt-outs + pipeline shape — see Configuration below)
+internal/toolchain/             # ensures the Go/Rust/Node runtime each detected ecosystem needs (see Toolchains below)
 internal/rust/                  # clippy, cargo-audit, cargo-deny
 internal/typescript/            # self-contained pinned ESLint + eslint-plugin-security
 internal/golang/                # gosec, govulncheck (installed into a version-keyed GOBIN dir)
@@ -73,6 +74,13 @@ failed in CI (setup-go had installed an older, vulnerable patch) until `go-versi
 exact `1.26.5`. If `go.mod`'s `toolchain` line is ever bumped, update every `go-version:` in
 `ci.yml`/`release.yml` to match in the same change.
 
+`internal/toolchain` (see Toolchains below) now also sets `GOTOOLCHAIN` from the scanned repo's own
+`go.mod` before running any Go tooling, which fixes this class of drift for **consumers** — they no
+longer need to pin `go-version` on bulwark's account. Keep the pins here regardless: this repo's
+`lint` and `build & test` jobs invoke `go` directly rather than through bulwark, so nothing in that
+mechanism covers them, and `self-scan` benefits from the pin holding independently of the feature
+it is dogfooding.
+
 ## Configuration
 
 `.bulwark.yml` at the scan root is optional and carries all the config. It does two things, and
@@ -103,6 +111,11 @@ go:
 semgrep:
   enabled: true
   config: auto           # override to a custom registry ref/path if needed
+toolchain:
+  enabled: true          # set false to keep the diagnostics but never download/install
+                          # (air-gapped runners, or images that preprovision everything)
+  # go/rust/node: deliberately unset. The versions come from the repo's own
+  # manifests — see Toolchains below. These keys exist only as a local override.
 coverage:
   source: run            # who produces the coverage data. "run" (default) has bulwark execute each
                           # ecosystem's test suite itself; "report" has it never execute anything and
@@ -138,6 +151,90 @@ coverage:
 
 Omitting the file, or omitting a section/key within it, keeps that value at its default — see
 `internal/config/config_test.go` for the exact merge semantics.
+
+## Toolchains
+
+bulwark provisions every tool it *runs* — gosec/govulncheck via `go install` into a version-keyed
+cache, cargo-audit/cargo-deny via `cargo install`, ESLint via npm, Semgrep via pipx — under the
+"pin the exact toolchain, don't reuse ambient installs" principle in `internal/golang`. The one
+thing it long did *not* provision was the language toolchain it does that provisioning **with**:
+`go`, `cargo` and `node` were simply assumed to be on PATH. `internal/toolchain` closes that.
+
+Nothing was visibly broken before, and that matters for judging changes here: on a GitHub-hosted
+runner Go is preinstalled and Go 1.21+ fetches whatever `go.mod` asks for, so the assumption held.
+It was a robustness and determinism gap, not an outage — a self-hosted or container runner without
+Go fails at `go install`, the version used is whatever the image ships rather than what the repo
+declares, and with no shared module cache every run re-downloads.
+
+**Versions come from the repo's own manifests, never from `.bulwark.yml`.**
+
+| Ecosystem | Version source |
+|---|---|
+| Go | the `go` and `toolchain` directives in **every** discovered `go.mod`, highest wins |
+| Rust | `channel` in `rust-toolchain.toml`, else the legacy bare `rust-toolchain`, per discovered crate |
+| TypeScript | `engines.node` in each detected package's `package.json`, else `.nvmrc` (package, then scan root) |
+
+Those files are already authoritative and already enforced by the language's own tooling, so a
+second copy in bulwark's config could only agree redundantly or drift silently — and a stale
+duplicate is worse than none, because it reads as authoritative. `toolchain.{go,rust,node}` in
+`.bulwark.yml` exist purely as a deliberate local **override**, which is a different thing from a
+parallel source of truth. `toolchain.enabled: false` keeps the diagnostics and skips the
+downloads.
+
+**An ambient toolchain that already satisfies the declared version is used as-is.** Downloading
+something already present and correct is pure cost, and on the runners bulwark actually runs on
+that is the common case — so the common path does no network I/O at all. `internal/toolchain`'s
+`satisfied` is the single predicate for that decision; an unpinned requirement (a `stable` rust
+channel, an `lts/*` .nvmrc, no declaration at all) is satisfied by anything present, since the repo
+named no floor to be below. A toolchain that won't identify itself is treated as too old, because
+it cannot be *shown* to satisfy a pin.
+
+Each ecosystem provisions differently, and only one of the three downloads anything:
+
+- **Go** delegates to `GOTOOLCHAIN`. Any Go 1.21+ can fetch another toolchain itself, through the
+  module proxy and verified against Go's checksum database — better provenance than bulwark could
+  hand-roll — so bulwark just names the version. Only with no Go at all, or one older than 1.21,
+  does it download a tarball from `go.dev`, taking the SHA-256 from the release index.
+  This also fixes the `go install` gap recorded under CI above: `GOTOOLCHAIN`'s default (`auto`)
+  consults `go.mod` only when the go command runs *inside* that module, and `internal/golang` runs
+  `go install <tool>@<version>` outside any module — so gosec and govulncheck were built with
+  whatever Go the runner shipped, and a govulncheck built by an older Go rejects newer source
+  outright. Setting `GOTOOLCHAIN` explicitly fixes that at the source rather than in each
+  consumer's workflow YAML.
+- **Rust** delegates to rustup, which already reads the same `rust-toolchain.toml` bulwark does.
+  This extends rather than contradicts `internal/rust`'s existing stance that the toolchain version
+  "is the target repo's responsibility via its own rust-toolchain.toml". What it adds is
+  materialising the channel up front with the `clippy` and `rustfmt` components the checks need —
+  rustup would otherwise install it lazily in the middle of `cargo clippy`, where a missing
+  component reads as a check failure rather than a setup step. With no rustup at all, bulwark says
+  so and continues rather than installing rustup behind the user's back.
+- **Node** is the only one bulwark downloads and unpacks itself, from `nodejs.org`, with the digest
+  read from that release's `SHASUMS256.txt`. There is no assumable equivalent of GOTOOLCHAIN or
+  rustup — nvm/fnm/volta are all optional and mutually exclusive. The `.tar.gz` is taken over the
+  `.tar.xz` purely because Go's standard library decompresses gzip and not xz.
+
+**Provisioning failures warn; they do not fail the scan.** This step is preparation, not a gate,
+and falling through to "whatever is on PATH" is exactly today's behavior — turning a working scan
+into a hard failure over a network blip would be a regression, and if the toolchain really is
+absent the next step fails loudly and specifically. What must not happen is failing *silently*, so
+every reuse, substitution, skip and failure is named on stderr. Stderr, not stdout, deliberately:
+`action.yml`'s PR-comment builder scrapes bracketed tags from coverage stdout with a pattern that
+is **not** line-anchored, so unrelated chatter on stdout would end up in the PR comment.
+
+**Doing this in bulwark rather than in each caller's CI is the point.** gt briefly grew a
+`setup-go` step in its bulwark stage (`19e4b77`, reverted in `a0ed107`) and it was wrong twice
+over: it looked for `go.mod` at exactly one path, so wardnet — whose modules live under `wctl/` and
+`sdk/wardnet-go/`, not the scan root — would silently have got nothing, and it put knowledge of Go
+toolchains into gt, which would then have needed the same for Rust and TypeScript forever. bulwark
+already knows which ecosystems it detected and where, so it reads every manifest under the scan
+root; and it is the only place that helps wardnet at all, since wardnet calls `wardnet/bulwark@v1`
+directly rather than through gt. See [ADR 0004](docs/adr/0004-ensure-language-toolchains.md).
+
+Downloads land in the same version-keyed `~/.cache/bulwark` layout every other bulwark-managed
+install already uses, so a consumer caching that one path (as wardnet's workflow already does)
+covers language toolchains too with no key change. Installs stage into a sibling temp directory and
+are renamed into place, so an interrupted download can never leave a half-populated toolchain that
+the next run mistakes for a complete one.
 
 ## Coverage
 

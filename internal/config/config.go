@@ -212,6 +212,32 @@ type Coverage struct {
 	Tolerance float64 `yaml:"tolerance"`
 }
 
+// Toolchain is the override surface for language-toolchain provisioning —
+// making sure the Go, Rust and Node runtimes bulwark's checks need are
+// present at the version the repo requires.
+//
+// It carries no version by default, and that is the design rather than an
+// omission. The versions come from the files that already state them and that
+// the language's own tooling already enforces: the `go` and `toolchain`
+// directives in every discovered go.mod, the channel in rust-toolchain.toml,
+// engines.node or .nvmrc. Restating one here could only agree redundantly or
+// drift silently, and a stale duplicate is worse than no duplicate because it
+// reads as authoritative. The fields below exist for the case where a repo
+// needs a deliberate local exception to what its manifests say — an override,
+// not a source of truth.
+type Toolchain struct {
+	// Enabled turns provisioning off while keeping the diagnostics. Set false
+	// on an air-gapped runner, or one where every toolchain is already
+	// provisioned by the image: bulwark still reports what each ecosystem
+	// declares and whether PATH satisfies it, but never downloads or installs.
+	Enabled bool `yaml:"enabled"`
+	// Go, Rust and Node override the version read from the manifests. Unset
+	// (the intended state) means "use what the repo declares".
+	Go   string `yaml:"go,omitempty"`
+	Rust string `yaml:"rust,omitempty"`
+	Node string `yaml:"node,omitempty"`
+}
+
 // Config is bulwark's full, resolved configuration for one scan.
 type Config struct {
 	Rust       Language           `yaml:"rust"`
@@ -219,17 +245,21 @@ type Config struct {
 	Go         Language           `yaml:"go"`
 	Semgrep    Semgrep            `yaml:"semgrep"`
 	Coverage   Coverage           `yaml:"coverage"`
+	Toolchain  Toolchain          `yaml:"toolchain"`
 }
 
 // Default returns bulwark's zero-config behavior: every language and Semgrep
 // enabled, no excludes, Semgrep's ruleset set to "auto", bulwark producing
-// coverage itself, every language's patch-coverage gate enabled.
+// coverage itself, every language's patch-coverage gate enabled, and
+// toolchain provisioning on with every version taken from the repo's own
+// manifests.
 func Default() Config {
 	return Config{
 		Rust:       Language{Enabled: true},
 		TypeScript: TypeScriptLanguage{Language: Language{Enabled: true}},
 		Go:         Language{Enabled: true},
 		Semgrep:    Semgrep{Enabled: true, Config: "auto"},
+		Toolchain:  Toolchain{Enabled: true},
 		Coverage: Coverage{
 			Source:    SourceRun,
 			Tolerance: 0.1,

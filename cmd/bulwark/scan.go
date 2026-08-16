@@ -39,6 +39,14 @@ func newScanCmd() *cobra.Command {
 				return err
 			}
 
+			// Before anything shells out to cargo/go/npx: make sure each
+			// enabled ecosystem's language toolchain is present at the
+			// version the repo declares. bulwark pins every tool it runs but
+			// used to assume the toolchain it runs them with.
+			if err := ensureToolchains(ctx, cmd, dir, cfg, enabledEcosystems(ecosystems, cfg)); err != nil {
+				return err
+			}
+
 			var results []executil.Result
 			for _, e := range ecosystems {
 				switch e {

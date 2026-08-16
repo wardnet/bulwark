@@ -305,6 +305,41 @@ func TestLoadCoverageReportRejectsWrongShape(t *testing.T) {
 	}
 }
 
+// The toolchain section carries an on/off switch and overrides, and
+// deliberately no default versions: the repo's own manifests (go.mod,
+// rust-toolchain.toml, engines.node/.nvmrc) are the source of truth, and a
+// version defaulted here would be a second one that could drift.
+func TestLoadToolchainDefaults(t *testing.T) {
+	d := Default()
+	if !d.Toolchain.Enabled {
+		t.Error("toolchain provisioning should default to enabled")
+	}
+	if d.Toolchain.Go != "" || d.Toolchain.Rust != "" || d.Toolchain.Node != "" {
+		t.Errorf("no toolchain version may be defaulted; the manifests state them: %+v", d.Toolchain)
+	}
+}
+
+func TestLoadToolchainOverride(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "toolchain:\n  enabled: false\n  go: \"1.27.0\"\n")
+
+	got, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Toolchain.Enabled {
+		t.Error("toolchain.enabled: false did not disable provisioning")
+	}
+	if got.Toolchain.Go != "1.27.0" {
+		t.Errorf("Toolchain.Go = %q, want the override 1.27.0", got.Toolchain.Go)
+	}
+	// The section is new and sits alongside the rest; naming it must not
+	// zero its neighbours.
+	if !got.Rust.Enabled || got.Coverage.Tolerance != 0.1 || got.Coverage.Source != SourceRun {
+		t.Errorf("the toolchain section disturbed other defaults: %+v", got)
+	}
+}
+
 func TestLoadInvalidYAML(t *testing.T) {
 	dir := t.TempDir()
 	write(t, dir, "rust: [this is not a mapping\n")
