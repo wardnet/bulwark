@@ -208,6 +208,15 @@ Each ecosystem provisions differently, and only one of the three downloads anyth
   rustup would otherwise install it lazily in the middle of `cargo clippy`, where a missing
   component reads as a check failure rather than a setup step. With no rustup at all, bulwark says
   so and continues rather than installing rustup behind the user's back.
+  Installing is not selecting, and the two come apart in exactly one case. rustup picks a toolchain
+  by reading `rust-toolchain.toml` from the directory cargo runs in, which covers the normal case
+  for free — `internal/rust` and `internal/coverage` both run cargo inside the crate directory, so
+  the file bulwark read is the file rustup reads. A version supplied by `toolchain.rust` in
+  `.bulwark.yml` has no such file, so rustup cannot see it and would install the requested channel
+  and then go on running the old default. `Requirement.Overridden` marks that case and
+  `provisionRust` sets `RUSTUP_TOOLCHAIN` **only** then: applying it whenever a channel came from a
+  manifest would override rustup's own per-crate selection — the thing `internal/rust` says not to
+  second-guess — and would break a monorepo whose crates pin different channels.
 - **Node** is the only one bulwark downloads and unpacks itself, from `nodejs.org`, with the digest
   read from that release's `SHASUMS256.txt`. There is no assumable equivalent of GOTOOLCHAIN or
   rustup — nvm/fnm/volta are all optional and mutually exclusive. The `.tar.gz` is taken over the

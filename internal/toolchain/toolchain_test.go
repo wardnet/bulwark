@@ -195,6 +195,97 @@ func TestSafeJoinIsNotFooledByAPrefixSibling(t *testing.T) {
 	}
 }
 
+// A symlink whose target is an ABSOLUTE path is the escape the obvious
+// containment check does not catch: filepath.Join("bin", "/etc/passwd") is
+// "bin/etc/passwd", so joining the target against the link's own directory
+// silently reinterprets it as relative and every such entry passes. Combined
+// with a later regular-file entry at the same name — which O_CREATE would
+// open *through* the symlink — an archive could overwrite any file the user
+// can write. Both halves are covered here.
+func TestExtractTarGzRejectsAbsoluteSymlinkTarget(t *testing.T) {
+	outside := filepath.Join(t.TempDir(), "victim")
+	if err := os.WriteFile(outside, []byte("ORIGINAL\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	archive := tarGzEntries(t, []tar.Header{
+		{Name: "pkg/bin/npx", Typeflag: tar.TypeSymlink, Linkname: outside, Mode: 0o777},
+		{Name: "pkg/bin/npx", Typeflag: tar.TypeReg, Mode: 0o755},
+	}, map[string]string{"pkg/bin/npx": "PWNED\n"})
+
+	if err := extractTarGz(archive, t.TempDir()); err == nil {
+		t.Error("extractTarGz accepted a symlink to an absolute path outside the destination")
+	}
+	got, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "ORIGINAL\n" {
+		t.Fatalf("a file outside the destination was overwritten with %q", got)
+	}
+}
+
+// The relative form of the same escape.
+func TestExtractTarGzRejectsRelativeSymlinkEscape(t *testing.T) {
+	archive := tarGzEntries(t, []tar.Header{
+		{Name: "pkg/bin/npx", Typeflag: tar.TypeSymlink, Linkname: "../../../../etc/passwd", Mode: 0o777},
+	}, nil)
+	if err := extractTarGz(archive, t.TempDir()); err == nil {
+		t.Error("extractTarGz accepted a relative symlink escaping the destination")
+	}
+}
+
+// Contained symlinks are the normal case — Node's tarball links npm and npx
+// into lib/node_modules — so the guard above must not reject them.
+func TestExtractTarGzKeepsContainedSymlinks(t *testing.T) {
+	archive := tarGzEntries(t, []tar.Header{
+		{Name: "pkg/lib/node_modules/npm/bin/npm-cli.js", Typeflag: tar.TypeReg, Mode: 0o755},
+		{Name: "pkg/bin/npm", Typeflag: tar.TypeSymlink, Linkname: "../lib/node_modules/npm/bin/npm-cli.js", Mode: 0o777},
+	}, map[string]string{"pkg/lib/node_modules/npm/bin/npm-cli.js": "#!/usr/bin/env node\n"})
+
+	dest := t.TempDir()
+	if err := extractTarGz(archive, dest); err != nil {
+		t.Fatalf("extractTarGz rejected a legitimate contained symlink: %v", err)
+	}
+	info, err := os.Lstat(filepath.Join(dest, "bin", "npm"))
+	if err != nil {
+		t.Fatalf("bin/npm missing: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Error("bin/npm should have been created as a symlink")
+	}
+}
+
+// tarGzEntries builds a gzipped tar from explicit headers, so a test can
+// control entry type, order and link targets. bodies supplies content for
+// regular entries, keyed by header name.
+func tarGzEntries(t *testing.T, headers []tar.Header, bodies map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(zw)
+	for _, h := range headers {
+		body := bodies[h.Name]
+		if h.Typeflag == tar.TypeReg {
+			h.Size = int64(len(body))
+		}
+		if err := tw.WriteHeader(&h); err != nil {
+			t.Fatal(err)
+		}
+		if h.Typeflag == tar.TypeReg {
+			if _, err := tw.Write([]byte(body)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
 func TestStripLeading(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
 		{"go/bin/go", "bin/go"},

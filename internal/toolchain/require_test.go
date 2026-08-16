@@ -228,6 +228,72 @@ func TestOverrideBeatsManifest(t *testing.T) {
 	}
 }
 
+// A typo'd override must be a loud config error, never a silent downgrade.
+// Assigning an unparseable value would blank Version and discard what the
+// manifest correctly said — turning "1.26.x" into "any toolchain will do",
+// and then reporting "no version declared" about a repo whose go.mod declares
+// one. That reads as bulwark being broken rather than the config being wrong.
+func TestBadOverrideIsAnErrorNotASilentDowngrade(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "go.mod", "module x\n\ngo 1.26.4\n")
+
+	_, err := Requirements(dir, []detect.Ecosystem{detect.Go}, Overrides{Go: "1.26.x"})
+	if err == nil {
+		t.Fatal("an unparseable toolchain.go override was accepted")
+	}
+	if !strings.Contains(err.Error(), "toolchain.go") {
+		t.Errorf("error should name the offending key, got: %v", err)
+	}
+}
+
+// TypeScript's override key is `node`, since what is overridden is the Node
+// runtime rather than the TypeScript compiler. The error has to say the key
+// the user would actually go and edit.
+func TestBadNodeOverrideNamesTheNodeKey(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "package.json", `{"name":"x"}`)
+
+	_, err := Requirements(dir, []detect.Ecosystem{detect.TypeScript}, Overrides{Node: "lts/*"})
+	if err == nil {
+		t.Fatal("an unparseable toolchain.node override was accepted")
+	}
+	if !strings.Contains(err.Error(), "toolchain.node") {
+		t.Errorf("error should name toolchain.node, got: %v", err)
+	}
+}
+
+// Rust is exempt: rustup channels are legitimately non-numeric, and rustup —
+// not bulwark — is the authority on which names are real. Such an override
+// stays unpinned and is passed through verbatim.
+func TestRustOverrideAcceptsANamedChannel(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "Cargo.toml", "[package]\nname = \"x\"\n")
+
+	got := requireOne(t, dir, detect.Rust, Overrides{Rust: "nightly"})
+	if !got.Unpinned() {
+		t.Errorf("a nightly override should be unpinned, got %+v", got)
+	}
+	if got.Raw != "nightly" {
+		t.Errorf("Raw = %q, want nightly passed through for rustup", got.Raw)
+	}
+	if !got.Overridden {
+		t.Error("an override must be marked Overridden so rustup can be told about it explicitly")
+	}
+}
+
+// A version read from a manifest is not Overridden: rustup finds
+// rust-toolchain.toml by itself, and forcing RUSTUP_TOOLCHAIN in that case
+// would override rustup's own per-crate selection.
+func TestManifestSourcedRequirementIsNotMarkedOverridden(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "Cargo.toml", "[package]\nname = \"x\"\n")
+	write(t, dir, "rust-toolchain.toml", "[toolchain]\nchannel = \"1.96\"\n")
+
+	if got := requireOne(t, dir, detect.Rust, Overrides{}); got.Overridden {
+		t.Error("a manifest-sourced requirement must not be marked Overridden")
+	}
+}
+
 // Requirements is scoped to what the caller detected: a Go-only repo must
 // never read a package.json or provision Node.
 func TestRequirementsOnlyCoversRequestedEcosystems(t *testing.T) {

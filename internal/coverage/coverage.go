@@ -394,28 +394,47 @@ var rustLCOVReportCandidates = []string{"coverage/lcov.info", "lcov.info", "targ
 // override strings themselves.
 func findReportForUnit(dir, unitDir, unitRelDir string, overrides ReportOverrides, solo bool, candidates []string) (string, bool) {
 	if override, ok := overrides[unitRelDir]; ok {
-		p := filepath.Join(dir, override)
-		if _, err := os.Stat(p); err == nil {
-			return p, true
-		}
-		return "", false
+		return resolveOverride(dir, override)
 	}
 	if solo {
 		if override, ok := overrides[""]; ok {
-			p := filepath.Join(dir, override)
-			if _, err := os.Stat(p); err == nil {
-				return p, true
-			}
-			return "", false
+			return resolveOverride(dir, override)
 		}
 	}
 	for _, c := range candidates {
-		p := filepath.Join(unitDir, c)
-		if _, err := os.Stat(p); err == nil {
+		if p := filepath.Join(unitDir, c); isRegularFile(p) {
 			return p, true
 		}
 	}
 	return "", false
+}
+
+// resolveOverride turns one explicit report-path override into a path, or
+// reports not-found.
+//
+// An empty override is not-found rather than a path. Joining "" onto dir
+// yields the scan root directory itself, and a bare existence check accepts a
+// directory — so the lookup would answer "found" with a path no parser can
+// read, instead of either missing or falling back to the conventional
+// candidates. Both `report: ""` in .bulwark.yml and `--go-report ""` on the
+// command line can produce it.
+func resolveOverride(dir, override string) (string, bool) {
+	if strings.TrimSpace(override) == "" {
+		return "", false
+	}
+	if p := filepath.Join(dir, override); isRegularFile(p) {
+		return p, true
+	}
+	return "", false
+}
+
+// isRegularFile reports whether path exists and is a file rather than a
+// directory. A coverage report is always a file; accepting a directory turns
+// a configuration mistake into a confusing parse failure downstream instead
+// of a clean miss here.
+func isRegularFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
 }
 
 // rustCoverage reads the total line coverage percentage for every

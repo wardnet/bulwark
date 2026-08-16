@@ -22,6 +22,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -100,9 +101,15 @@ type Reports map[string]string
 
 // UnmarshalYAML accepts a bare scalar (the single-unit form, stored under
 // the "" key that findReportForUnit already reserves for exactly that) or a
-// mapping of unit dir to path. An explicit null (`report:` with no value) is
-// unset, not an empty path — the latter would resolve to the scan root
-// itself and miss, which reads as a broken config rather than an absent one.
+// mapping of unit dir to path.
+//
+// An explicit null (`report:` with no value) and an explicit empty string
+// (`report: ""`) are both unset rather than an empty path. An empty path
+// would join to the scan root directory itself, and since os.Stat succeeds on
+// a directory the lookup would report the scan root as a *found* report —
+// neither missing nor falling back to the conventional candidates, just
+// silently wrong. Treating both spellings as absent is the only reading that
+// can't produce that.
 func (r *Reports) UnmarshalYAML(value *yaml.Node) error {
 	switch {
 	case value.Tag == "!!null":
@@ -112,6 +119,10 @@ func (r *Reports) UnmarshalYAML(value *yaml.Node) error {
 		var s string
 		if err := value.Decode(&s); err != nil {
 			return err
+		}
+		if strings.TrimSpace(s) == "" {
+			*r = nil
+			return nil
 		}
 		*r = Reports{"": s}
 		return nil

@@ -115,13 +115,37 @@ line-anchored, so unrelated chatter on stdout would surface in the comment.
   cache-key change. Installs stage into a sibling directory and are renamed
   into place, so an interrupted download cannot leave a half-populated
   toolchain that the next run treats as complete.
-- Archive extraction refuses entries that escape the destination. Note the
-  containment check runs on the *unclean* path: cleaning
-  `go/../../escaped` first collapses it to `../escaped`, after which dropping
-  the archive's leading component eats the traversal and yields a
-  benign-looking `escaped` — contained, but written under a name unrelated to
-  what the archive asked for. Splitting the raw name leaves the traversal
-  intact to be rejected.
+- Archive extraction refuses entries that escape the destination, in three
+  separate ways that each needed their own guard:
+  - The containment check runs on the *unclean* path. Cleaning
+    `go/../../escaped` first collapses it to `../escaped`, after which
+    dropping the archive's leading component eats the traversal and yields a
+    benign-looking `escaped` — contained, but written under a name unrelated
+    to what the archive asked for.
+  - A symlink whose target is an **absolute** path is rejected outright rather
+    than containment-checked, because the obvious check silently passes on
+    one: `filepath.Join("bin", "/etc/passwd")` is `"bin/etc/passwd"`, so
+    joining a link target against its own directory reinterprets an absolute
+    path as relative.
+  - A regular entry removes anything already at its target before writing.
+    `O_CREATE` follows an existing symlink and writes through it, so an
+    archive that plants a symlink and then writes a regular file at the same
+    name would otherwise write wherever the link points. The absolute-target
+    rejection alone is not enough — the two guards close the same hole from
+    different ends.
+- rustup selection is distinct from rustup installation. A channel read from a
+  manifest is selected by rustup itself, from the crate directory cargo runs
+  in; a channel supplied by `toolchain.rust` in `.bulwark.yml` is invisible to
+  rustup and needs an explicit `RUSTUP_TOOLCHAIN`. That variable is set only
+  in the override case: setting it for manifest-sourced channels would
+  override rustup's per-crate selection and break a monorepo whose crates pin
+  different channels.
+- An override that bulwark cannot parse as a version is a hard config error
+  for Go and Node, not a silent fall-through. Accepting it would blank the
+  requirement and discard what the manifest correctly said, turning a typo
+  into "any toolchain will do" and then reporting "no version declared" about
+  a repo that declares one. Rust is exempt, since rustup channels are
+  legitimately non-numeric and rustup is the authority on which names exist.
 - Only enabled ecosystems are provisioned. A language disabled in
   `.bulwark.yml` is one whose tools never run, and on a repo that disabled
   Rust precisely because its runner has no Rust, provisioning it would be

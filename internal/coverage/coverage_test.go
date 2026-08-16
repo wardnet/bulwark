@@ -124,6 +124,32 @@ func TestFindReportOverrideMissing(t *testing.T) {
 	}
 }
 
+// An empty override must be a miss, not a path. Joining "" onto dir yields
+// the scan root directory, and a bare os.Stat accepts a directory — so the
+// lookup would answer "found" with something no parser can read, instead of
+// missing or falling back to the conventional candidates. `report: ""` in
+// .bulwark.yml and `--go-report ""` both produce it.
+func TestFindReportEmptyOverrideIsAMissNotTheScanRoot(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "coverage.out", "mode: set\n")
+
+	got, ok := findReportForUnit(dir, dir, "", ReportOverrides{"": ""}, true, []string{"coverage.out"})
+	if ok {
+		t.Fatalf("findReportForUnit with an empty override = (%q, true), want a miss", got)
+	}
+}
+
+// The same guard, for an override naming a directory that happens to exist.
+func TestFindReportDirectoryOverrideIsAMiss(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "coverage"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := findReportForUnit(dir, dir, "", ReportOverrides{"": "coverage"}, true, nil); ok {
+		t.Fatal("a directory was accepted as a coverage report")
+	}
+}
+
 func TestFindReportCandidateSearchOrder(t *testing.T) {
 	dir := t.TempDir()
 	write(t, dir, "cover.out", "mode: set\n")

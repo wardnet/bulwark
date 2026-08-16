@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -119,6 +120,16 @@ func extractTarGz(data []byte, dest string) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
 				return err
 			}
+			// Remove any existing entry before writing. Opening with O_CREATE
+			// follows an existing symlink and writes through it, so an
+			// archive that plants a symlink and then writes a regular file at
+			// the same name would write wherever the link points. Since dest
+			// is a directory this function just created, anything already at
+			// target came from this same archive — dropping it is safe and is
+			// what stops that two-step.
+			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+				return err
+			}
 			n, err := writeFile(target, tr, hdr.FileInfo().Mode(), maxArchiveBytes-written)
 			if err != nil {
 				return err
@@ -128,11 +139,25 @@ func extractTarGz(data []byte, dest string) error {
 				return fmt.Errorf("archive exceeds %d bytes; refusing to continue", maxArchiveBytes)
 			}
 		case tar.TypeSymlink:
-			// Node's tarball ships symlinks (npm/npx into
-			// lib/node_modules). Resolve the link target against the same
-			// containment check as a regular path so a crafted archive can't
-			// point outside dest.
-			if _, err := safeJoin(dest, filepath.Join(filepath.Dir(rel), hdr.Linkname)); err != nil {
+			// Node's tarball ships symlinks (npm/npx into lib/node_modules),
+			// so they cannot simply be skipped — but they are the sharpest
+			// edge in an archive and need two separate checks.
+			//
+			// An absolute target is rejected outright rather than
+			// containment-checked, because the obvious check does not work on
+			// one: filepath.Join("bin", "/etc/passwd") is "bin/etc/passwd",
+			// so joining a link target against its own directory silently
+			// reinterprets an absolute path as a relative one and every
+			// escape passes. A toolchain tarball has no legitimate use for an
+			// absolute symlink anyway — it would point outside the install
+			// either way.
+			if path.IsAbs(filepath.ToSlash(hdr.Linkname)) {
+				return fmt.Errorf("archive entry %q is a symlink to the absolute path %q", rel, hdr.Linkname)
+			}
+			// A relative target still has to land inside dest once resolved
+			// against the link's own directory. Slash semantics throughout:
+			// tar names are slash-separated regardless of host.
+			if _, err := safeJoin(dest, path.Join(path.Dir(filepath.ToSlash(rel)), filepath.ToSlash(hdr.Linkname))); err != nil {
 				return err
 			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {

@@ -167,10 +167,31 @@ func provisionRust(ctx context.Context, req Requirement, ambient string, present
 	if !r.Ok() {
 		return nil, fmt.Errorf("rustup toolchain install %s: %w", channel, r.Err)
 	}
-	return &step{
+
+	st := &step{
 		note: fmt.Sprintf("rust: installed toolchain %s via rustup (declared in %s; %s)",
 			channel, req.Source, absentOrOld(ambient, present)),
-	}, nil
+	}
+	// Installing is not selecting. rustup picks a toolchain by reading
+	// rust-toolchain.toml from the directory cargo runs in, which covers the
+	// normal case for free — internal/rust and internal/coverage both run
+	// cargo inside the crate directory, so the file bulwark read is the file
+	// rustup reads.
+	//
+	// An override has no such file. The version exists only in .bulwark.yml,
+	// rustup cannot see it, and without being told it would install the
+	// requested channel and then go on running the old default — reporting
+	// success for a toolchain nothing actually uses. RUSTUP_TOOLCHAIN is the
+	// explicit selection, and it is set *only* here: applying it whenever a
+	// channel was read from a manifest would override rustup's own per-crate
+	// selection, which is exactly what internal/rust's "bulwark doesn't
+	// second-guess that" stance says not to do, and would break a monorepo
+	// whose crates pin different channels.
+	if req.Overridden {
+		st.vars = []string{"RUSTUP_TOOLCHAIN=" + channel}
+		st.note += " and selected it via RUSTUP_TOOLCHAIN (the version came from config, so no rust-toolchain.toml names it)"
+	}
+	return st, nil
 }
 
 // provisionNode makes the declared Node runtime available.

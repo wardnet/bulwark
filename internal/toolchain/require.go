@@ -2,6 +2,7 @@ package toolchain
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +37,12 @@ type Requirement struct {
 	// requirement can be traced without guessing which of several manifests
 	// won.
 	Source string
+	// Overridden records that .bulwark.yml supplied the version rather than a
+	// manifest. It matters for Rust: rustup selects a toolchain by reading
+	// rust-toolchain.toml from the directory cargo runs in, so a version that
+	// exists only in bulwark's config is one rustup cannot see and has to be
+	// told about explicitly.
+	Overridden bool
 }
 
 // Unpinned reports whether the repo stated no comparable version, in which
@@ -71,13 +78,44 @@ func Requirements(root string, ecosystems []detect.Ecosystem, cfg Overrides) ([]
 			return nil, err
 		}
 		if override := cfg.For(e); override != "" {
-			req.Version = canonical(override)
+			v := canonical(override)
+			// A version bulwark cannot parse is a hard config error, not a
+			// silent downgrade. Assigning it unconditionally would set
+			// Version to "" and discard what the manifest correctly said —
+			// turning a typo like "1.26.x" into "any toolchain will do", and
+			// then reporting "no version declared" about a repo whose go.mod
+			// declares one. That reads as bulwark being broken rather than as
+			// the config being wrong.
+			//
+			// Rust is exempt: rustup channels are legitimately non-numeric
+			// ("stable", "nightly", "1.96-x86_64-unknown-linux-gnu"), and
+			// rustup is the authority on which of those are real, not
+			// bulwark. Such an override stays unpinned and is handed through
+			// verbatim.
+			if v == "" && e != detect.Rust {
+				return nil, fmt.Errorf(
+					"toolchain.%s in .bulwark.yml: %q is not a version bulwark can compare against an installed toolchain",
+					overrideKey(e), override)
+			}
+			req.Version = v
 			req.Raw = override
-			req.Source = "toolchain." + string(e) + " in .bulwark.yml"
+			req.Source = "toolchain." + overrideKey(e) + " in .bulwark.yml"
+			req.Overridden = true
 		}
 		out = append(out, req)
 	}
 	return out, nil
+}
+
+// overrideKey names an ecosystem as it is spelled under `toolchain:` in
+// .bulwark.yml. TypeScript's key is `node`, because what is being overridden
+// is the Node runtime, not the TypeScript compiler — the ecosystem's name and
+// its toolchain's name are the one place these diverge.
+func overrideKey(e detect.Ecosystem) string {
+	if e == detect.TypeScript {
+		return "node"
+	}
+	return string(e)
 }
 
 // goRequirement reads the `go` and `toolchain` directives from every module
