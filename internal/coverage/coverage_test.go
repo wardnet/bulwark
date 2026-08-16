@@ -141,19 +141,26 @@ func TestFindReportNoCandidatesExist(t *testing.T) {
 	}
 }
 
-// TestGoCoverageModeSkipDoesNotRunTests guards ModeSkip's core promise: it
-// must parse an existing profile without ever invoking `go test`. A fixture
-// Go module with a deliberately failing test proves this — if goCoverage
-// under ModeSkip ran the tests, the run would fail/hang and this test would
-// fail with it; instead it should cleanly read the pre-existing profile.
-func TestGoCoverageModeSkipDoesNotRunTests(t *testing.T) {
+// TestGoCoverageSourceReportDoesNotRunTests guards SourceReport's core
+// promise: it must parse an existing profile without ever invoking `go test`.
+// A fixture Go module with a deliberately failing test proves this — if
+// goCoverage under SourceReport ran the tests, the run would fail/hang and
+// this test would fail with it; instead it should cleanly read the
+// pre-existing profile.
+//
+// This is the same guarantee the old TestGoCoverageModeSkipDoesNotRunTests
+// held, under the renamed axis. Renaming "skip the tests" to "a report is the
+// source" changes who the setting is addressed to, not what bulwark does with
+// it: the never-execute promise is what makes a report-sourced repo's CI
+// budget predictable, so it survives the rename verbatim.
+func TestGoCoverageSourceReportDoesNotRunTests(t *testing.T) {
 	dir := t.TempDir()
 	write(t, dir, "go.mod", "module fixture\n\ngo 1.26\n")
 	write(t, dir, "main.go", "package fixture\n\nfunc Foo() {}\n")
-	write(t, dir, "main_test.go", "package fixture\n\nimport \"testing\"\n\nfunc TestFails(t *testing.T) { t.Fatal(\"this test must never run under ModeSkip\") }\n")
+	write(t, dir, "main_test.go", "package fixture\n\nimport \"testing\"\n\nfunc TestFails(t *testing.T) { t.Fatal(\"this test must never run under SourceReport\") }\n")
 	write(t, dir, "coverage.out", "mode: set\nfixture/main.go:3.13,3.16 1 1\n")
 
-	pct, _, ok := goCoverage(context.Background(), dir, "", ModeSkip, nil, nil)
+	pct, _, ok := goCoverage(context.Background(), dir, "", SourceReport, nil, nil)
 	if !ok {
 		t.Fatal("expected goCoverage to succeed by parsing the existing coverage.out")
 	}
@@ -187,7 +194,7 @@ func TestGoCoverageDiscoversEveryModuleUnderDir(t *testing.T) {
 	writeNested(t, dir, filepath.Join("sdk", "wardnet-go", "coverage.out"),
 		"mode: set\nwardnet.network/go/api.go:3.13,3.16 1 0\n")
 
-	pct, profiles, ok := goCoverage(context.Background(), dir, "", ModeSkip, nil, nil)
+	pct, profiles, ok := goCoverage(context.Background(), dir, "", SourceReport, nil, nil)
 	if !ok {
 		t.Fatal("goCoverage found no measurable Go module under a dir holding two")
 	}

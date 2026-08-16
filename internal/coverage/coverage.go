@@ -18,16 +18,26 @@ import (
 	"wardnet/bulwark/internal/executil"
 )
 
-// Mode controls whether Compute executes tests itself or only parses an
-// already-produced coverage report.
-type Mode string
+// Source says who produces the coverage data Compute returns: bulwark
+// itself, or a prior job in the same pipeline.
+//
+// It mirrors config.Source, but stays a parameter of Compute rather than
+// something Compute reads off the config it is already handed. That is
+// deliberate and load-bearing: baseline computation at a historical main
+// commit must run tests no matter what the repo's config says, because that
+// commit's throwaway worktree contains no CI-produced report to parse. A
+// Compute that consulted cfg.Coverage.Source itself would silently turn
+// every SourceReport repo's baselines into empty reports — the exact `{}`
+// poisoning cmd/bulwark/coverage.go refuses to cache. Keeping the axis in
+// the signature makes the one caller that must override it say so out loud.
+type Source string
 
 const (
-	// ModeRun executes each ecosystem's test suite (with coverage
+	// SourceRun executes each ecosystem's test suite (with coverage
 	// instrumentation) itself. The right default for local dev: one command,
 	// no separate test step to remember to run first.
-	ModeRun Mode = "run"
-	// ModeSkip never executes tests — it only looks for a report file each
+	SourceRun Source = "run"
+	// SourceReport never executes tests — it only looks for a report file each
 	// ecosystem's coverage tooling would already have produced as part of a
 	// prior, separate test step (e.g. CI's own test job), and parses it. This
 	// mirrors how Codecov/Sonar work: they never run your tests themselves,
@@ -36,12 +46,12 @@ const (
 	// get executed a second (or, for repos whose CI already runs a plain
 	// pass/fail test job separately from an instrumented coverage job, a
 	// third) time.
-	ModeSkip Mode = "skip"
+	SourceReport Source = "report"
 )
 
 // ReportOverrides maps a discovered unit directory — a Rust crate/workspace
 // root, or a Go module root — relative to --dir, to an explicit report path
-// override (also relative to --dir), for use with ModeSkip. The empty-string
+// override (also relative to --dir), for use with SourceReport. The empty-string
 // key ("") is the override applied when discovery finds exactly one such unit
 // — this preserves the single-unit CLI usage of a bare `--rust-report <path>`
 // or `--go-report <path>` unchanged even though those flags are now
@@ -60,7 +70,7 @@ type (
 // language, for a repo whose coverage output doesn't land at one of the
 // conventional locations findReport/findReportForUnit checks. A zero value
 // uses the built-in candidate list for that language. Only meaningful with
-// ModeSkip.
+// SourceReport.
 type ReportPaths struct {
 	Go       GoReportOverrides
 	Rust     RustReportOverrides
@@ -126,10 +136,10 @@ type GoModuleProfile struct {
 // excludes per language.
 //
 // The returned cleanup func must be called once the caller is done with any
-// PatchSources paths (it removes the scratch directory ModeRun writes
-// reports into; ModeSkip's cleanup is a no-op since it only ever reads
+// PatchSources paths (it removes the scratch directory SourceRun writes
+// reports into; SourceReport's cleanup is a no-op since it only ever reads
 // files the caller/CI already produced).
-func Compute(ctx context.Context, dir string, cfg config.Config, mode Mode, reports ReportPaths, want PatchWanted) (map[string]float64, PatchSources, func(), error) {
+func Compute(ctx context.Context, dir string, cfg config.Config, source Source, reports ReportPaths, want PatchWanted) (map[string]float64, PatchSources, func(), error) {
 	ecosystems, err := detect.Ecosystems(dir, cfg.AllExcludes())
 	if err != nil {
 		return nil, PatchSources{}, func() {}, err
@@ -137,7 +147,7 @@ func Compute(ctx context.Context, dir string, cfg config.Config, mode Mode, repo
 
 	workDir := ""
 	cleanup := func() {}
-	if mode == ModeRun {
+	if source == SourceRun {
 		tmp, err := os.MkdirTemp("", "bulwark-coverage-*")
 		if err != nil {
 			return nil, PatchSources{}, func() {}, err
@@ -154,18 +164,18 @@ func Compute(ctx context.Context, dir string, cfg config.Config, mode Mode, repo
 		switch e {
 		case detect.Rust:
 			var lcovPaths map[string]string
-			pct, lcovPaths, ok = rustCoverage(ctx, dir, workDir, mode, cfg.Rust.Exclude, reports.Rust, reports.RustLCOV, want.Rust)
+			pct, lcovPaths, ok = rustCoverage(ctx, dir, workDir, source, cfg.Rust.Exclude, reports.Rust, reports.RustLCOV, want.Rust)
 			if ok && want.Rust {
 				sources.RustLCOV = lcovPaths
 			}
 		case detect.Go:
 			var goProfiles map[string]GoModuleProfile
-			pct, goProfiles, ok = goCoverage(ctx, dir, workDir, mode, cfg.Go.Exclude, reports.Go)
+			pct, goProfiles, ok = goCoverage(ctx, dir, workDir, source, cfg.Go.Exclude, reports.Go)
 			if ok && want.Go {
 				sources.GoProfiles = goProfiles
 			}
 		case detect.TypeScript:
-			pct, ok = tsCoverage(ctx, dir, cfg.TypeScript.Exclude, mode, cfg.TypeScript.Install)
+			pct, ok = tsCoverage(ctx, dir, cfg.TypeScript.Exclude, source, cfg.TypeScript.Install)
 			if ok && want.TypeScript {
 				pkgDirs, _ := detect.TSPackageDirs(dir, cfg.TypeScript.Exclude)
 				sources.TSLCOV = tsLCOVSources(pkgDirs)
@@ -204,7 +214,7 @@ func moduleName(ctx context.Context, moduleDir string) string {
 
 // tsLCOVSources looks for an lcov.info Istanbul/Vitest may have already
 // written (as a side effect of the same test:coverage run tsCoverage just
-// executed, or a prior CI step under ModeSkip) alongside each package's
+// executed, or a prior CI step under SourceReport) alongside each package's
 // coverage-summary.json — no separate test execution needed either way.
 func tsLCOVSources(pkgDirs []string) map[string]string {
 	sources := map[string]string{}
@@ -251,7 +261,7 @@ var goReportCandidates = []string{"coverage.out", "cover.out", "c.out"}
 // Discovering modules rather than treating dir as one is what makes a
 // monorepo work at all: `go test` and `go list -m` are both module-scoped, so
 // running them at a dir that merely *contains* modules measures nothing.
-func goCoverage(ctx context.Context, dir, workDir string, mode Mode, exclude []string, overrides GoReportOverrides) (float64, map[string]GoModuleProfile, bool) {
+func goCoverage(ctx context.Context, dir, workDir string, source Source, exclude []string, overrides GoReportOverrides) (float64, map[string]GoModuleProfile, bool) {
 	moduleDirs, err := detect.GoModuleDirs(dir, exclude)
 	if err != nil || len(moduleDirs) == 0 {
 		return 0, nil, false
@@ -268,7 +278,7 @@ func goCoverage(ctx context.Context, dir, workDir string, mode Mode, exclude []s
 		if rel == "." {
 			rel = ""
 		}
-		pct, src, ok := goCoverageOne(ctx, dir, moduleDir, rel, workDir, mode, overrides, solo, i)
+		pct, src, ok := goCoverageOne(ctx, dir, moduleDir, rel, workDir, source, overrides, solo, i)
 		if !ok {
 			continue
 		}
@@ -283,13 +293,13 @@ func goCoverage(ctx context.Context, dir, workDir string, mode Mode, exclude []s
 }
 
 // goCoverageOne measures one module, either running `go test -coverprofile`
-// inside it (ModeRun) or parsing a profile another step already produced
-// (ModeSkip). Every command runs in moduleDir rather than dir, because that
+// inside it (SourceRun) or parsing a profile another step already produced
+// (SourceReport). Every command runs in moduleDir rather than dir, because that
 // is the only place a module-scoped Go command works.
-func goCoverageOne(ctx context.Context, dir, moduleDir, moduleRelDir, workDir string, mode Mode, overrides GoReportOverrides, solo bool, idx int) (float64, GoModuleProfile, bool) {
+func goCoverageOne(ctx context.Context, dir, moduleDir, moduleRelDir, workDir string, source Source, overrides GoReportOverrides, solo bool, idx int) (float64, GoModuleProfile, bool) {
 	var profile string
-	switch mode {
-	case ModeSkip:
+	switch source {
+	case SourceReport:
 		found, ok := findReportForUnit(dir, moduleDir, moduleRelDir, overrides, solo, goReportCandidates)
 		if !ok {
 			return 0, GoModuleProfile{}, false
@@ -414,7 +424,7 @@ func findReportForUnit(dir, unitDir, unitRelDir string, overrides ReportOverride
 // mirroring how tsCoverage averages across TS packages. Returns a map of
 // crate dir -> its resolved lcov export path (when wantLCOV is set and one
 // was resolved for that crate), for patch coverage.
-func rustCoverage(ctx context.Context, dir, workDir string, mode Mode, exclude []string, reportOverrides, lcovReportOverrides RustReportOverrides, wantLCOV bool) (float64, map[string]string, bool) {
+func rustCoverage(ctx context.Context, dir, workDir string, source Source, exclude []string, reportOverrides, lcovReportOverrides RustReportOverrides, wantLCOV bool) (float64, map[string]string, bool) {
 	crateDirs, err := detect.RustCrateDirs(dir, exclude)
 	if err != nil || len(crateDirs) == 0 {
 		return 0, nil, false
@@ -431,7 +441,7 @@ func rustCoverage(ctx context.Context, dir, workDir string, mode Mode, exclude [
 		if rel == "." {
 			rel = ""
 		}
-		pct, lcovPath, ok := rustCoverageOne(ctx, dir, crateDir, rel, workDir, mode, reportOverrides, lcovReportOverrides, solo, wantLCOV, i)
+		pct, lcovPath, ok := rustCoverageOne(ctx, dir, crateDir, rel, workDir, source, reportOverrides, lcovReportOverrides, solo, wantLCOV, i)
 		if !ok {
 			continue
 		}
@@ -449,22 +459,22 @@ func rustCoverage(ctx context.Context, dir, workDir string, mode Mode, exclude [
 
 // rustCoverageOne reads one crate's total line coverage percentage from a
 // cargo-llvm-cov JSON export, either running `cargo llvm-cov` itself
-// (ModeRun — requires cargo-llvm-cov already installed, a cargo subcommand
+// (SourceRun — requires cargo-llvm-cov already installed, a cargo subcommand
 // like cargo-audit/cargo-deny that bulwark doesn't auto-install) or parsing
-// an existing export another step already produced (ModeSkip — needs no
+// an existing export another step already produced (SourceReport — needs no
 // tool installed at all, since nothing is executed).
 //
 // When wantLCOV is set, it also resolves an lcov export for patch coverage:
-// under ModeSkip this is just another findReportForCrate lookup; under
-// ModeRun, `cargo llvm-cov --no-report` runs the tests exactly once, keeping
+// under SourceReport this is just another findReportForCrate lookup; under
+// SourceRun, `cargo llvm-cov --no-report` runs the tests exactly once, keeping
 // raw profile data on disk, and both the JSON and lcov reports are then
 // regenerated from that same profile via `--no-run` — no second test
 // execution.
-func rustCoverageOne(ctx context.Context, dir, crateDir, crateRelDir, workDir string, mode Mode, reportOverrides, lcovReportOverrides RustReportOverrides, solo, wantLCOV bool, idx int) (float64, string, bool) {
+func rustCoverageOne(ctx context.Context, dir, crateDir, crateRelDir, workDir string, source Source, reportOverrides, lcovReportOverrides RustReportOverrides, solo, wantLCOV bool, idx int) (float64, string, bool) {
 	var data []byte
 	var lcovPath string
-	switch mode {
-	case ModeSkip:
+	switch source {
+	case SourceReport:
 		found, ok := findReportForUnit(dir, crateDir, crateRelDir, reportOverrides, solo, rustReportCandidates)
 		if !ok {
 			return 0, "", false
@@ -630,27 +640,27 @@ func tsInstall(ctx context.Context, roots []string, override string) {
 // tsCoverage looks for Vitest/Istanbul's coverage-summary.json in each
 // detected package (the tool's own standard output location — unlike Go/Rust
 // there's no bulwark-configurable override, since this path is already the
-// de facto convention, not something projects vary). In ModeRun it first
+// de facto convention, not something projects vary). In SourceRun it first
 // installs each workspace root's dependencies (auto-detected by lockfile, or
 // install if set) — a fresh checkout (e.g. coverage baseline computation's
 // throwaway git worktree) has no node_modules a prior step could have
 // already installed — then runs each package's own "test:coverage" script
 // (skipping packages that don't declare one) to produce that file; in
-// ModeSkip it only reads a file a prior step already produced, running
+// SourceReport it only reads a file a prior step already produced, running
 // nothing.
-func tsCoverage(ctx context.Context, dir string, exclude []string, mode Mode, install string) (float64, bool) {
+func tsCoverage(ctx context.Context, dir string, exclude []string, source Source, install string) (float64, bool) {
 	pkgDirs, err := detect.TSPackageDirs(dir, exclude)
 	if err != nil || len(pkgDirs) == 0 {
 		return 0, false
 	}
 
-	if mode == ModeRun {
+	if source == SourceRun {
 		tsInstall(ctx, tsWorkspaceRoots(dir, pkgDirs), install)
 	}
 
 	var total, count float64
 	for _, pkgDir := range pkgDirs {
-		if mode == ModeRun {
+		if source == SourceRun {
 			if !hasCoverageScript(pkgDir) {
 				continue
 			}

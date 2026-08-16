@@ -51,25 +51,40 @@ bulwark update                 # self-update to the latest release
 
 `bulwark scan` exits non-zero if any check fails, printing a `[PASS]`/`[FAIL]` line per check.
 
-`bulwark coverage` defaults to running each ecosystem's test suite itself (`--tests=run`) — the
-right choice for local dev, one command and nothing to remember. In CI, where a test step has
-already run with coverage instrumentation on, pass `--tests=skip` so `bulwark coverage` only parses
-the report that step already produced instead of running the whole suite again:
+`bulwark coverage` defaults to running each ecosystem's test suite itself — the right choice for
+local dev, one command and nothing to remember. A repo whose CI already runs a test job with
+coverage instrumentation on says so once, in `.bulwark.yml`, and bulwark becomes a pure consumer of
+that job's report instead of running the whole suite again:
 
-```sh
-bulwark coverage --dir . --tests=skip \
-  --go-report coverage.out \
-  --rust-report coverage/llvm-cov.json
+```yaml
+coverage:
+  source: report        # default is "run" — bulwark produces coverage itself
 ```
 
+That's usually the whole change: each language's conventional report paths are searched without
+further configuration (`coverage.out`/`cover.out`/`c.out` per Go module, `coverage/llvm-cov.json`
+and `coverage/lcov.info` per Rust crate, Istanbul's `coverage/coverage-summary.json` per TS
+package). Only a report written somewhere unconventional needs naming:
+
+```yaml
+coverage:
+  source: report
+  rust:
+    report: daemon/coverage/daemon-llvm-cov.json   # non-standard name, so point at it
+```
+
+`--source run|report` overrides the file for a one-off local run, as do `--go-report`,
+`--rust-report` and `--rust-lcov-report` for the paths.
+
 See [AGENTS.md](AGENTS.md#coverage) for exactly how the baseline is computed and cached, and why
-`--tests=run`/`--tests=skip` exist.
+`coverage.source` exists.
 
 ## Configuration
 
-`.bulwark.yml` at the repo root is optional and purely **opt-out** — the default (no file) is to
-scan everything detected with every check enabled. Use it to disable a language entirely, exclude a
-path from detection, or point Semgrep at a custom ruleset:
+`.bulwark.yml` at the repo root is optional — the default (no file) is to scan everything detected
+with every check enabled and to produce coverage by running the tests. Use it to disable a language
+entirely, exclude a path from detection, point Semgrep at a custom ruleset, or describe how the
+repo's coverage is produced:
 
 ```yaml
 rust:
@@ -85,6 +100,7 @@ semgrep:
   enabled: true
   config: auto
 coverage:
+  source: run     # or "report" — a prior CI job produces coverage, bulwark only parses it
   tolerance: 0.1  # pp the aggregate gate tolerates below baseline (patch gate: coverage.patch.tolerance)
 ```
 
@@ -111,8 +127,14 @@ steps:
 
 Both `scan` and `coverage` can be turned off independently (`run-scan: false` / `run-coverage:
 false`) if a repo only wants one of them, or isn't ready to grant `contents: write` yet. See
-`action.yml`'s own input descriptions for the full list (`dir`, `tests-mode`, `go-report`,
-`rust-report`, `github-token`).
+`action.yml`'s own input descriptions for the full list (`dir`, `version`, `github-token`, and the
+two optional tokens).
+
+Note there is no input for coverage production. Who produces coverage, and where its reports live,
+come from `.bulwark.yml` at the scan root — the same answer for every workflow that calls the
+action, so it's stated once in the repo rather than restated at each call site. `dir` is the one
+thing that can't move there, since the file lives *at* the scan root and bulwark has to be told the
+root before it can read its own config.
 
 (No release has been cut yet, so `@v1` doesn't resolve to anything until the first `v1.x.y` tag is
 pushed and the floating `v1` alias is moved to it — see the `bump-version` skill for that process.

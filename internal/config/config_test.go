@@ -176,6 +176,135 @@ func TestLoadTypeScriptInstallDefaultsEmpty(t *testing.T) {
 	}
 }
 
+func TestLoadCoverageSourceDefaultsToRun(t *testing.T) {
+	got, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Coverage.Source != SourceRun {
+		t.Fatalf("Coverage.Source = %q, want %q with no config file", got.Coverage.Source, SourceRun)
+	}
+}
+
+func TestLoadCoverageSourceReport(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "coverage:\n  source: report\n")
+
+	got, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Coverage.Source != SourceReport {
+		t.Fatalf("Coverage.Source = %q, want %q", got.Coverage.Source, SourceReport)
+	}
+	// The coverage section is shared with the tolerance knobs and the patch
+	// gates; naming source must not zero its neighbours.
+	if got.Coverage.Tolerance != 0.1 || got.Coverage.Patch.Tolerance != 0.1 {
+		t.Fatalf("setting coverage.source disturbed the tolerances: %+v", got.Coverage)
+	}
+	if !got.Coverage.Patch.Go.Enabled || !got.Coverage.Patch.Rust.Enabled || !got.Coverage.Patch.TypeScript.Enabled {
+		t.Fatalf("setting coverage.source disabled a patch gate: %+v", got.Coverage.Patch)
+	}
+}
+
+// A typo'd source must be an error, not a silent fall back to "run". Falling
+// back would have bulwark execute a full test suite in a CI job built on the
+// assumption that it wouldn't — and on a runner without the toolchain, that
+// measures nothing while looking like a real result.
+func TestLoadRejectsUnknownCoverageSource(t *testing.T) {
+	for _, bad := range []string{"skip", "reports", "Run", ""} {
+		t.Run(bad, func(t *testing.T) {
+			dir := t.TempDir()
+			write(t, dir, "coverage:\n  source: \""+bad+"\"\n")
+
+			_, err := Load(dir)
+			if err == nil {
+				t.Fatalf("Load accepted coverage.source: %q", bad)
+			}
+			if !strings.Contains(err.Error(), "coverage.source") {
+				t.Fatalf("error should name the offending key, got: %v", err)
+			}
+		})
+	}
+}
+
+// The single-unit form. A repo with one Go module shouldn't have to invent a
+// key for it, so a bare scalar lands under "" — the key findReportForUnit
+// already reserves for "the only unit discovered".
+func TestLoadCoverageReportScalarForm(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "coverage:\n  source: report\n  go:\n    report: coverage.out\n")
+
+	got, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !reflect.DeepEqual(got.Coverage.Go.Report, Reports{"": "coverage.out"}) {
+		t.Fatalf("Coverage.Go.Report = %+v, want the bare path under the \"\" key", got.Coverage.Go.Report)
+	}
+}
+
+// The multi-unit form — the case the old newline-separated "<dir>=<path>"
+// action input existed to encode, and the reason wardnet's monorepo couldn't
+// be described by a single pair of paths.
+func TestLoadCoverageReportMappingForm(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, `coverage:
+  source: report
+  go:
+    report:
+      wctl: coverage/wctl.out
+      sdk/wardnet-go: coverage/sdk.out
+  rust:
+    report:
+      daemon: daemon/coverage/daemon-llvm-cov.json
+    lcov:
+      daemon: daemon/coverage/lcov.info
+`)
+
+	got, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	wantGo := Reports{"wctl": "coverage/wctl.out", "sdk/wardnet-go": "coverage/sdk.out"}
+	if !reflect.DeepEqual(got.Coverage.Go.Report, wantGo) {
+		t.Fatalf("Coverage.Go.Report = %+v, want %+v", got.Coverage.Go.Report, wantGo)
+	}
+	wantRust := Reports{"daemon": "daemon/coverage/daemon-llvm-cov.json"}
+	if !reflect.DeepEqual(got.Coverage.Rust.Report, wantRust) {
+		t.Fatalf("Coverage.Rust.Report = %+v, want %+v", got.Coverage.Rust.Report, wantRust)
+	}
+	wantLCOV := Reports{"daemon": "daemon/coverage/lcov.info"}
+	if !reflect.DeepEqual(got.Coverage.Rust.LCOV, wantLCOV) {
+		t.Fatalf("Coverage.Rust.LCOV = %+v, want %+v", got.Coverage.Rust.LCOV, wantLCOV)
+	}
+}
+
+// `report:` with nothing after it is unset, not the empty path. An empty
+// path would resolve to the scan root itself, miss, and read as a broken
+// config rather than an absent one.
+func TestLoadCoverageReportNullIsUnset(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "coverage:\n  source: report\n  go:\n    report:\n")
+
+	got, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Coverage.Go.Report != nil {
+		t.Fatalf("Coverage.Go.Report = %+v, want nil for an explicit null", got.Coverage.Go.Report)
+	}
+}
+
+func TestLoadCoverageReportRejectsWrongShape(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "coverage:\n  go:\n    report: [a, b]\n")
+
+	if _, err := Load(dir); err == nil {
+		t.Fatal("expected an error for a sequence where a path or mapping was wanted")
+	}
+}
+
 func TestLoadInvalidYAML(t *testing.T) {
 	dir := t.TempDir()
 	write(t, dir, "rust: [this is not a mapping\n")
