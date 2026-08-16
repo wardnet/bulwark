@@ -55,6 +55,11 @@ func TestCoverageOnMainRecordsFullyCarriedBaselineWhenNothingMeasured(t *testing
 	if err := os.WriteFile(filepath.Join(repo, "package.json"), []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// Coverage production is described by the repo's own config file, the way
+	// a real consumer does it now — not by a flag at the call site.
+	if err := os.WriteFile(filepath.Join(repo, config.FileName), []byte("coverage:\n  source: report\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	run(repo, "add", "-A")
 	run(repo, "commit", "-m", "code")
 	c1 := revParse(repo, "HEAD")
@@ -85,7 +90,7 @@ func TestCoverageOnMainRecordsFullyCarriedBaselineWhenNothingMeasured(t *testing
 	var out, errOut bytes.Buffer
 	cmd.SetOut(&out)
 	cmd.SetErr(&errOut)
-	cmd.SetArgs([]string{"--dir", repo, "--tests", "skip"})
+	cmd.SetArgs([]string{"--dir", repo})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("coverage on main with nothing measured: %v\nstdout: %s\nstderr: %s", err, out.String(), errOut.String())
 	}
@@ -100,6 +105,172 @@ func TestCoverageOnMainRecordsFullyCarriedBaselineWhenNothingMeasured(t *testing
 	}
 	if !strings.Contains(r.Output, "93.8") {
 		t.Errorf("baseline for %s = %s, want typescript 93.8 carried from %s", c2, r.Output, c1)
+	}
+}
+
+// The trap this whole change has to step around. Baseline computation runs
+// in a throwaway worktree checked out at a historical main commit — a bare
+// tree with no CI-produced report in it — so it must run tests no matter
+// what the repo's coverage.source says. Reading `source: report` as "never
+// run tests" anywhere in this path would hand every report-sourced repo an
+// empty baseline, which the caller then declines to cache, leaving the gate
+// permanently comparing against nothing.
+//
+// The fixture module has a test and no committed profile, so the only way a
+// Go percentage can come back at all is if the suite actually ran.
+func TestComputeBaselineAtRunsTestsEvenWhenSourceIsReport(t *testing.T) {
+	ctx := context.Background()
+	run := func(dir string, args ...string) {
+		t.Helper()
+		if r := executil.Run(ctx, dir, "git", args...); !r.Ok() {
+			t.Fatalf("git %v: %v\n%s", args, r.Err, r.Output)
+		}
+	}
+
+	repo := t.TempDir()
+	run(repo, "init", "-b", "main", ".")
+	run(repo, "config", "user.email", "t@t")
+	run(repo, "config", "user.name", "t")
+	for name, body := range map[string]string{
+		"go.mod":       "module fixture\n\ngo 1.26\n",
+		"main.go":      "package fixture\n\nfunc Foo() int { return 1 }\n",
+		"main_test.go": "package fixture\n\nimport \"testing\"\n\nfunc TestFoo(t *testing.T) {\n\tif Foo() != 1 {\n\t\tt.Fatal(\"no\")\n\t}\n}\n",
+		// The very setting that must NOT reach the baseline worktree.
+		config.FileName: "coverage:\n  source: report\n",
+	} {
+		if err := os.WriteFile(filepath.Join(repo, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run(repo, "add", "-A")
+	run(repo, "commit", "-m", "fixture")
+	r := executil.Run(ctx, repo, "git", "rev-parse", "HEAD")
+	if !r.Ok() {
+		t.Fatalf("rev-parse: %v", r.Err)
+	}
+	sha := strings.TrimSpace(r.Output)
+
+	cfg, err := config.Load(repo)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Coverage.Source != config.SourceReport {
+		t.Fatalf("fixture config did not take: %+v", cfg.Coverage)
+	}
+
+	cmd := newCoverageCmd()
+	var out, errOut bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+
+	baseline, err := computeBaselineAt(ctx, cmd, repo, sha, cfg)
+	if err != nil {
+		t.Fatalf("computeBaselineAt: %v\nstderr: %s", err, errOut.String())
+	}
+	got, ok := baseline["go"]
+	if !ok {
+		t.Fatalf("baseline has no go entry — the worktree honoured coverage.source: report and measured nothing: %+v\nstderr: %s", baseline, errOut.String())
+	}
+	if got != 100 {
+		t.Fatalf("go baseline = %v%%, want 100%% from actually running the fixture's test", got)
+	}
+}
+
+func TestResolveSource(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		sourceFlag string
+		testsMode  string
+		fromFile   config.Source
+		want       coverage.Source
+		wantErr    bool
+	}{
+		// The file is the normal path: no flags, config decides.
+		{name: "file report", fromFile: config.SourceReport, want: coverage.SourceReport},
+		{name: "file run", fromFile: config.SourceRun, want: coverage.SourceRun},
+		// An explicit flag outranks the file, in both directions — a local
+		// dev must be able to force a real run in a report-sourced repo.
+		{name: "flag beats file", sourceFlag: "run", fromFile: config.SourceReport, want: coverage.SourceRun},
+		{name: "flag report beats file run", sourceFlag: "report", fromFile: config.SourceRun, want: coverage.SourceReport},
+		// The deprecated spelling, still honoured, still outranking the file.
+		{name: "tests skip maps to report", testsMode: "skip", fromFile: config.SourceRun, want: coverage.SourceReport},
+		{name: "tests run maps to run", testsMode: "run", fromFile: config.SourceReport, want: coverage.SourceRun},
+		{name: "source wins over tests", sourceFlag: "report", testsMode: "run", fromFile: config.SourceRun, want: coverage.SourceReport},
+		// "skip" is the old vocabulary and means nothing to --source.
+		{name: "source rejects skip", sourceFlag: "skip", fromFile: config.SourceRun, wantErr: true},
+		{name: "source rejects junk", sourceFlag: "nope", fromFile: config.SourceRun, wantErr: true},
+		{name: "tests rejects report", testsMode: "report", fromFile: config.SourceRun, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := &cobra.Command{}
+			cmd.SetOut(&bytes.Buffer{})
+			cmd.SetErr(&bytes.Buffer{})
+
+			got, err := resolveSource(cmd, tc.sourceFlag, tc.testsMode, tc.fromFile)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("resolveSource(%q, %q, %q) = %q, want an error", tc.sourceFlag, tc.testsMode, tc.fromFile, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveSource: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("resolveSource(%q, %q, %q) = %q, want %q", tc.sourceFlag, tc.testsMode, tc.fromFile, got, tc.want)
+			}
+		})
+	}
+}
+
+// Both flags default to "" precisely so that "unset" is distinguishable from
+// "explicitly run". With a "run" default the flag would always be populated,
+// always outrank the file, and coverage.source would never be consulted at
+// all — a silent failure that looks exactly like the config key not working.
+func TestCoverageFlagDefaultsLeaveConfigInCharge(t *testing.T) {
+	cmd := newCoverageCmd()
+	for _, name := range []string{"source", "tests"} {
+		if got := cmd.Flags().Lookup(name).DefValue; got != "" {
+			t.Errorf("--%s defaults to %q; it must default to empty so .bulwark.yml is consulted", name, got)
+		}
+	}
+}
+
+func TestResolveReports(t *testing.T) {
+	cfg := config.Default()
+	cfg.Coverage.Go.Report = config.Reports{"": "from-file.out"}
+	cfg.Coverage.Rust.Report = config.Reports{"daemon": "file-llvm.json"}
+	cfg.Coverage.Rust.LCOV = config.Reports{"daemon": "file-lcov.info"}
+
+	// Nothing on the command line: the file supplies all three.
+	got := resolveReports(cfg, nil, nil, nil)
+	if !reflect.DeepEqual(got.Go, coverage.ReportOverrides{"": "from-file.out"}) {
+		t.Errorf("Go = %+v, want the file's value", got.Go)
+	}
+	if !reflect.DeepEqual(got.Rust, coverage.ReportOverrides{"daemon": "file-llvm.json"}) {
+		t.Errorf("Rust = %+v, want the file's value", got.Rust)
+	}
+	if !reflect.DeepEqual(got.RustLCOV, coverage.ReportOverrides{"daemon": "file-lcov.info"}) {
+		t.Errorf("RustLCOV = %+v, want the file's value", got.RustLCOV)
+	}
+
+	// A flag replaces its own kind wholesale and leaves the others alone.
+	// Wholesale, not merged, so a flag can drop a stale keyed entry the file
+	// declares rather than only ever being able to add to it.
+	got = resolveReports(cfg, []string{"wctl=flag.out", "sdk=flag2.out"}, nil, nil)
+	wantGo := coverage.ReportOverrides{"wctl": "flag.out", "sdk": "flag2.out"}
+	if !reflect.DeepEqual(got.Go, wantGo) {
+		t.Errorf("Go = %+v, want the flag's value replacing the file's entirely", got.Go)
+	}
+	if !reflect.DeepEqual(got.Rust, coverage.ReportOverrides{"daemon": "file-llvm.json"}) {
+		t.Errorf("--go-report disturbed Rust: %+v", got.Rust)
+	}
+}
+
+func TestResolveReportsEmptyConfigYieldsNil(t *testing.T) {
+	got := resolveReports(config.Default(), nil, nil, nil)
+	if got.Go != nil || got.Rust != nil || got.RustLCOV != nil {
+		t.Fatalf("a zero-config repo should carry no overrides at all, got %+v", got)
 	}
 }
 

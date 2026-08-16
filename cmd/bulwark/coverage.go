@@ -30,6 +30,7 @@ const priorBaselineDepth = 50
 
 func newCoverageCmd() *cobra.Command {
 	var dir string
+	var sourceFlag string
 	var testsMode string
 	var goReport []string
 	var rustReport []string
@@ -40,38 +41,48 @@ func newCoverageCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
 
-			mode := coverage.Mode(testsMode)
-			if mode != coverage.ModeRun && mode != coverage.ModeSkip {
-				return fmt.Errorf("--tests must be %q or %q, got %q", coverage.ModeRun, coverage.ModeSkip, testsMode)
-			}
-			reports := coverage.ReportPaths{
-				Go:       parseReportOverrides(goReport),
-				Rust:     parseReportOverrides(rustReport),
-				RustLCOV: parseReportOverrides(rustLCOVReport),
-			}
-
 			cfg, err := config.Load(dir)
 			if err != nil {
 				return err
 			}
+			source, err := resolveSource(cmd, sourceFlag, testsMode, cfg.Coverage.Source)
+			if err != nil {
+				return err
+			}
+			reports := resolveReports(cfg, goReport, rustReport, rustLCOVReport)
+
 			patchWanted := coverage.PatchWanted{
 				Go:         cfg.Coverage.Patch.Go.Enabled,
 				Rust:       cfg.Coverage.Patch.Rust.Enabled,
 				TypeScript: cfg.Coverage.Patch.TypeScript.Enabled,
 			}
 
-			current, sources, cleanup, err := coverage.Compute(ctx, dir, cfg, mode, reports, patchWanted)
+			// Detection runs before Compute, not after, because the toolchain
+			// each ecosystem needs has to be in place before Compute shells
+			// out to `go test` / `cargo llvm-cov` / a package's
+			// test:coverage. Compute detects again internally; the walk is
+			// cheap and idempotent, and duplicating it is the smaller cost
+			// against threading a pre-detected list through its signature.
+			//
+			// This also covers the SourceReport path, which executes no tests
+			// but still needs `go list -m` to resolve a profile's module
+			// paths.
+			detected, err := detect.Ecosystems(dir, cfg.AllExcludes())
+			if err != nil {
+				return err
+			}
+			ecosystems := enabledEcosystems(detected, cfg)
+			if err := ensureToolchains(ctx, cmd, dir, cfg, ecosystems); err != nil {
+				return err
+			}
+
+			current, sources, cleanup, err := coverage.Compute(ctx, dir, cfg, source, reports, patchWanted)
 			defer cleanup()
 			if err != nil {
 				return err
 			}
 			// A partially-measured current tree is just as invisible as an
 			// unmeasured one: the language simply doesn't appear in the report.
-			detected, err := detect.Ecosystems(dir, cfg.AllExcludes())
-			if err != nil {
-				return err
-			}
-			ecosystems := enabledEcosystems(detected, cfg)
 			if err := warnUnmeasured(cmd, ecosystems, current, "the current tree"); err != nil {
 				return err
 			}
@@ -88,8 +99,9 @@ func newCoverageCmd() *cobra.Command {
 			//
 			// This is what makes the gate work at all for a repo whose coverage
 			// comes from a multi-job pipeline rather than from bulwark running the
-			// tests itself (exactly the case --tests=skip exists to serve). Such a
-			// repo can never recompute a historical baseline: computeBaselineAt's
+			// tests itself (exactly the case `coverage.source: report` exists to
+			// serve). Such a repo can never recompute a historical baseline:
+			// computeBaselineAt's
 			// throwaway worktree is a bare checkout with none of the toolchain or
 			// staged reports the pipeline provides, so it measures nothing. wardnet
 			// hit precisely that — and the numbers it failed to reconstruct in a
@@ -98,8 +110,8 @@ func newCoverageCmd() *cobra.Command {
 			// re-run, no cargo-llvm-cov, no yarn — they are already in hand.
 			//
 			// A main run that measured NOTHING (a docs-only merge: every
-			// coverage producer path-filtered away, no reports for
-			// --tests=skip to read) still records — the carry-forward fills
+			// coverage producer path-filtered away, no reports for a
+			// report-sourced repo to read) still records — the carry-forward fills
 			// every detected language from the nearest prior baseline. The
 			// old early-return here left such a commit with no baseline at
 			// all, so the first PR against it recomputed nothing, reported
@@ -112,7 +124,7 @@ func newCoverageCmd() *cobra.Command {
 					return err
 				}
 				if len(record) == 0 {
-					return printNoCoverage(cmd, mode)
+					return printNoCoverage(cmd, source)
 				}
 				if err := gitstate.WriteBaseline(ctx, dir, sha, record); err != nil {
 					// Best-effort, as everywhere else: a write race with a concurrent
@@ -129,7 +141,7 @@ func newCoverageCmd() *cobra.Command {
 			}
 
 			if len(current) == 0 {
-				return printNoCoverage(cmd, mode)
+				return printNoCoverage(cmd, source)
 			}
 			if shaErr != nil {
 				return shaErr
@@ -188,29 +200,108 @@ func newCoverageCmd() *cobra.Command {
 			return errors.Join(aggregateErr, patchErr)
 		},
 	}
+	// --dir stays a flag and cannot move into .bulwark.yml: the file lives AT
+	// the scan root, so bulwark has to know the root before it can read its
+	// own config. Everything else about coverage production now has a home in
+	// that file, and the flags below are the local-dev/one-off escape hatch.
 	cmd.Flags().StringVar(&dir, "dir", ".", "repository root")
-	cmd.Flags().StringVar(&testsMode, "tests", string(coverage.ModeRun),
-		`whether to execute tests ("run", the default — good for local dev) or only parse an
-existing report a prior CI step already produced ("skip" — use in CI once that step already
-runs with coverage instrumentation on, so tests aren't executed a second/third time)`)
+	cmd.Flags().StringVar(&sourceFlag, "source", "",
+		`who produces the coverage data: "run" (bulwark executes each ecosystem's test suite
+itself) or "report" (a prior CI job already produced one; bulwark only parses it). Defaults to
+coverage.source in .bulwark.yml, which is where this normally belongs — it's a property of how
+the repo's pipeline is built, not of one invocation. Falls back to "run" with no file.`)
+	cmd.Flags().StringVar(&testsMode, "tests", "",
+		`deprecated alias for --source: "run" maps to --source=run, "skip" to --source=report`)
+	if err := cmd.Flags().MarkDeprecated("tests", `use --source ("skip" is now "report"), or set coverage.source in .bulwark.yml`); err != nil {
+		panic(err) // only errors on a flag name that doesn't exist, which is a programming error
+	}
 	cmd.Flags().StringArrayVar(&goReport, "go-report", nil,
-		`path (relative to --dir) to an existing go coverage profile; only used with --tests=skip.
-Repeatable. A bare path applies only when exactly one Go module is discovered under --dir; for
-multiple modules, disambiguate with "<moduleDir>=<path>" (moduleDir relative to --dir), e.g.
+		`path (relative to --dir) to an existing go coverage profile; only used with --source=report.
+Overrides coverage.go.report in .bulwark.yml, which is the usual home for it. Repeatable. A bare
+path applies only when exactly one Go module is discovered under --dir; for multiple modules,
+disambiguate with "<moduleDir>=<path>" (moduleDir relative to --dir), e.g.
 --go-report wctl=coverage/wctl.out. Default per module: search coverage.out, cover.out, c.out
 relative to that module's directory`)
 	cmd.Flags().StringArrayVar(&rustReport, "rust-report", nil,
-		`path (relative to --dir) to an existing cargo-llvm-cov JSON export; only used with --tests=skip.
-Repeatable. A bare path applies only when exactly one Rust crate/workspace is discovered under --dir;
-for multiple crates, disambiguate with "<crateDir>=<path>" (crateDir relative to --dir), e.g.
+		`path (relative to --dir) to an existing cargo-llvm-cov JSON export; only used with --source=report.
+Overrides coverage.rust.report in .bulwark.yml. Repeatable. A bare path applies only when exactly one
+Rust crate/workspace is discovered under --dir; for multiple crates, disambiguate with
+"<crateDir>=<path>" (crateDir relative to --dir), e.g.
 --rust-report daemon=daemon/coverage/daemon-llvm-cov.json. Default per crate: search
 coverage/llvm-cov.json, llvm-cov.json, target/llvm-cov/llvm-cov.json relative to that crate's directory`)
 	cmd.Flags().StringArrayVar(&rustLCOVReport, "rust-lcov-report", nil,
 		`path (relative to --dir) to an existing cargo-llvm-cov lcov export, used for Rust patch coverage;
-only used with --tests=skip. Repeatable, same bare-vs-"<crateDir>=<path>" syntax as --rust-report.
+only used with --source=report. Overrides coverage.rust.lcov in .bulwark.yml. Repeatable, same
+bare-vs-"<crateDir>=<path>" syntax as --rust-report.
 Default per crate: search coverage/lcov.info, lcov.info, target/llvm-cov/lcov.info relative to that
 crate's directory`)
 	return cmd
+}
+
+// resolveSource settles who produces coverage for this invocation, in
+// descending precedence: --source, then the deprecated --tests, then
+// coverage.source in .bulwark.yml, which config.Default() already resolved to
+// SourceRun when the file is absent or silent.
+//
+// Both flags default to "" rather than to "run" so that "unset" is
+// distinguishable from "explicitly asked for run". With a "run" default the
+// flag would always be populated, always outrank the file, and
+// coverage.source would never once be consulted — the failure would be
+// silent, and it would look exactly like the config key not working.
+func resolveSource(cmd *cobra.Command, sourceFlag, testsMode string, fromFile config.Source) (coverage.Source, error) {
+	switch {
+	case sourceFlag != "":
+		source := coverage.Source(sourceFlag)
+		if source != coverage.SourceRun && source != coverage.SourceReport {
+			return "", fmt.Errorf("--source must be %q or %q, got %q", coverage.SourceRun, coverage.SourceReport, sourceFlag)
+		}
+		if testsMode != "" {
+			if _, err := fmt.Fprintln(cmd.ErrOrStderr(), "warning: both --source and the deprecated --tests were given; --source wins"); err != nil {
+				return "", err
+			}
+		}
+		return source, nil
+	case testsMode != "":
+		// The old vocabulary, kept working for anyone driving the binary
+		// directly. "skip" and "report" name the same behavior — never
+		// execute, only parse — from the two ends of the same decision.
+		switch testsMode {
+		case "run":
+			return coverage.SourceRun, nil
+		case "skip":
+			return coverage.SourceReport, nil
+		default:
+			return "", fmt.Errorf(`--tests must be "run" or "skip", got %q`, testsMode)
+		}
+	default:
+		// config.Load already rejected anything that isn't one of the two
+		// values, so this needs no second validation pass.
+		return coverage.Source(fromFile), nil
+	}
+}
+
+// resolveReports merges the report-path flags over .bulwark.yml's
+// coverage.{go,rust} sections. Precedence is per language and per kind, not
+// per key: passing --rust-report replaces the file's rust.report wholesale
+// rather than merging entry-by-entry into it. Merging would make a flag
+// unable to *remove* a stale keyed entry the file declares, so the override
+// could only ever add — and "the flag I passed didn't take effect" is a worse
+// failure than having to restate the handful of paths a repo has.
+func resolveReports(cfg config.Config, goReport, rustReport, rustLCOVReport []string) coverage.ReportPaths {
+	pick := func(flag []string, file config.Reports) coverage.ReportOverrides {
+		if len(flag) > 0 {
+			return parseReportOverrides(flag)
+		}
+		if len(file) == 0 {
+			return nil
+		}
+		return coverage.ReportOverrides(file)
+	}
+	return coverage.ReportPaths{
+		Go:       pick(goReport, cfg.Coverage.Go.Report),
+		Rust:     pick(rustReport, cfg.Coverage.Rust.Report),
+		RustLCOV: pick(rustLCOVReport, cfg.Coverage.Rust.LCOV),
+	}
 }
 
 // parseReportOverrides parses repeated --go-report/--rust-report/
@@ -237,14 +328,19 @@ func parseReportOverrides(values []string) coverage.ReportOverrides {
 
 // computeBaselineAt checks out origin/main at sha into a throwaway worktree
 // and computes coverage there, so a cache miss doesn't disturb the caller's
-// own working tree/branch. This always actually runs tests (coverage.ModeRun),
-// regardless of the top-level --tests flag: a historical commit's checkout
-// has no pre-existing CI-produced report to find — the report itself would
-// have to come from actually running the suite at that commit — so there is
-// no "skip" equivalent for baseline computation. This is a one-time cost per
-// main commit (cached afterward on the bulwark-state branch), not a
-// per-invocation cost, so it doesn't reintroduce the duplicate-test-run
-// problem --tests=skip exists to avoid.
+// own working tree/branch.
+//
+// This always actually runs tests (coverage.SourceRun), regardless of
+// coverage.source or --source: a historical commit's checkout has no
+// pre-existing CI-produced report to find — the report itself would have to
+// come from actually running the suite at that commit — so there is no
+// report-sourced equivalent for baseline computation. Passing the repo's own
+// coverage.source through here instead would hand every report-sourced repo
+// an empty baseline forever, which is the `{}` poisoning the caller then
+// refuses to cache; the gate would silently compare against nothing. This is
+// a one-time cost per main commit (cached afterward on the bulwark-state
+// branch), not a per-invocation cost, so it doesn't reintroduce the
+// duplicate-test-run problem `coverage.source: report` exists to avoid.
 func computeBaselineAt(ctx context.Context, cmd *cobra.Command, dir, sha string, cfg config.Config) (map[string]float64, error) {
 	tmp, err := os.MkdirTemp("", "bulwark-baseline-*")
 	if err != nil {
@@ -260,7 +356,7 @@ func computeBaselineAt(ctx context.Context, cmd *cobra.Command, dir, sha string,
 	// source — patch coverage always compares against the current tree's
 	// baseline lookup, never a baseline-of-a-baseline — so PatchWanted is the
 	// zero value here, and the resolved sources/cleanup are discarded.
-	report, _, cleanup, err := coverage.Compute(ctx, tmp, cfg, coverage.ModeRun, coverage.ReportPaths{}, coverage.PatchWanted{})
+	report, _, cleanup, err := coverage.Compute(ctx, tmp, cfg, coverage.SourceRun, coverage.ReportPaths{}, coverage.PatchWanted{})
 	defer cleanup()
 	if err != nil {
 		return nil, err
@@ -728,10 +824,10 @@ func diffReport(cmd *cobra.Command, current, baseline map[string]float64, tolera
 // printNoCoverage reports a run that measured nothing and — on main — had no
 // prior baseline entries to carry forward either: there is nothing to gate
 // and nothing worth recording.
-func printNoCoverage(cmd *cobra.Command, mode coverage.Mode) error {
+func printNoCoverage(cmd *cobra.Command, source coverage.Source) error {
 	msg := "no coverage measured — no coverage tooling detected/available for any ecosystem"
-	if mode == coverage.ModeSkip {
-		msg += " (--tests=skip only reads an existing report — did an earlier CI step produce one at the expected path?)"
+	if source == coverage.SourceReport {
+		msg += " (coverage.source is \"report\", which only reads an existing report — did an earlier CI job produce one at the expected path?)"
 	}
 	_, err := fmt.Fprintln(cmd.OutOrStdout(), msg)
 	return err

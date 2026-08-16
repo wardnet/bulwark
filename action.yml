@@ -6,7 +6,10 @@ inputs:
     description: bulwark version to install (omit or set to "latest" for the latest release)
     default: latest
   dir:
-    description: directory to scan (passed to bulwark's --dir)
+    description: >
+      directory to scan (passed to bulwark's --dir). This stays an input and
+      cannot move into .bulwark.yml: that file lives AT the scan root, so
+      bulwark has to be told the root before it can read its own config.
     default: "."
   run-scan:
     description: >
@@ -22,29 +25,24 @@ inputs:
       baselines on the bulwark-state branch — a failure to cache is non-fatal (best-effort), but a
       failure to even diff coverage is not.
     default: "true"
-  tests-mode:
-    description: >
-      passed through to `bulwark coverage --tests=`. "run" (default) has bulwark execute each
-      ecosystem's test suite itself — the right choice if this action is the only place tests run.
-      "skip" only parses a report an earlier step in the same job already produced (see go-report/
-      rust-report below) — use this if a separate test step already runs with coverage
-      instrumentation on, so tests aren't executed a second time.
-    default: run
-  go-report:
-    description: >
-      path (relative to dir) to an existing Go coverage profile; only used with tests-mode=skip.
-      Newline-separated for a repo with more than one Go module, one "<moduleDir>=<path>" per line
-      (moduleDir relative to dir). Usually unnecessary: each discovered module's own
-      coverage.out/cover.out/c.out is found without a flag.
-    default: ""
-  rust-report:
-    description: path (relative to dir) to an existing cargo-llvm-cov JSON export; only used with tests-mode=skip
-    default: ""
-  rust-lcov-report:
-    description: >
-      path (relative to dir) to an existing cargo-llvm-cov lcov export, used for Rust patch
-      coverage; only used with tests-mode=skip
-    default: ""
+  # Removed in favour of .bulwark.yml at the scan root: tests-mode, go-report,
+  # rust-report, rust-lcov-report. Who produces coverage is a property of how
+  # a repo's pipeline is built — the same answer for every workflow that calls
+  # this action — so it belongs in the repo's own config file, not restated at
+  # each call site. The replacements are:
+  #
+  #   coverage:
+  #     source: report        # was tests-mode: skip ("run" is still the default)
+  #     go:
+  #       report: coverage.out
+  #     rust:
+  #       report: coverage/llvm-cov.json
+  #       lcov: coverage/lcov.info
+  #
+  # Each report key also accepts a mapping of unit dir to path for a repo with
+  # more than one Go module or Rust crate, which is what the newline-separated
+  # "<dir>=<path>" input encoding was straining to express. Most repos need
+  # neither: the conventional per-unit paths are searched without configuration.
   semgrep-app-token:
     description: >
       Semgrep AppSec Platform token. When set, bulwark's Semgrep check runs `semgrep ci` instead
@@ -113,29 +111,17 @@ runs:
       shell: bash
       env:
         DIR: ${{ inputs.dir }}
-        TESTS_MODE: ${{ inputs.tests-mode }}
-        GO_REPORT: ${{ inputs.go-report }}
-        RUST_REPORT: ${{ inputs.rust-report }}
-        RUST_LCOV_REPORT: ${{ inputs.rust-lcov-report }}
       run: |
         set +e
-        args=(coverage --dir "$DIR" --tests="$TESTS_MODE")
-        # These flags are repeatable — one per discovered crate/module — but a
-        # composite-action input is a single string, so each is read as
-        # newline-separated values. That lets a multi-module repo pass one
-        # "<dir>=<path>" per line; a single-line value behaves as before.
-        add_reports() {
-          local flag="$1" line
-          while IFS= read -r line; do
-            line="${line#"${line%%[![:space:]]*}"}"
-            line="${line%"${line##*[![:space:]]}"}"
-            [[ -n "$line" ]] && args+=("$flag" "$line")
-          done <<< "$2"
-        }
-        add_reports --go-report "$GO_REPORT"
-        add_reports --rust-report "$RUST_REPORT"
-        add_reports --rust-lcov-report "$RUST_LCOV_REPORT"
-        bulwark "${args[@]}" 2>&1 | tee "${RUNNER_TEMP}/bulwark-coverage-output.txt"
+        # No coverage-production flags here by design. bulwark reads
+        # .bulwark.yml from "$DIR" itself — who produces coverage
+        # (coverage.source) and where its reports live (coverage.go.report,
+        # coverage.rust.{report,lcov}) all come from there. The action used to
+        # re-encode those as inputs and splice them back into flags, which
+        # meant a repo's coverage wiring was split across two files and the
+        # multi-crate case could only be expressed as newline-separated
+        # "<dir>=<path>" strings.
+        bulwark coverage --dir "$DIR" 2>&1 | tee "${RUNNER_TEMP}/bulwark-coverage-output.txt"
         echo "exit-code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 
     - name: Upload coverage to Codecov

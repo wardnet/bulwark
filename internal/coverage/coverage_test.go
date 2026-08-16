@@ -124,6 +124,32 @@ func TestFindReportOverrideMissing(t *testing.T) {
 	}
 }
 
+// An empty override must be a miss, not a path. Joining "" onto dir yields
+// the scan root directory, and a bare os.Stat accepts a directory — so the
+// lookup would answer "found" with something no parser can read, instead of
+// missing or falling back to the conventional candidates. `report: ""` in
+// .bulwark.yml and `--go-report ""` both produce it.
+func TestFindReportEmptyOverrideIsAMissNotTheScanRoot(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "coverage.out", "mode: set\n")
+
+	got, ok := findReportForUnit(dir, dir, "", ReportOverrides{"": ""}, true, []string{"coverage.out"})
+	if ok {
+		t.Fatalf("findReportForUnit with an empty override = (%q, true), want a miss", got)
+	}
+}
+
+// The same guard, for an override naming a directory that happens to exist.
+func TestFindReportDirectoryOverrideIsAMiss(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "coverage"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := findReportForUnit(dir, dir, "", ReportOverrides{"": "coverage"}, true, nil); ok {
+		t.Fatal("a directory was accepted as a coverage report")
+	}
+}
+
 func TestFindReportCandidateSearchOrder(t *testing.T) {
 	dir := t.TempDir()
 	write(t, dir, "cover.out", "mode: set\n")
@@ -141,19 +167,26 @@ func TestFindReportNoCandidatesExist(t *testing.T) {
 	}
 }
 
-// TestGoCoverageModeSkipDoesNotRunTests guards ModeSkip's core promise: it
-// must parse an existing profile without ever invoking `go test`. A fixture
-// Go module with a deliberately failing test proves this — if goCoverage
-// under ModeSkip ran the tests, the run would fail/hang and this test would
-// fail with it; instead it should cleanly read the pre-existing profile.
-func TestGoCoverageModeSkipDoesNotRunTests(t *testing.T) {
+// TestGoCoverageSourceReportDoesNotRunTests guards SourceReport's core
+// promise: it must parse an existing profile without ever invoking `go test`.
+// A fixture Go module with a deliberately failing test proves this — if
+// goCoverage under SourceReport ran the tests, the run would fail/hang and
+// this test would fail with it; instead it should cleanly read the
+// pre-existing profile.
+//
+// This is the same guarantee the old TestGoCoverageModeSkipDoesNotRunTests
+// held, under the renamed axis. Renaming "skip the tests" to "a report is the
+// source" changes who the setting is addressed to, not what bulwark does with
+// it: the never-execute promise is what makes a report-sourced repo's CI
+// budget predictable, so it survives the rename verbatim.
+func TestGoCoverageSourceReportDoesNotRunTests(t *testing.T) {
 	dir := t.TempDir()
 	write(t, dir, "go.mod", "module fixture\n\ngo 1.26\n")
 	write(t, dir, "main.go", "package fixture\n\nfunc Foo() {}\n")
-	write(t, dir, "main_test.go", "package fixture\n\nimport \"testing\"\n\nfunc TestFails(t *testing.T) { t.Fatal(\"this test must never run under ModeSkip\") }\n")
+	write(t, dir, "main_test.go", "package fixture\n\nimport \"testing\"\n\nfunc TestFails(t *testing.T) { t.Fatal(\"this test must never run under SourceReport\") }\n")
 	write(t, dir, "coverage.out", "mode: set\nfixture/main.go:3.13,3.16 1 1\n")
 
-	pct, _, ok := goCoverage(context.Background(), dir, "", ModeSkip, nil, nil)
+	pct, _, ok := goCoverage(context.Background(), dir, "", SourceReport, nil, nil)
 	if !ok {
 		t.Fatal("expected goCoverage to succeed by parsing the existing coverage.out")
 	}
@@ -187,7 +220,7 @@ func TestGoCoverageDiscoversEveryModuleUnderDir(t *testing.T) {
 	writeNested(t, dir, filepath.Join("sdk", "wardnet-go", "coverage.out"),
 		"mode: set\nwardnet.network/go/api.go:3.13,3.16 1 0\n")
 
-	pct, profiles, ok := goCoverage(context.Background(), dir, "", ModeSkip, nil, nil)
+	pct, profiles, ok := goCoverage(context.Background(), dir, "", SourceReport, nil, nil)
 	if !ok {
 		t.Fatal("goCoverage found no measurable Go module under a dir holding two")
 	}

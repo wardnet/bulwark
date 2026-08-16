@@ -23,7 +23,8 @@ go run github.com/goreleaser/goreleaser/v2@latest release --snapshot --clean
 ```
 cmd/bulwark/                    # the bulwark CLI (scan, coverage, version, update)
 internal/detect/                # ecosystem + TS-package detection (walks for Cargo.toml/package.json/go.mod)
-internal/config/                # .bulwark.yml loading (opt-out only — see Configuration below)
+internal/config/                # .bulwark.yml loading (opt-outs + pipeline shape — see Configuration below)
+internal/toolchain/             # ensures the Go/Rust/Node runtime each detected ecosystem needs (see Toolchains below)
 internal/rust/                  # clippy, cargo-audit, cargo-deny
 internal/typescript/            # self-contained pinned ESLint + eslint-plugin-security
 internal/golang/                # gosec, govulncheck (installed into a version-keyed GOBIN dir)
@@ -63,7 +64,7 @@ every other command). `bulwark coverage` has been verified end-to-end against th
 only job that exercises the actual scan/report path end-to-end against a real repo, and it already
 caught a real bug once (see the git history around the `go-version: "1.26.5"` pin below).
 
-**Pin the exact Go patch version in workflows (`"1.26.5"`), never a bare minor (`"1.26"`).**
+**Pin the exact Go patch version in workflows (currently `"1.26.6"`), never a bare minor (`"1.26"`).**
 `actions/setup-go`'s `go-version: "1.26"` resolves to whatever `1.26.x` patch it has
 cached/available, which is not necessarily the version this repo's `go.mod` `toolchain` directive
 pins — and critically, `go install`-ing an *external* tool (gosec, govulncheck) does **not** consult
@@ -73,13 +74,27 @@ failed in CI (setup-go had installed an older, vulnerable patch) until `go-versi
 exact `1.26.5`. If `go.mod`'s `toolchain` line is ever bumped, update every `go-version:` in
 `ci.yml`/`release.yml` to match in the same change.
 
+`internal/toolchain` (see Toolchains below) now also sets `GOTOOLCHAIN` from the scanned repo's own
+`go.mod` before running any Go tooling, which fixes this class of drift for **consumers** — they no
+longer need to pin `go-version` on bulwark's account. Keep the pins here regardless: this repo's
+`lint` and `build & test` jobs invoke `go` directly rather than through bulwark, so nothing in that
+mechanism covers them, and `self-scan` benefits from the pin holding independently of the feature
+it is dogfooding.
+
 ## Configuration
 
-`.bulwark.yml` at the scan root is optional and purely **opt-out** — its job is narrowing what
-bulwark's zero-config default already does (scan everything detected, every check enabled), plus
-one numeric knob (`coverage.tolerance`), not tuning severity or suppressing individual findings (that's what a fix-up pass + inline
-`#nosec`/`nosemgrep` annotations in the scanned repo are for). See `internal/config/config.go` for
-the full schema; shape:
+`.bulwark.yml` at the scan root is optional and carries all the config. It does two things, and
+tuning severity or suppressing individual findings is neither of them (that's what a fix-up pass +
+inline `#nosec`/`nosemgrep` annotations in the scanned repo are for):
+
+- **Opt out** of what bulwark's zero-config default already does (scan everything detected, every
+  check enabled), plus the numeric gate knobs (`coverage.tolerance`, `coverage.patch.tolerance`).
+- **Describe the repo's pipeline** — `coverage.source` and the `coverage.{go,rust}` report paths.
+  These narrow nothing; they state a fact about how the repo is built. That fact is the same for
+  every invocation in that repo, which is exactly why it belongs in a file at the scan root rather
+  than in a flag or action input each caller has to remember to repeat identically.
+
+See `internal/config/config.go` for the full schema; shape:
 
 ```yaml
 rust:
@@ -96,7 +111,34 @@ go:
 semgrep:
   enabled: true
   config: auto           # override to a custom registry ref/path if needed
+toolchain:
+  enabled: true          # set false to keep the diagnostics but never download/install
+                          # (air-gapped runners, or images that preprovision everything)
+  # go/rust/node: deliberately unset. The versions come from the repo's own
+  # manifests — see Toolchains below. These keys exist only as a local override.
 coverage:
+  source: run            # who produces the coverage data. "run" (default) has bulwark execute each
+                          # ecosystem's test suite itself; "report" has it never execute anything and
+                          # only parse what a prior CI job already wrote. Not "run tests or not" —
+                          # that describes bulwark's behavior; this names which side of the pipeline
+                          # owns coverage production. Anything else is rejected, never silently
+                          # treated as "run" (see the section below).
+  go:
+    report: coverage.out # only read under source: report, and usually unnecessary — each discovered
+                          # module's own coverage.out/cover.out/c.out is found without it. A bare
+                          # path applies when exactly one module is discovered; a repo with several
+                          # uses a mapping instead:
+                          #   report:
+                          #     wctl: coverage/wctl.out
+                          #     sdk/wardnet-go: coverage/sdk.out
+  rust:
+    report: coverage/llvm-cov.json  # the cargo-llvm-cov JSON export — the aggregate percentage
+    lcov: coverage/lcov.info        # the lcov export — patch coverage's per-line data. Two paths
+                                     # because the JSON export has no per-line data at all. Same
+                                     # bare-or-mapping shape as go.report, keyed by crate dir.
+                                     # There is deliberately no `typescript:` here: Istanbul/Vitest
+                                     # write coverage/{coverage-summary.json,lcov.info} by fixed
+                                     # convention, so there has never been anything to override.
   tolerance: 0.1         # pp a language's aggregate coverage may dip below its baseline before
                           # the gate fails; absorbs sub-tenth measurement noise ("86.1% vs
                           # baseline 86.1%, regressed 0.0%"). Compared at display precision
@@ -110,6 +152,111 @@ coverage:
 Omitting the file, or omitting a section/key within it, keeps that value at its default — see
 `internal/config/config_test.go` for the exact merge semantics.
 
+## Toolchains
+
+bulwark provisions every tool it *runs* — gosec/govulncheck via `go install` into a version-keyed
+cache, cargo-audit/cargo-deny via `cargo install`, ESLint via npm, Semgrep via pipx — under the
+"pin the exact toolchain, don't reuse ambient installs" principle in `internal/golang`. The one
+thing it long did *not* provision was the language toolchain it does that provisioning **with**:
+`go`, `cargo` and `node` were simply assumed to be on PATH. `internal/toolchain` closes that.
+
+Nothing was visibly broken before, and that matters for judging changes here: on a GitHub-hosted
+runner Go is preinstalled and Go 1.21+ fetches whatever `go.mod` asks for, so the assumption held.
+It was a robustness and determinism gap, not an outage — a self-hosted or container runner without
+Go fails at `go install`, the version used is whatever the image ships rather than what the repo
+declares, and with no shared module cache every run re-downloads.
+
+**Versions come from the repo's own manifests, never from `.bulwark.yml`.**
+
+| Ecosystem | Version source |
+|---|---|
+| Go | the `go` and `toolchain` directives in **every** discovered `go.mod`, highest wins |
+| Rust | `channel` in `rust-toolchain.toml`, else the legacy bare `rust-toolchain`, per discovered crate |
+| TypeScript | `engines.node` in each detected package's `package.json`, else `.nvmrc` (package, then scan root) |
+
+Those files are already authoritative and already enforced by the language's own tooling, so a
+second copy in bulwark's config could only agree redundantly or drift silently — and a stale
+duplicate is worse than none, because it reads as authoritative. `toolchain.{go,rust,node}` in
+`.bulwark.yml` exist purely as a deliberate local **override**, which is a different thing from a
+parallel source of truth. `toolchain.enabled: false` keeps the diagnostics and skips the
+downloads.
+
+**An ambient toolchain that already satisfies the declared version is used as-is.** Downloading
+something already present and correct is pure cost, and on the runners bulwark actually runs on
+that is the common case — so the common path does no network I/O at all. `internal/toolchain`'s
+`satisfied` is the single predicate for that decision; an unpinned requirement (a `stable` rust
+channel, an `lts/*` .nvmrc, no declaration at all) is satisfied by anything present, since the repo
+named no floor to be below. A toolchain that won't identify itself is treated as too old, because
+it cannot be *shown* to satisfy a pin.
+
+Each ecosystem provisions differently, and only one of the three downloads anything:
+
+- **Go** delegates to `GOTOOLCHAIN`. Any Go 1.21+ can fetch another toolchain itself, through the
+  module proxy and verified against Go's checksum database — better provenance than bulwark could
+  hand-roll — so bulwark just names the version. Only with no Go at all, or one older than 1.21,
+  does it download a tarball from `go.dev`, taking the SHA-256 from the release index.
+  **Go is pinned even when the ambient toolchain already satisfies the declaration** — the one
+  ecosystem where "satisfied" is not the same as "nothing to do". `GOTOOLCHAIN`'s default (`auto`)
+  does not only *upgrade*: `go install <tool>@<version>` run outside a module, which
+  `internal/golang` does to fetch gosec and govulncheck, makes the go command consult that
+  **tool's** own `go.mod` and switch to whatever minimum it declares. `golang.org/x/vuln@v1.6.0`
+  declares `go >= 1.25.0`, so an `auto` runner with Go 1.26 installed builds govulncheck with
+  go1.25 — and a govulncheck built by an older Go rejects newer source outright. That is the exact
+  failure recorded under CI above, and it reproduces on a runner whose ambient toolchain is
+  perfectly correct. `pinAmbientGo` therefore sets `GOTOOLCHAIN=local` in that case.
+  `local`, not the declared version: the declaration is a *minimum*, so a `go 1.26` directive
+  resolves to `go1.26.0` and pinning it would downgrade a runner already on 1.26.6 — backwards,
+  when the newer patch is the one carrying the security fix. bulwark's own `ci.yml` sets
+  `GOTOOLCHAIN: local` by hand for exactly this reason; consumers now get it automatically.
+  The probe reads the ambient version with `GOTOOLCHAIN=local` set for the same reason: `go
+  version` inside a module honours that module's `toolchain` directive and reports the version it
+  would switch *to*, which is not the one `local` would then select — measure and pin have to come
+  from the same place, or bulwark concludes "ambient is fine" and lands on an older toolchain than
+  it just measured.
+- **Rust** delegates to rustup, which already reads the same `rust-toolchain.toml` bulwark does.
+  This extends rather than contradicts `internal/rust`'s existing stance that the toolchain version
+  "is the target repo's responsibility via its own rust-toolchain.toml". What it adds is
+  materialising the channel up front with the `clippy` and `rustfmt` components the checks need —
+  rustup would otherwise install it lazily in the middle of `cargo clippy`, where a missing
+  component reads as a check failure rather than a setup step. With no rustup at all, bulwark says
+  so and continues rather than installing rustup behind the user's back.
+  Installing is not selecting, and the two come apart in exactly one case. rustup picks a toolchain
+  by reading `rust-toolchain.toml` from the directory cargo runs in, which covers the normal case
+  for free — `internal/rust` and `internal/coverage` both run cargo inside the crate directory, so
+  the file bulwark read is the file rustup reads. A version supplied by `toolchain.rust` in
+  `.bulwark.yml` has no such file, so rustup cannot see it and would install the requested channel
+  and then go on running the old default. `Requirement.Overridden` marks that case and
+  `provisionRust` sets `RUSTUP_TOOLCHAIN` **only** then: applying it whenever a channel came from a
+  manifest would override rustup's own per-crate selection — the thing `internal/rust` says not to
+  second-guess — and would break a monorepo whose crates pin different channels.
+- **Node** is the only one bulwark downloads and unpacks itself, from `nodejs.org`, with the digest
+  read from that release's `SHASUMS256.txt`. There is no assumable equivalent of GOTOOLCHAIN or
+  rustup — nvm/fnm/volta are all optional and mutually exclusive. The `.tar.gz` is taken over the
+  `.tar.xz` purely because Go's standard library decompresses gzip and not xz.
+
+**Provisioning failures warn; they do not fail the scan.** This step is preparation, not a gate,
+and falling through to "whatever is on PATH" is exactly today's behavior — turning a working scan
+into a hard failure over a network blip would be a regression, and if the toolchain really is
+absent the next step fails loudly and specifically. What must not happen is failing *silently*, so
+every reuse, substitution, skip and failure is named on stderr. Stderr, not stdout, deliberately:
+`action.yml`'s PR-comment builder scrapes bracketed tags from coverage stdout with a pattern that
+is **not** line-anchored, so unrelated chatter on stdout would end up in the PR comment.
+
+**Doing this in bulwark rather than in each caller's CI is the point.** gt briefly grew a
+`setup-go` step in its bulwark stage (`19e4b77`, reverted in `a0ed107`) and it was wrong twice
+over: it looked for `go.mod` at exactly one path, so wardnet — whose modules live under `wctl/` and
+`sdk/wardnet-go/`, not the scan root — would silently have got nothing, and it put knowledge of Go
+toolchains into gt, which would then have needed the same for Rust and TypeScript forever. bulwark
+already knows which ecosystems it detected and where, so it reads every manifest under the scan
+root; and it is the only place that helps wardnet at all, since wardnet calls `wardnet/bulwark@v1`
+directly rather than through gt. See [ADR 0004](docs/adr/0004-ensure-language-toolchains.md).
+
+Downloads land in the same version-keyed `~/.cache/bulwark` layout every other bulwark-managed
+install already uses, so a consumer caching that one path (as wardnet's workflow already does)
+covers language toolchains too with no key change. Installs stage into a sibling temp directory and
+are renamed into place, so an interrupted download can never leave a half-populated toolchain that
+the next run mistakes for a complete one.
+
 ## Coverage
 
 `bulwark coverage` diffs the current branch's per-language coverage against a lazily-computed,
@@ -121,7 +268,7 @@ generated cache data, not source, needs no PR/review and never pollutes main's h
   *is* the baseline — so `cmd/bulwark/coverage.go` writes what it just measured to `bulwark-state`
   and stops. This is the *primary* way baselines get created, and the only one that works for a repo
   whose coverage is produced by a multi-job CI pipeline rather than by bulwark running the tests
-  itself (precisely what `--tests=skip` exists to serve): such a repo can never *re*compute a
+  itself (precisely what `coverage.source: report` exists to serve): such a repo can never *re*compute a
   historical baseline, because `computeBaselineAt`'s throwaway worktree is a bare checkout with none
   of the toolchain (`cargo-llvm-cov`, yarn/Node) or staged reports the pipeline provides — it
   measures nothing. wardnet ran that way for months: the numbers it kept failing to reconstruct in a
@@ -146,7 +293,7 @@ generated cache data, not source, needs no PR/review and never pollutes main's h
   measure it" carries forward. The `recorded coverage baseline` line names anything carried, and an
   unmeasured language *no* prior had is named in a stderr warning (shallow history is the usual
   culprit) instead of vanishing silently. This applies even when a main run measures **nothing**
-  (a docs-only merge: every producer path-filtered away, no reports for `--tests=skip` to read) —
+  (a docs-only merge: every producer path-filtered away, no reports for a report-sourced repo to read) —
   the whole baseline is carried rather than skipping the record, because a main commit with no
   baseline forces every PR against it into the recompute-nothing → all-`[NEW]` → gate-on-nothing
   hole (wardnet/wardnet#899). "No coverage measured" is only printed when there was truly nothing
@@ -177,14 +324,16 @@ generated cache data, not source, needs no PR/review and never pollutes main's h
   discovers every independent Cargo crate/workspace root under `--dir` (deduping a workspace
   member's own `Cargo.toml` under its ancestor workspace root), and both `internal/rust.Check` and
   `internal/coverage.rustCoverage` iterate every discovered root, averaging coverage across them the
-  same way TypeScript averages across packages. `--rust-report`/`--rust-lcov-report` are therefore
-  repeatable, keyed flags (`--rust-report <crateDir>=<path>`, crateDir relative to `--dir`) rather
-  than a single path — a bare value (no `=`) is only honored when discovery finds exactly one crate,
-  preserving the original single-crate invocation unchanged.
+  same way TypeScript averages across packages. Rust's report overrides are therefore keyed by
+  crate directory (relative to `--dir`) rather than a single path — `coverage.rust.report` and
+  `coverage.rust.lcov` accept a mapping of crate dir to path, and the `--rust-report`/
+  `--rust-lcov-report` flags are repeatable with the same `<crateDir>=<path>` syntax. A bare value
+  (a scalar in the file, or no `=` on the flag) is only honored when discovery finds exactly one
+  crate, preserving the original single-crate invocation unchanged.
 - Go never assumes `--dir` itself is a module root either, for the same reason and by the same
   shape (see [ADR 0002](docs/adr/0002-go-multi-module-coverage.md)) — `internal/detect.GoModuleDirs`
   discovers every module under `--dir` and `internal/coverage.goCoverage` measures each in turn,
-  averaging across them. `--go-report` is likewise repeatable and keyed
+  averaging across them. `coverage.go.report` and `--go-report` are likewise keyed by module dir
   (`--go-report <moduleDir>=<path>`). This one bit for real: `go test`, `go list -m` and `go tool
   cover -func` are all module-scoped, so running them at a monorepo root measured *nothing* — and
   said so only in a warning, leaving Go absent from wardnet's gate, aggregate and patch both, while
@@ -202,7 +351,7 @@ generated cache data, not source, needs no PR/review and never pollutes main's h
   omits any language whose tooling it can't run (deliberate — a repo with no coverage tooling
   shouldn't hard fail). But baseline computation runs in a *bare worktree*: no `node_modules`, no
   CI-staged report, only whatever tooling the runner happens to have. `internal/coverage.rustCoverage`
-  in `ModeRun` requires `cargo-llvm-cov` on `PATH` and bulwark does **not** install it (unlike
+  under `SourceRun` requires `cargo-llvm-cov` on `PATH` and bulwark does **not** install it (unlike
   cargo-audit/cargo-deny/gosec/semgrep, which it pins and installs itself) — so on a runner without
   it, the baseline computes to `{}`. Cached, that `{}` is indistinguishable from a real entry: every
   later PR gets a cache *hit*, every language reports `[NEW]`, and the gate enforces **nothing**,
@@ -225,39 +374,67 @@ generated cache data, not source, needs no PR/review and never pollutes main's h
   (wardnet/wardnet#892 showed a Rust-only PR as "typescript: no longer measured" when the TS code
   was untouched — only the frontend coverage job had been skipped). Neither fails on its own.
 
-### `--tests=run` vs `--tests=skip`
+### `coverage.source`: who produces the coverage
 
 Unlike Codecov or Sonar — which never execute your tests, only ingest a coverage report your build
-already produced — `bulwark coverage`'s default (`--tests=run`) actually runs each ecosystem's test
-suite itself (`go test -coverprofile`, `cargo llvm-cov`, a package's `test:coverage` script). That's
-the right default for local dev (one command, no separate step to remember), but it's wrong for CI
-if a test job already runs with coverage instrumentation on — running tests again would duplicate
-work that may already be expensive (wardnet/wardnet-cloud's existing pipelines already run tests
-twice: once plain for pass/fail, once instrumented for coverage; `bulwark coverage` piling on a third
-run would make it worse, not better).
+already produced — `bulwark coverage`'s default (`coverage.source: run`) actually runs each
+ecosystem's test suite itself (`go test -coverprofile`, `cargo llvm-cov`, a package's
+`test:coverage` script). That's the right default for local dev (one command, no separate step to
+remember), but it's wrong for CI if a test job already runs with coverage instrumentation on —
+running tests again would duplicate work that may already be expensive (wardnet/wardnet-cloud's
+existing pipelines already run tests twice: once plain for pass/fail, once instrumented for
+coverage; `bulwark coverage` piling on a third run would make it worse, not better).
 
-`--tests=skip` fixes this: it never executes anything, only looks for a report file a prior step
-already produced — `internal/coverage.findReportForUnit` checks an explicit
-`--go-report`/`--rust-report` override first (keyed by the discovered module/crate directory it
-applies to), then a built-in candidate list resolved relative to that directory
+`coverage.source: report` fixes this: bulwark never executes anything, only looks for a report file
+a prior job already produced — `internal/coverage.findReportForUnit` checks an explicit override
+first (keyed by the discovered module/crate directory it applies to, from `coverage.go.report` /
+`coverage.rust.report` / `coverage.rust.lcov`, or the matching `--go-report`/`--rust-report`/
+`--rust-lcov-report` flag), then a built-in candidate list resolved relative to that directory
 (`coverage.out`/`cover.out`/`c.out` for Go;
 `coverage/llvm-cov.json`/`llvm-cov.json`/`target/llvm-cov/llvm-cov.json` for Rust — TypeScript has
 no override, since `coverage/coverage-summary.json` is already Istanbul's own fixed convention, not
 something projects vary). In CI, the intended shape is: the existing test job already produces
 coverage as a side effect of running tests once (e.g. `cargo llvm-cov nextest` *as* the test runner,
-not a second pass after a plain `cargo test`), and `bulwark coverage --tests=skip` runs afterward as
-a pure report-consumer.
+not a second pass after a plain `cargo test`), and `bulwark coverage` runs afterward as a pure
+report-consumer.
 
-One exception: computing a **baseline** at a historical main SHA (a cache miss) always uses
-`--tests=run` internally (`cmd/bulwark/coverage.go`'s `computeBaselineAt` hardcodes
-`coverage.ModeRun`), regardless of the top-level flag — a historical commit's throwaway checkout has
-no CI-produced report sitting in it, so there's nothing to skip to. This only costs a real test run
-once per main commit (cached afterward on `bulwark-state`), not once per PR, so it doesn't reintroduce
-the duplication `--tests=skip` exists to avoid.
+**The axis is named for who owns production, not for what bulwark skips.** The setting used to be
+`--tests=run|skip` (and a `tests-mode` action input), which described bulwark's own behavior and
+left the reader to infer the pipeline shape behind it. `run`/`report` names the decision the repo
+is actually making. The never-execute promise is unchanged and still guarded by
+`internal/coverage.TestGoCoverageSourceReportDoesNotRunTests`.
 
-TypeScript's `ModeRun` path also runs a one-time dependency install per workspace root before
+**Where it lives is the point** (see [ADR 0003](docs/adr/0003-coverage-source-in-config.md)).
+`coverage.source` is a property of how a repo's pipeline is built
+— one answer, true for every workflow in that repo — so it belongs in `.bulwark.yml` at the scan
+root, not restated at each call site. The composite action therefore has *no* input for it:
+`action.yml` passes only `--dir`, and `--dir` is the one thing that can't move into the file, since
+the file lives at the scan root and bulwark must know the root before it can read its own config.
+The CLI flags (`--source`, and `--go-report`/`--rust-report`/`--rust-lcov-report`) remain as a
+local-dev/one-off override that outranks the file; `--tests` survives as a deprecated alias mapping
+`skip` to `report`. `cmd/bulwark/coverage.go`'s `resolveSource` and `resolveReports` own that
+precedence. Both source flags default to `""`, not to `"run"` — with a `"run"` default the flag
+would always be populated, always outrank the file, and `coverage.source` would never once be
+consulted, a silent failure indistinguishable from the config key not working.
+
+**One exception, and it is a trap.** Computing a **baseline** at a historical main SHA (a cache
+miss) always uses `coverage.SourceRun` internally — `cmd/bulwark/coverage.go`'s `computeBaselineAt`
+hardcodes it and passes an empty `ReportPaths{}` — regardless of what `coverage.source` says. A
+historical commit's throwaway checkout has no CI-produced report sitting in it, so there is nothing
+to consume. This is why `internal/coverage.Compute` takes the source as a **parameter** and never
+reads `cfg.Coverage.Source` itself, even though it is already handed the config: a `Compute` that
+consulted the config directly would hand every report-sourced repo an empty baseline forever —
+exactly the `{}` poisoning the caller then refuses to cache, leaving the gate comparing against
+nothing, silently and permanently. Keeping the axis in the signature forces the one caller that
+must override it to say so out loud.
+`cmd/bulwark/TestComputeBaselineAtRunsTestsEvenWhenSourceIsReport` guards this directly, with a
+fixture whose only possible source of a coverage number is a test that actually ran. The real cost
+is one test run per main commit (cached afterward on `bulwark-state`), not once per PR, so it
+doesn't reintroduce the duplication `coverage.source: report` exists to avoid.
+
+TypeScript's `SourceRun` path also runs a one-time dependency install per workspace root before
 executing each package's `test:coverage` script — a fresh checkout (baseline computation's throwaway
-worktree, but also any other `ModeRun` invocation) has no `node_modules` a prior step could have
+worktree, but also any other `SourceRun` invocation) has no `node_modules` a prior step could have
 already installed. `internal/coverage.resolvePackageManager` auto-detects npm/yarn/pnpm from the
 root's lockfile (`package-lock.json`/`yarn.lock`/`pnpm-lock.yaml`); a root with more than one
 recognized lockfile is treated as ambiguous and install is skipped there rather than guessing a
@@ -340,13 +517,14 @@ shape:
   is needed (unlike Rust's), because the keys are already `--dir`-relative and cannot collide.
 - **Rust**: `cargo llvm-cov` doesn't emit per-line data in its `--json` export, so patch coverage
   additionally produces an `--lcov` report, per discovered crate/workspace root (see the Coverage
-  section above). Under `--tests=run`, this doesn't cost a second test execution: `cargo llvm-cov
+  section above). Under `SourceRun`, this doesn't cost a second test execution: `cargo llvm-cov
   --no-report` runs each crate's suite once and keeps raw profile data on disk, then both `--no-run
   --json` (aggregate, unchanged) and `--no-run --lcov` (patch, new) regenerate their reports from
-  that same profile. Under `--tests=skip`, the lcov file is another `findReportForCrate` lookup per
-  crate — an explicit `--rust-lcov-report <crateDir>=<path>` override, else a candidate list
+  that same profile. Under `SourceReport`, the lcov file is another `findReportForCrate` lookup per
+  crate — an explicit `coverage.rust.lcov` entry (or `--rust-lcov-report <crateDir>=<path>`), else a
+  candidate list
   (`coverage/lcov.info`, `lcov.info`, `target/llvm-cov/lcov.info`) resolved relative to that crate's
-  own directory, mirroring `--rust-report` exactly. `Compute`'s returned `PatchSources.RustLCOV` is
+  own directory, mirroring `coverage.rust.report` exactly. `Compute`'s returned `PatchSources.RustLCOV` is
   a `map[string]string` keyed by crate dir (like TypeScript's `TSLCOV`, not a single path) —
   `cmd/bulwark/coverage.go`'s `rustPatchPercent` resolves each crate's contribution independently,
   mirroring `tsPatchPercent`'s longest-prefix matching so two crates can't clobber each other's hit
