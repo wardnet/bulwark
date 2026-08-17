@@ -99,12 +99,18 @@ func TestCoverageOnMainRecordsFullyCarriedBaselineWhenNothingMeasured(t *testing
 	}
 
 	run(repo, "fetch", "origin", gitstate.BranchName)
-	r := executil.Run(ctx, repo, "git", "show", "origin/"+gitstate.BranchName+":"+c2+".json")
+	// Keyed by tree, not commit: the tree is what the coverage describes, and
+	// the identifier the commit shares with the pull request that produced it.
+	tree, err := gitstate.TreeSHA(ctx, repo, c2)
+	if err != nil {
+		t.Fatalf("resolve tree for %s: %v", c2, err)
+	}
+	r := executil.Run(ctx, repo, "git", "show", "origin/"+gitstate.BranchName+":"+tree+".json")
 	if !r.Ok() {
-		t.Fatalf("no baseline recorded for %s: %v\nstdout: %s\nstderr: %s", c2, r.Err, out.String(), errOut.String())
+		t.Fatalf("no baseline recorded for tree %s (commit %s): %v\nstdout: %s\nstderr: %s", tree, c2, r.Err, out.String(), errOut.String())
 	}
 	if !strings.Contains(r.Output, "93.8") {
-		t.Errorf("baseline for %s = %s, want typescript 93.8 carried from %s", c2, r.Output, c1)
+		t.Errorf("baseline for %s = %s, want typescript 93.8 carried from %s", tree, r.Output, c1)
 	}
 }
 
