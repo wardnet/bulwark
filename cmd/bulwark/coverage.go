@@ -126,10 +126,17 @@ func newCoverageCmd() *cobra.Command {
 				if len(record) == 0 {
 					return printNoCoverage(cmd, source)
 				}
-				if err := gitstate.WriteBaseline(ctx, dir, sha, record); err != nil {
+				// Keyed by tree. The commit is incidental; the tree is what the
+				// coverage describes, and it is the identifier this commit shares
+				// with the pull request that produced it.
+				key := sha
+				if t, err := gitstate.TreeSHA(ctx, dir, sha); err == nil {
+					key = t
+				}
+				if err := gitstate.WriteBaseline(ctx, dir, key, record); err != nil {
 					// Best-effort, as everywhere else: a write race with a concurrent
 					// main build must not fail the build.
-					_, printErr := fmt.Fprintf(cmd.ErrOrStderr(), "warning: failed to record coverage baseline for %s: %v\n", sha, err)
+					_, printErr := fmt.Fprintf(cmd.ErrOrStderr(), "warning: failed to record coverage baseline for %s: %v\n", key, err)
 					return printErr
 				}
 				note := ""
@@ -150,7 +157,16 @@ func newCoverageCmd() *cobra.Command {
 				return headErr
 			}
 
-			baseline, hit, err := gitstate.ReadBaseline(ctx, dir, sha)
+			// Tree first, commit second. The tree of the base commit is the tree
+			// some earlier pull request already measured and recorded — a squash
+			// merge lands the merged tree verbatim — so the number is usually
+			// already there. The SHA key is only for baselines written before
+			// this, so existing state keeps resolving.
+			baseTree, treeErr := gitstate.TreeSHA(ctx, dir, sha)
+			if treeErr != nil {
+				baseTree = ""
+			}
+			baseline, hit, err := gitstate.ReadBaseline(ctx, dir, baseTree, sha)
 			if err != nil {
 				return err
 			}
@@ -176,13 +192,43 @@ func newCoverageCmd() *cobra.Command {
 					if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "warning: computed no coverage at all for %s — not caching it as a baseline. The gate cannot compare against a baseline of nothing; fix the missing tooling above and it will recompute.\n", sha); err != nil {
 						return err
 					}
-				} else if err := gitstate.WriteBaseline(ctx, dir, sha, baseline); err != nil {
+				} else if err := gitstate.WriteBaseline(ctx, dir, firstNonEmpty(baseTree, sha), baseline); err != nil {
 					// Caching is otherwise best-effort: a write failure (worktree
 					// race, disk pressure, transient git error) must never fail this
 					// command outright — `current` and `baseline` are already
 					// computed, and diffReport below is what actually matters.
 					if _, printErr := fmt.Fprintf(cmd.ErrOrStderr(), "warning: failed to cache coverage baseline for %s: %v\n", sha, err); printErr != nil {
 						return printErr
+					}
+				}
+			}
+
+			// Record what this run measured, keyed by the tree it measured.
+			//
+			// On a pull request HEAD is refs/pull/N/merge, and a squash merge
+			// lands a commit with exactly that tree — verified on a real merge:
+			// the tree measured on the PR and the tree of the squash commit are
+			// the same object. So this IS the baseline for the commit this pull
+			// request is about to become, already measured, by the pipeline that
+			// knows how to measure it.
+			//
+			// Without this the number is thrown away and the next pull request
+			// falls back to computeBaselineAt, which measures a bare worktree
+			// with none of the toolchain or staged reports the pipeline provides
+			// — for a `coverage.source: report` repository that is the wrong
+			// number, or none at all.
+			//
+			// Best-effort, like every other write here: a failure must not fail
+			// the gate that is about to run.
+			if len(current) > 0 {
+				if headTree, err := gitstate.TreeSHA(ctx, dir, "HEAD"); err == nil {
+					if _, hit, _ := gitstate.ReadBaseline(ctx, dir, headTree); !hit {
+						if err := gitstate.WriteBaseline(ctx, dir, headTree, current); err != nil {
+							if _, printErr := fmt.Fprintf(cmd.ErrOrStderr(),
+								"warning: failed to record this tree's coverage for %s: %v\n", headTree, err); printErr != nil {
+								return printErr
+							}
+						}
 					}
 				}
 			}
@@ -341,6 +387,17 @@ func parseReportOverrides(values []string) coverage.ReportOverrides {
 // a one-time cost per main commit (cached afterward on the bulwark-state
 // branch), not a per-invocation cost, so it doesn't reintroduce the
 // duplicate-test-run problem `coverage.source: report` exists to avoid.
+// firstNonEmpty returns the first non-empty string, so a tree lookup that
+// failed falls back to the commit SHA rather than writing an empty key.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 func computeBaselineAt(ctx context.Context, cmd *cobra.Command, dir, sha string, cfg config.Config) (map[string]float64, error) {
 	tmp, err := os.MkdirTemp("", "bulwark-baseline-*")
 	if err != nil {

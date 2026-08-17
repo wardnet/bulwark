@@ -252,3 +252,131 @@ func TestWriteBaselineReportsAPushThatNeverLands(t *testing.T) {
 		t.Error("WriteBaseline returned nil even though the push was rejected and the baseline never landed")
 	}
 }
+
+// The property the whole tree-keying change rests on, tested directly rather
+// than assumed: a squash merge lands a commit whose tree is the merged tree the
+// pull request was built from. That is what lets a measurement taken on a pull
+// request serve as the baseline for the commit it becomes.
+//
+// Verified against a real merge before this was written — tumika#25's gate
+// recorded tree 783e0a44… and the squash commit that landed carried the same
+// tree object — but a repository is cheap to build here, and this keeps the
+// assumption honest if git's behaviour ever shifts.
+func TestSquashMergePreservesTheMergedTree(t *testing.T) {
+	ctx := context.Background()
+	run := func(dir string, args ...string) {
+		t.Helper()
+		if r := executil.Run(ctx, dir, "git", args...); !r.Ok() {
+			t.Fatalf("git %v: %v\n%s", args, r.Err, r.Output)
+		}
+	}
+
+	repo := t.TempDir()
+	run(repo, "init", "-b", "main", ".")
+	run(repo, "config", "user.email", "t@t")
+	run(repo, "config", "user.name", "t")
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run(repo, "add", "-A")
+	run(repo, "commit", "-m", "base")
+
+	run(repo, "checkout", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(repo, "b.txt"), []byte("change\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run(repo, "add", "-A")
+	run(repo, "commit", "-m", "one")
+	if err := os.WriteFile(filepath.Join(repo, "c.txt"), []byte("more\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run(repo, "add", "-A")
+	run(repo, "commit", "-m", "two")
+
+	// What GitHub builds for a pull request: refs/pull/N/merge, the merged
+	// result of the branch into its base.
+	run(repo, "checkout", "main")
+	run(repo, "merge", "--no-ff", "-m", "merge ref", "feature")
+	mergeTree, err := TreeSHA(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// What a squash merge lands: one commit on main carrying the same content.
+	run(repo, "reset", "--hard", "HEAD~1")
+	run(repo, "merge", "--squash", "feature")
+	run(repo, "commit", "-m", "squashed")
+	squashTree, err := TreeSHA(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if mergeTree != squashTree {
+		t.Fatalf("merge tree %s != squash tree %s — a pull request's measurement "+
+			"would not describe the commit it becomes, and tree-keyed baselines "+
+			"would silently never hit", mergeTree, squashTree)
+	}
+}
+
+// Tree keying exists so a measurement taken on a pull request is still there
+// when that tree becomes main. Read must therefore find an entry written under
+// the tree, and must still find pre-existing entries written under a commit
+// SHA — or every repository recomputes on the first run after the change.
+func TestReadBaselinePrefersTheTreeAndFallsBackToTheCommit(t *testing.T) {
+	ctx := context.Background()
+	run := func(dir string, args ...string) {
+		t.Helper()
+		if r := executil.Run(ctx, dir, "git", args...); !r.Ok() {
+			t.Fatalf("git %v: %v\n%s", args, r.Err, r.Output)
+		}
+	}
+
+	origin := t.TempDir()
+	run(origin, "init", "--bare", "-b", "main", ".")
+
+	repo := t.TempDir()
+	run(repo, "init", "-b", "main", ".")
+	run(repo, "config", "user.email", "t@t")
+	run(repo, "config", "user.name", "t")
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run(repo, "add", "-A")
+	run(repo, "commit", "-m", "c")
+	run(repo, "remote", "add", "origin", origin)
+	run(repo, "push", "-u", "origin", "main")
+
+	head, err := HeadSHA(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := TreeSHA(ctx, repo, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Only a commit-keyed entry, as written before this change.
+	if err := WriteBaseline(ctx, repo, head, map[string]float64{"go": 11}); err != nil {
+		t.Fatal(err)
+	}
+	got, hit, err := ReadBaseline(ctx, repo, tree, head)
+	if err != nil || !hit {
+		t.Fatalf("ReadBaseline(tree, commit) hit=%v err=%v, want the legacy commit entry found", hit, err)
+	}
+	if got["go"] != 11 {
+		t.Errorf("go = %v, want the commit-keyed 11", got["go"])
+	}
+
+	// Now a tree-keyed entry as well: it must win, because it is the one a
+	// pull request records and the one a later main commit shares.
+	if err := WriteBaseline(ctx, repo, tree, map[string]float64{"go": 77}); err != nil {
+		t.Fatal(err)
+	}
+	got, hit, err = ReadBaseline(ctx, repo, tree, head)
+	if err != nil || !hit {
+		t.Fatalf("ReadBaseline hit=%v err=%v, want the tree entry found", hit, err)
+	}
+	if got["go"] != 77 {
+		t.Errorf("go = %v, want the tree-keyed 77 to take precedence over the commit-keyed 11", got["go"])
+	}
+}

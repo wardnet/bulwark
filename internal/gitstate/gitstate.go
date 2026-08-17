@@ -1,6 +1,14 @@
 // Package gitstate stores and retrieves coverage baselines on a dedicated
-// `bulwark-state` branch, keyed by the main commit SHA they were computed
-// against. This is deliberately a branch, not a commit on main: it's
+// `bulwark-state` branch, keyed by the TREE they were computed against.
+//
+// The tree, not the commit, because coverage is a property of content and
+// because the tree is the one identifier a pull request shares with the commit
+// it becomes: GitHub builds a pull request as refs/pull/N/merge, and a squash
+// merge lands a commit carrying that same tree. Keyed by commit those two are
+// unrelated, so a number measured on a pull request — by the pipeline that
+// knows how to measure it — was thrown away, and the next pull request fell
+// back to recomputing it in a bare worktree. Commit-keyed entries are still
+// read, so state written before this keeps resolving. This is deliberately a branch, not a commit on main: it's
 // bot-owned generated cache data, not source, so it needs no PR/review
 // ceremony and never pollutes main's history. Lookups are lazy — there is no
 // "on merge to main" trigger; the first PR against a new main SHA computes
@@ -20,6 +28,23 @@ import (
 
 // BranchName is the dedicated branch coverage baselines live on.
 const BranchName = "bulwark-state"
+
+// TreeSHA resolves the tree a commit points at.
+//
+// Baselines are keyed by tree rather than by commit because the tree is what
+// coverage is actually a property of, and because it is the one identifier
+// shared by a pull request and the commit it becomes. GitHub builds a pull
+// request as refs/pull/N/merge — the merged result — and a squash merge lands a
+// commit with that same tree, so the number measured on the pull request is
+// already the number for the main commit it produces. Keyed by commit SHA those
+// two are unrelated, and the measurement is thrown away.
+func TreeSHA(ctx context.Context, dir, commit string) (string, error) {
+	r := executil.Run(ctx, dir, "git", "rev-parse", commit+"^{tree}")
+	if !r.Ok() {
+		return "", fmt.Errorf("git rev-parse %s^{tree}: %w", commit, r.Err)
+	}
+	return strings.TrimSpace(r.Output), nil
+}
 
 // HeadSHA resolves the commit currently checked out. `bulwark coverage`
 // compares it against BaseSHA to tell a PR run (HEAD is ahead of the
@@ -49,19 +74,34 @@ func BaseSHA(ctx context.Context, dir string) (string, error) {
 
 // ReadBaseline returns the cached report for sha, and false if none exists
 // yet (a cache miss, not an error — the caller computes and writes one).
-func ReadBaseline(ctx context.Context, dir, sha string) (map[string]float64, bool, error) {
+func ReadBaseline(ctx context.Context, dir string, keys ...string) (map[string]float64, bool, error) {
 	// A missing remote branch is the expected first-ever-run state, not an
 	// error: there's nothing to fetch yet.
 	if r := executil.Run(ctx, dir, "git", "fetch", "origin", BranchName); !r.Ok() {
 		return nil, false, nil
 	}
-	r := executil.Run(ctx, dir, "git", "show", "origin/"+BranchName+":"+sha+".json")
+	// Keys are tried in order: the tree first, then the commit SHA. The SHA is
+	// only a fallback for baselines written before keying moved to trees, so
+	// existing state keeps resolving instead of every repository recomputing on
+	// the first run after the change.
+	var r executil.Result
+	found := ""
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		r = executil.Run(ctx, dir, "git", "show", "origin/"+BranchName+":"+key+".json")
+		if r.Ok() {
+			found = key
+			break
+		}
+	}
 	if !r.Ok() {
 		return nil, false, nil
 	}
 	var report map[string]float64
 	if err := json.Unmarshal([]byte(r.Output), &report); err != nil {
-		return nil, false, fmt.Errorf("parsing cached baseline for %s: %w", sha, err)
+		return nil, false, fmt.Errorf("parsing cached baseline for %s: %w", found, err)
 	}
 	// An empty baseline ("{}") is a cache miss, not a baseline of nothing.
 	// Coverage.Compute silently omits any language it couldn't measure, so a
@@ -113,15 +153,32 @@ func PriorBaselines(ctx context.Context, dir, sha string, langs []string, maxDep
 	}
 	// rev-list from sha (not sha~1) keeps this working on a shallow checkout
 	// too: even at fetch-depth 1 it can still see the same-sha entry.
-	rev := executil.Run(ctx, dir, "git", "rev-list", "--first-parent", fmt.Sprintf("--max-count=%d", maxDepth), sha)
+	// Commit AND tree for each entry, in one walk: baselines are keyed by tree
+	// now, and by commit for anything written before that. Asking git for both
+	// costs nothing here and avoids a rev-parse per commit.
+	rev := executil.Run(ctx, dir, "git", "log", "--first-parent",
+		fmt.Sprintf("--max-count=%d", maxDepth), "--format=%H %T", sha)
 	if !rev.Ok() {
 		return found
 	}
-	for _, commit := range strings.Fields(rev.Output) {
-		if !cached[commit+".json"] {
+	for _, line := range strings.Split(strings.TrimSpace(rev.Output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
 			continue
 		}
-		r := executil.Run(ctx, dir, "git", "show", "origin/"+BranchName+":"+commit+".json")
+		key := ""
+		// Tree first, so a commit that has both resolves to the same entry
+		// ReadBaseline would pick.
+		for i := len(fields) - 1; i >= 0; i-- {
+			if cached[fields[i]+".json"] {
+				key = fields[i]
+				break
+			}
+		}
+		if key == "" {
+			continue
+		}
+		r := executil.Run(ctx, dir, "git", "show", "origin/"+BranchName+":"+key+".json")
 		if !r.Ok() {
 			continue
 		}
