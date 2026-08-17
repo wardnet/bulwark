@@ -47,3 +47,38 @@ jobs:
           args: release --clean --parallelism 1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Consumers pin wardnet/bulwark@v1, not a patch tag — the README calls the
+      # floating major "its intended delivery channel, moved deliberately on
+      # each release". Until now that move was done by hand, so the delivery
+      # channel depended on someone remembering after every release.
+      #
+      # Forgetting is silent and total: every consumer keeps running the old
+      # scanner, no drift signal fires, and the release looks published because
+      # the assets and the vX.Y.Z tag are all there. The only way to notice is
+      # to wonder why a fix did not take effect.
+      #
+      # So it verifies the move rather than assuming the push worked.
+      - name: Move the major version tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          major="${TAG%%.*}"   # v1.8.0 -> v1
+          if [[ ! "$major" =~ ^v[0-9]+$ ]]; then
+            echo "::error::could not derive a major tag from ${TAG}"
+            exit 1
+          fi
+
+          echo "Moving ${major} -> ${TAG} ($(git rev-parse --short "$TAG"))"
+          git tag -f "$major" "$TAG"
+          git push --force origin "refs/tags/${major}"
+
+          remote_sha=$(git ls-remote origin "refs/tags/${major}" | cut -f1)
+          expected_sha=$(git rev-parse "${major}")
+          if [[ "$remote_sha" != "$expected_sha" ]]; then
+            echo "::error::${major} did not advance on the remote (got ${remote_sha}, want ${expected_sha})"
+            exit 1
+          fi
+          echo "${major} now points at ${TAG}." >> "$GITHUB_STEP_SUMMARY"
