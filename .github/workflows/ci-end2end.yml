@@ -1,0 +1,47 @@
+# ci-end2end — this file is yours.
+#
+# gt created it once and will never modify or delete it again.
+#
+# Dogfooding, moved from ci.yml verbatim. It belongs in end2end rather than
+# build because it is exactly that: the scanner built from this tree, run
+# against a real repository, exercising the scan and report path end to end.
+#
+# Distinct from the `bulwark` stage in ci-orchestration, which runs the last
+# RELEASED scanner. This one asks "does the scanner in this PR still work";
+# that one asks "does the shipped scanner still pass this repo". Both matter,
+# and neither substitutes for the other.
+name: ci-end2end
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  self-scan:
+    name: self-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # From go.mod's toolchain line. It was restated in five places, which
+          # is how one of them goes stale without anyone noticing.
+          go-version-file: go.mod
+          cache: true
+
+      - name: build bulwark
+        run: go build -o /tmp/bulwark ./cmd/bulwark
+
+      - name: bulwark scan (self)
+        run: /tmp/bulwark scan --dir .
+
+  # The single job the branch-protection ruleset actually requires. Individual
+  # job names (lint, build & test, ...) are an implementation detail that
+  # changes as CI evolves — pointing the ruleset at each one means every job
+  # rename/add/remove is also a ruleset edit, and a job that's silently never
+  # required (as self-scan was here) goes unnoticed. Add a job to `needs:`
+  # below and the gate covers it automatically; the ruleset itself never
+  # needs to change again.

@@ -10,7 +10,7 @@
 # never touches them again. Branch protection needs exactly one check, ci-gate,
 # which waits on all of them.
 
-gt_version: v1.0.0
+gt_version: 1.0.0
 dependabot:
   - ecosystem: gomod
     directory: /
@@ -72,13 +72,8 @@ dependabot_auto_merge:
   schedule: 0 1 * * *
   max_bump: minor
   delete_branch: true
+  github_app: false
 bulwark:
-  # On, and this is the scanner scanning itself. Worth having deliberately: a
-  # regression that breaks bulwark's own repo is caught by the thing it breaks.
-  #
-  # The stage calls wardnet/bulwark@v1, the released major, not this working
-  # tree — so a PR here is checked by the last shipped scanner, which is what
-  # consumers actually run.
   enabled: true
 pipeline:
   ci:
@@ -87,11 +82,8 @@ pipeline:
       - preflight
       - build
       - test
+      - end2end
     merge_queue: false
-  # Off: cd-orchestration fires on v*.*.*, which release.yml already owns, and
-  # its verify-attestation runs with require: true — no tree carries an
-  # attestation yet, so the next release would go red on a pipeline that ships
-  # nothing.
   cd:
     enabled: false
     stages:
@@ -122,10 +114,16 @@ settings:
     merge_commit: false
     rebase: false
     delete_branch_on_merge: true
+    squash_title: pr_title
+    squash_message: blank
   branch_protection:
     branch: main
     required_approvals: 0
     require_up_to_date: false
+    dismiss_stale_reviews: true
+    require_thread_resolution: true
+    require_code_owner_review: false
+    require_last_push_approval: false
 files:
   - sync
   - dependabot-auto-merge
