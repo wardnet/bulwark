@@ -36,10 +36,38 @@ type Language struct {
 	Exclude []string `yaml:"exclude"`
 }
 
+// Linter names which engine backs the TypeScript check. Like Source, it is
+// named for the decision the repo makes rather than for bulwark's behavior:
+// which linter this repo has migrated to. The answer is a property of the repo
+// and holds for every invocation in it.
+//
+// The two are mutually exclusive by design, and there is deliberately no
+// "both". They are also not interchangeable rule sets — eslint-plugin-security
+// is a set of Node/backend heuristics (detect-child-process,
+// detect-object-injection, detect-non-literal-fs-filename, …) while Biome's
+// security group is six JSX/eval/secret rules, and only noGlobalEval genuinely
+// coincides with anything ESLint's plugin has. Switching therefore changes what
+// bulwark gates on. That is accepted because it is opt-in per repo, and Semgrep
+// still runs across every ecosystem either way. See docs/adr/0005.
+type Linter string
+
+const (
+	// LinterESLint is the default: bulwark's pinned ESLint +
+	// eslint-plugin-security, reporting security findings only.
+	LinterESLint Linter = "eslint"
+	// LinterBiome is opt-in. Biome reports its security *and* correctness
+	// groups, so a repo that opts in is gating on more than security.
+	LinterBiome Linter = "biome"
+)
+
 // TypeScriptLanguage extends Language with TS-only coverage install
 // configuration.
 type TypeScriptLanguage struct {
 	Language `yaml:",inline"`
+	// Linter selects the engine backing the TypeScript check. Defaults to
+	// LinterESLint, which is the behavior every repo had before this key
+	// existed.
+	Linter Linter `yaml:"linter"`
 	// Install overrides coverage's install-command auto-detection (npm ci /
 	// corepack enable && yarn install --immutable / pnpm install
 	// --frozen-lockfile, chosen by the root's lockfile) with an explicit
@@ -267,7 +295,7 @@ type Config struct {
 func Default() Config {
 	return Config{
 		Rust:       Language{Enabled: true},
-		TypeScript: TypeScriptLanguage{Language: Language{Enabled: true}},
+		TypeScript: TypeScriptLanguage{Language: Language{Enabled: true}, Linter: LinterESLint},
 		Go:         Language{Enabled: true},
 		Semgrep:    Semgrep{Enabled: true, Config: "auto"},
 		Toolchain:  Toolchain{Enabled: true},
@@ -308,6 +336,9 @@ func Load(root string) (Config, error) {
 	if err := validateSource(cfg); err != nil {
 		return Config{}, fmt.Errorf("%s: %w", path, err)
 	}
+	if err := validateLinter(cfg); err != nil {
+		return Config{}, fmt.Errorf("%s: %w", path, err)
+	}
 	return cfg, nil
 }
 
@@ -322,6 +353,20 @@ func validateSource(cfg Config) error {
 		return nil
 	default:
 		return fmt.Errorf("coverage.source must be %q or %q, got %q", SourceRun, SourceReport, cfg.Coverage.Source)
+	}
+}
+
+// validateLinter rejects any typescript.linter other than the two defined
+// values, for the same reason validateSource does: silently falling back to
+// eslint on a typo ("biomejs", "Biome") would run a linter the repo believes it
+// has migrated off, and report [PASS] the whole time. A misspelled opt-in that
+// silently does nothing is the worst outcome available here.
+func validateLinter(cfg Config) error {
+	switch cfg.TypeScript.Linter {
+	case LinterESLint, LinterBiome:
+		return nil
+	default:
+		return fmt.Errorf("typescript.linter must be %q or %q, got %q", LinterESLint, LinterBiome, cfg.TypeScript.Linter)
 	}
 }
 

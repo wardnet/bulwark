@@ -17,6 +17,15 @@ The aggregate coverage value cached on the `bulwark-state` branch for a specific
 **Coverable line**:
 A source line that a language's own coverage tool (`go tool cover`, `cargo llvm-cov`, Istanbul) reports an entry for. Comments, blank lines, imports, and braces are never coverable — they simply never appear in a coverage report, so patch coverage's denominator (coverable changed lines) excludes them automatically, without bulwark doing any language-aware filtering itself.
 
+**Linter**:
+Which engine backs bulwark's TypeScript check for a given repo — ESLint (the default) or Biome — selected by `typescript.linter` in `.bulwark.yml`. The two are mutually exclusive; there is no "both". A repo's value is a **migration state**, not a per-invocation choice: it is a fact about that repo, the same for every run in it.
+_Note_: the two are not interchangeable rule sets. Switching changes which findings bulwark gates on, and under Biome the check gates on **correctness** as well as security — so the TypeScript check is "security findings only" under ESLint but not under Biome.
+_Avoid_: "linting mode", "the TS linter setting".
+
+**Pin**:
+The exact version of a tool bulwark installs and runs, recorded in a real package-manager manifest (`package.json`, `Cargo.toml`, `go.mod`, `requirements.txt`) so Dependabot can see and bump it — never only in a Go constant. The distinguishing property of a pin is that something must be able to *age it out*: a pin nothing can bump is indistinguishable from a scanner that has silently stopped being current.
+_Avoid_: "vendored version", "bundled version" (bulwark vendors no tool source; it installs pinned releases).
+
 ## Flagged ambiguities
 **"Threshold"** — the original patch-coverage feature request proposed a `coverage.patch.threshold` config (an arbitrary fixed percentage per language). This was superseded: patch coverage has no independent threshold — it always gates against the aggregate baseline (see **Patch coverage**). Only an `enabled: bool` (default `true`, opt-out) remains in config.
 

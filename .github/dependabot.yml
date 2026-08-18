@@ -21,3 +21,79 @@ updates:
     cooldown:
       default-days: 5 # nosemgrep: package_managers.dependabot.dependabot-missing-cooldown.dependabot-missing-cooldown
     open-pull-requests-limit: 10
+
+  # --- Tool version pins ------------------------------------------------------
+  # bulwark pins every tool it runs. These manifests exist so those pins are
+  # visible to Dependabot rather than frozen in Go constants nothing ever ages
+  # out — a security scanner that is itself years out of date keeps reporting
+  # [PASS]. See AGENTS.md, "Tool version pins".
+
+  # ESLint stack (internal/typescript).
+  - package-ecosystem: npm
+    directory: /internal/typescript/eslint-pin
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 5 # nosemgrep: package_managers.dependabot.dependabot-missing-cooldown.dependabot-missing-cooldown
+    open-pull-requests-limit: 10
+
+  # Biome (internal/typescript), used when a repo sets typescript.linter: biome.
+  - package-ecosystem: npm
+    directory: /internal/typescript/biome-pin
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 5 # nosemgrep: package_managers.dependabot.dependabot-missing-cooldown.dependabot-missing-cooldown
+    open-pull-requests-limit: 10
+
+  # cargo-audit (internal/rust). One manifest per tool: cargo-audit and
+  # cargo-deny cannot resolve in a shared dependency graph.
+  - package-ecosystem: cargo
+    directory: /internal/rust/cargo-audit-pin
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 5 # nosemgrep: package_managers.dependabot.dependabot-missing-cooldown.dependabot-missing-cooldown
+    open-pull-requests-limit: 10
+
+  # cargo-deny (internal/rust).
+  - package-ecosystem: cargo
+    directory: /internal/rust/cargo-deny-pin
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 5 # nosemgrep: package_managers.dependabot.dependabot-missing-cooldown.dependabot-missing-cooldown
+    open-pull-requests-limit: 10
+
+  # gosec / govulncheck (internal/golang). A bump here must be mirrored into
+  # golang.go's constants; internal/golang/pins_test.go fails if it is not.
+  - package-ecosystem: gomod
+    directory: /internal/golang/go-pin
+    schedule:
+      interval: weekly
+    # go-pin has no .go files, so `go mod tidy` marks every require — gosec and
+    # govulncheck included — as `// indirect`. Dependabot's default allow rule is
+    # direct dependencies only, which would skip both and leave the pins frozen
+    # with nothing reporting it; pins_test.go only fires *after* a bump lands.
+    #
+    # Named explicitly rather than `dependency-type: all`: this module has 49
+    # indirect requires (grpc, protobuf, cloud.google.com/go, …) and allowing all
+    # of them would reintroduce the PR flood that keeping go-pin out of bulwark's
+    # own go.mod exists to avoid. Only these two are pins anyone acts on.
+    allow:
+      - dependency-name: "github.com/securego/gosec/v2"
+        dependency-type: all
+      - dependency-name: "golang.org/x/vuln"
+        dependency-type: all
+    cooldown:
+      default-days: 5 # nosemgrep: package_managers.dependabot.dependabot-missing-cooldown.dependabot-missing-cooldown
+    open-pull-requests-limit: 10
+
+  # Semgrep (internal/semgrep).
+  - package-ecosystem: pip
+    directory: /internal/semgrep
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 5 # nosemgrep: package_managers.dependabot.dependabot-missing-cooldown.dependabot-missing-cooldown
+    open-pull-requests-limit: 10

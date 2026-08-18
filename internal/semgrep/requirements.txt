@@ -1,0 +1,5 @@
+# Version pin for the Semgrep release bulwark installs via pipx. Nothing here is
+# ever pip-installed by bulwark: this file exists so Dependabot's `pip` ecosystem
+# can see the version and open bump PRs, and it is parsed at runtime by
+# internal/semgrep/pins.go so the version has exactly one home.
+semgrep==1.168.0

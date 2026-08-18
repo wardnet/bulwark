@@ -1,0 +1,24 @@
+# Version pin for cargo-deny, the tool bulwark installs with `cargo install`.
+#
+# This crate is never built, published, or depended on: it exists so Dependabot's
+# `cargo` ecosystem can see the version and open bump PRs, and it is parsed at
+# runtime by internal/rust/pins.go so the version has exactly one home.
+#
+# cargo-audit and cargo-deny get one manifest each, not a shared one. They cannot
+# coexist in a single resolution graph — cargo-deny's krates wants petgraph =0.8.1
+# while cargo-audit's cargo-lock pulls petgraph 0.8.2 — and a manifest that cannot
+# resolve is one Dependabot silently errors on, which is the exact "pin nothing
+# ages out" failure this whole arrangement exists to prevent. `cargo install`
+# never shares a graph between two tools, so the conflict is invisible in normal use.
+#
+# The empty [workspace] table stops cargo absorbing this into a workspace above it.
+[workspace]
+
+[package]
+name = "bulwark-cargo-deny-pin"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+cargo-deny = "=0.20.2"

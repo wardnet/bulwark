@@ -26,7 +26,7 @@ internal/detect/                # ecosystem + TS-package detection (walks for Ca
 internal/config/                # .bulwark.yml loading (opt-outs + pipeline shape — see Configuration below)
 internal/toolchain/             # ensures the Go/Rust/Node runtime each detected ecosystem needs (see Toolchains below)
 internal/rust/                  # clippy, cargo-audit, cargo-deny
-internal/typescript/            # self-contained pinned ESLint + eslint-plugin-security
+internal/typescript/            # pinned ESLint + eslint-plugin-security; opt-in Biome (see Linters)
 internal/golang/                # gosec, govulncheck (installed into a version-keyed GOBIN dir)
 internal/semgrep/                # pinned Semgrep, installed via pipx
 internal/coverage/               # per-language coverage percentage (see Coverage below)
@@ -103,6 +103,8 @@ rust:
 typescript:
   enabled: true
   exclude: ["legacy-app"]
+  linter: eslint         # or "biome" — which engine backs the TS check (see Linters
+                          # below). Mutually exclusive; there is deliberately no "both".
   install: ""            # override coverage's install-command auto-detection, e.g.
                           # "corepack enable && yarn install --immutable" (see Coverage below)
 go:
@@ -151,6 +153,102 @@ coverage:
 
 Omitting the file, or omitting a section/key within it, keeps that value at its default — see
 `internal/config/config_test.go` for the exact merge semantics.
+
+## Linters: ESLint (default) and Biome (opt-in)
+
+`typescript.linter` selects which engine backs the TypeScript check: `eslint` (the default,
+and byte-for-byte what every repo had before the key existed) or `biome`. They are mutually
+exclusive and there is deliberately no `both` — a repo is migrating, and the key names where
+it has got to. An unknown value is rejected by `config.validateLinter` rather than falling
+back, because a misspelled opt-in that silently keeps running the old linter is the one
+outcome nobody can detect.
+
+**The two are not interchangeable rule sets, and switching changes what bulwark gates on.**
+`eslint-plugin-security` is Node/backend heuristics (`detect-child-process`,
+`detect-object-injection`, `detect-non-literal-fs-filename`, `detect-unsafe-regex`, …);
+Biome's `security` group is six JSX/eval/secret rules (`noBlankTarget`,
+`noDangerouslySetInnerHtml`, `noDangerouslySetInnerHtmlWithChildren`, `noGlobalEval`,
+`noScriptUrl`, `noSecrets`). Only `noGlobalEval` genuinely coincides with anything ESLint's
+plugin has. Under Biome, bulwark additionally gates on the **`correctness`** group, so a repo
+that opts in is gating on more than security. That is accepted because it is opt-in per repo,
+and Semgrep still runs across every ecosystem either way. See [ADR 0005](docs/adr/0005-optional-biome-linter.md).
+
+Four things about the Biome integration were established against Biome 2.5.8 directly rather
+than from its docs, and all four are load-bearing:
+
+- **`files.includes` negations work from an out-of-tree config.** Biome resolves config globs
+  "relative to the folder the configuration file is in", and bulwark stages `biome.json` in its
+  cache directory — so this looked like it would silently ignore nothing. It doesn't: `**`-prefixed
+  negations are depth-agnostic and match correctly. But they are doing real work — with them
+  removed, Biome lints `dist/` and reports findings inside a minified production bundle, the exact
+  incident `TestEslintConfigIgnoresMatchesDefaultSkipDirs` was written for. `TestBiomeConfigIgnoresMatchesDefaultSkipDirs`
+  guards it.
+- **`--config-path` beats the scanned project's own root `biome.json`.** A project config setting
+  `linter.enabled: false` is ignored, so bulwark's verdict doesn't vary with what the target repo
+  declares — the same stance `internal/typescript`'s doc comment takes for ESLint.
+- **A `biome.json` in a *subdirectory* aborts the whole run.** Biome reports "Found a nested root
+  configuration" and produces no report at all, regardless of what bulwark's own config sets
+  `root` to. `lintDirBiome` detects that specific failure and reports it as a configuration
+  conflict naming the fix (add `"root": false` to the nested file, or exclude the directory),
+  because it must read as neither a pass nor a findings failure.
+- **A nested config declaring `"root": false` is *merged* into bulwark's config.** Its rules then
+  fire in our run. `reportableBiome`'s category allowlist contains that — merged `lint/style/*`
+  is dropped. The same merge is a real limitation in the other direction that cannot be closed
+  from here: a nested config could set `"security": "off"` and silently narrow what bulwark
+  checks.
+
+`recommended: false` in the bundled `biome.json` is not tidiness — without it Biome's default
+preset enables `style` and `suspicious` too, and bulwark would start failing PRs over opinions it
+never agreed to enforce. The formatter and assist are explicitly disabled for the same reason:
+bulwark is not a formatter and must never report a formatting diff as a finding.
+
+## Tool version pins
+
+bulwark pins every tool it runs, which is the whole premise — and for a long time every one of
+those pins was a Go string constant, invisible to Dependabot. A pinned security toolchain that
+nothing ever ages out is a scanner that quietly goes stale while still reporting `[PASS]`, which
+is the worst available failure. Every pin now lives in a real package-manager manifest that
+Dependabot watches, colocated with the package that uses it:
+
+| Tool(s) | Manifest | Runtime source |
+|---|---|---|
+| eslint, eslint-plugin-security, @typescript-eslint/parser, typescript | `internal/typescript/eslint-pin/package.json` + lock | the manifest itself (`npm ci`) |
+| @biomejs/biome | `internal/typescript/biome-pin/package.json` + lock | the manifest itself (`npm ci`) |
+| cargo-audit | `internal/rust/cargo-audit-pin/Cargo.toml` | parsed by `internal/rust/pins.go` |
+| cargo-deny | `internal/rust/cargo-deny-pin/Cargo.toml` | parsed by `internal/rust/pins.go` |
+| semgrep | `internal/semgrep/requirements.txt` | parsed by `internal/semgrep/pins.go` |
+| gosec, govulncheck | `internal/golang/go-pin/go.mod` | **still Go constants** — see below |
+
+The npm toolchains install with `npm ci` from a committed lockfile into a cache directory keyed
+by a **hash of that lockfile**. The old key was a hand-maintained string of concatenated version
+numbers, so adding a dependency meant remembering to extend the key, and forgetting meant reusing
+a cache directory that predated it — precisely how "every .ts file is silently skipped" would have
+come back when the TypeScript parser was added. A lockfile hash cannot be forgotten.
+
+**Go is the one exception, deliberately.** `gosecPkg`/`govulncheckPkg` are const expressions that
+concatenate the version at compile time, and `go:embed` cannot read files inside a nested module,
+so the versions can't be read from `go-pin/go.mod` at runtime. The constants stay and
+`internal/golang/pins_test.go` fails CI if a Dependabot bump to `go-pin/go.mod` isn't mirrored into
+them. `go-pin` is a **separate module** rather than `tool` directives in bulwark's own `go.mod`:
+declaring them in the main module works, but drags gosec's entire dependency graph (grpc, protobuf,
+`google.golang.org/api`, …) into code bulwark never links — measured at go.mod 17→69 lines and
+go.sum 17→114 — which would then generate a stream of irrelevant Dependabot PRs.
+
+**Each cargo tool gets its own manifest, and that is not tidiness.** cargo-audit and cargo-deny
+cannot resolve in a shared dependency graph — cargo-deny's `krates` pins `petgraph =0.8.1` while
+cargo-audit's `cargo-lock` pulls `0.8.2` — and a `[package]` manifest with no `src/lib.rs` doesn't
+parse at all. Either way cargo errors, Dependabot's updater fails in a job log nobody reads, and the
+pin silently stops being bumped: the exact failure this whole arrangement exists to prevent. `cargo
+install` never shares a graph between two tools, so the conflict is invisible in normal use.
+`internal/rust`'s `TestPinManifestsAreSeparate` guards against a well-meaning consolidation.
+
+**Adding a new pin means three edits, not one:** the manifest, a `.github/dependabot.yml` entry,
+and an exclude in bulwark's own `.bulwark.yml`. The manifests are real `package.json`/`Cargo.toml`/
+`go.mod` files, so CI's self-scan would otherwise treat each as a package to lint, a crate to audit
+or a module to scan. `internal/config`'s `TestPinDirectoriesAreExcluded` covers only the exclude
+half — it never reads `dependabot.yml`, and it discovers pins by a `*-pin` directory-name suffix, so
+`internal/semgrep/requirements.txt` falls outside it entirely. Nothing enforces the Dependabot
+entry. See [ADR 0006](docs/adr/0006-tool-pins-as-dependabot-manifests.md).
 
 ## Toolchains
 

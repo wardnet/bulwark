@@ -1,0 +1,9 @@
+{
+  "name": "bulwark-biome-pin",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Version pin for bulwark's bundled Biome toolchain, used when a repo sets typescript.linter: biome. Not a package bulwark builds or publishes: it exists so Dependabot can see this version and open bump PRs, and so `npm ci` installs it deterministically. See internal/typescript/biome.go.",
+  "dependencies": {
+    "@biomejs/biome": "2.5.8"
+  }
+}

@@ -19,13 +19,14 @@ against a lazily-computed baseline — no manual setup, no "works on my machine.
 | Ecosystem | Checks |
 |---|---|
 | Rust | `cargo fmt --check`, `cargo clippy` (pedantic/restriction groups come from the target repo's own `Cargo.toml`), `cargo-audit` (CVEs), `cargo-deny` (licenses + bans) |
-| TypeScript | ESLint + `eslint-plugin-security`, using a toolchain `bulwark` bundles and pins itself — independent of whatever (if anything) the target package declares in its own `devDependencies` |
+| TypeScript | ESLint + `eslint-plugin-security`, using a toolchain `bulwark` bundles and pins itself — independent of whatever (if anything) the target package declares in its own `devDependencies`. Projects migrating to [Biome](https://biomejs.dev) can opt in with `typescript.linter: biome` |
 | Go | `gosec`, `govulncheck` |
 | All of the above | [Semgrep](https://semgrep.dev) |
 
 Every tool is pinned to an exact version and installed into a `bulwark`-managed cache directory the
 first time it's needed — nothing is ever silently run at whatever version happens to already be on
-`PATH`.
+`PATH`. Those pins live in real package manifests that Dependabot watches, so a pinned security
+toolchain can't quietly go stale while still reporting `[PASS]`.
 
 ## Install
 
@@ -93,6 +94,7 @@ rust:
 typescript:
   enabled: true
   exclude: ["legacy-app"]
+  linter: eslint  # or "biome" — which linter backs the TypeScript check
 go:
   enabled: true
   exclude: []

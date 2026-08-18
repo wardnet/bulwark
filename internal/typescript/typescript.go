@@ -10,6 +10,20 @@
 // required so the config's `import "eslint-plugin-security"` resolves; a
 // config staged in an unrelated temp directory can't see npx's ephemeral
 // node_modules and fails with ERR_MODULE_NOT_FOUND.
+//
+// The versions themselves live in eslint-pin/package.json, not in Go
+// constants, so Dependabot can see them and open bump PRs — a pinned security
+// toolchain that nothing ever ages out is a scanner that quietly goes stale
+// while still reporting [PASS]. package.json has no comments, so the
+// constraints that decided those pins are recorded here instead:
+//
+//   - @typescript-eslint/parser is what lets the security rules see .ts/.tsx
+//     at all, and `typescript` is the parser's own peer dependency — it cannot
+//     read TS without it.
+//   - Parser 8.63.0 declares `eslint: ^8.57 || ^9 || ^10` (so it matches the
+//     eslint pin) and `typescript: >=4.8.4 <6.1.0` — which is why the
+//     typescript pin is 5.x and not the 7.x now on npm latest. A Dependabot PR
+//     bumping typescript across that ceiling must bump the parser too.
 package typescript
 
 import (
@@ -28,26 +42,43 @@ import (
 //go:embed eslint.config.mjs
 var eslintConfig []byte
 
-// Pinned so every invocation of bulwark, anywhere, uses the exact same
-// toolchain regardless of what's cached or installed on the machine.
-const (
-	eslintVersion         = "10.6.0"
-	pluginSecurityVersion = "4.0.1"
-	// The parser that lets the security rules see .ts/.tsx at all. `typescript`
-	// itself is the parser's own peer dependency — it can't read TS without it.
-	// Parser 8.63.0 declares `eslint: ^8.57 || ^9 || ^10` (so it matches the
-	// eslint pin above) and `typescript: >=4.8.4 <6.1.0` — which is why this is
-	// TS 5.x and not the 7.x now on npm latest.
-	tsParserVersion = "8.63.0"
-	typescriptVer   = "5.9.3"
+// The pin manifest, embedded so the binary is self-contained. npm ci installs
+// exactly what the lockfile resolves — every transitive dependency included —
+// rather than re-resolving them freshly on each cache miss.
+var (
+	//go:embed eslint-pin/package.json
+	eslintPackageJSON []byte
+	//go:embed eslint-pin/package-lock.json
+	eslintPackageLock []byte
 )
 
-// Check lints every package directory under root, skipping any directory
-// named in exclude.
-func Check(ctx context.Context, root string, exclude []string) ([]executil.Result, error) {
+// Linter names which engine backs the TypeScript check for a repo. The two are
+// mutually exclusive and their rule sets barely overlap, so this is a migration
+// state a repo moves through, not a pair of independent switches — see
+// .bulwark.yml's typescript.linter and docs/adr/0005.
+type Linter string
+
+const (
+	// ESLint is the default: bulwark's pinned ESLint + eslint-plugin-security.
+	ESLint Linter = "eslint"
+	// Biome is opt-in, for repos that have migrated off ESLint.
+	Biome Linter = "biome"
+)
+
+// Check lints every package directory under root with the configured linter,
+// skipping any directory named in exclude.
+func Check(ctx context.Context, root string, exclude []string, linter Linter) ([]executil.Result, error) {
 	pkgDirs, err := detect.TSPackageDirs(root, exclude)
 	if err != nil {
 		return nil, err
+	}
+	// Nothing to lint: don't pay for a toolchain install to discover that.
+	if len(pkgDirs) == 0 {
+		return nil, nil
+	}
+
+	if linter == Biome {
+		return checkBiome(ctx, pkgDirs)
 	}
 
 	toolchainDir, err := ensureToolchain(ctx)
@@ -60,6 +91,27 @@ func Check(ctx context.Context, root string, exclude []string) ([]executil.Resul
 	var results []executil.Result
 	for _, dir := range pkgDirs {
 		res, err := lintDir(ctx, dir, eslintBin, configPath)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, res)
+	}
+	return results, nil
+}
+
+// checkBiome is Check's Biome arm, split out only to keep the two toolchains'
+// setup from interleaving.
+func checkBiome(ctx context.Context, pkgDirs []string) ([]executil.Result, error) {
+	toolchainDir, err := ensureBiome(ctx)
+	if err != nil {
+		return nil, err
+	}
+	biomeBin := filepath.Join(toolchainDir, "node_modules", ".bin", "biome")
+	configPath := filepath.Join(toolchainDir, "biome.json")
+
+	var results []executil.Result
+	for _, dir := range pkgDirs {
+		res, err := lintDirBiome(ctx, dir, biomeBin, configPath)
 		if err != nil {
 			return nil, err
 		}
@@ -173,40 +225,14 @@ func lintDir(ctx context.Context, dir, eslintBin, configPath string) (executil.R
 	return r, nil
 }
 
-// ensureToolchain installs the pinned eslint + eslint-plugin-security into a
-// cache directory keyed by their versions (so a version bump gets a fresh
-// install instead of silently reusing a stale one), and writes the bundled
-// config alongside it.
+// ensureToolchain installs the pinned ESLint stack from eslint-pin/ and writes
+// the bundled config alongside it.
 func ensureToolchain(ctx context.Context) (string, error) {
-	cacheDir, err := os.UserCacheDir()
+	dir, err := ensureNPMToolchain(ctx, "eslint", "eslint", eslintPackageJSON, eslintPackageLock)
 	if err != nil {
 		return "", err
 	}
-	// Every pinned version is in the directory name, so adding the parser
-	// re-keys the cache — an existing toolchain dir from before this change
-	// can't be reused, which it must not be: it has no parser, and would
-	// silently go back to skipping every .ts file.
-	dir := filepath.Join(cacheDir, "bulwark",
-		"eslint-toolchain-"+eslintVersion+"-"+pluginSecurityVersion+"-"+tsParserVersion+"-"+typescriptVer)
-	configPath := filepath.Join(dir, "eslint.config.mjs")
-
-	if _, err := os.Stat(filepath.Join(dir, "node_modules", ".bin", "eslint")); err != nil {
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			return "", err
-		}
-		if r := executil.Run(ctx, dir, "npm", "init", "-y", "--silent"); !r.Ok() {
-			return "", r.Err
-		}
-		if r := executil.Run(ctx, dir, "npm", "install", "--no-audit", "--no-fund", "--silent",
-			"eslint@"+eslintVersion,
-			"eslint-plugin-security@"+pluginSecurityVersion,
-			"@typescript-eslint/parser@"+tsParserVersion,
-			"typescript@"+typescriptVer,
-		); !r.Ok() {
-			return "", r.Err
-		}
-	}
-	if err := os.WriteFile(configPath, eslintConfig, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "eslint.config.mjs"), eslintConfig, 0o600); err != nil {
 		return "", err
 	}
 	return dir, nil
