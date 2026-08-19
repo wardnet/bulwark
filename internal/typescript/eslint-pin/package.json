@@ -4,7 +4,7 @@
   "private": true,
   "description": "Version pins for bulwark's bundled ESLint toolchain. Not a package bulwark builds or publishes: it exists so Dependabot can see these versions and open bump PRs, and so `npm ci` installs them deterministically. See internal/typescript/typescript.go.",
   "dependencies": {
-    "@typescript-eslint/parser": "8.63.0",
+    "@typescript-eslint/parser": "8.67.0",
     "eslint": "10.6.0",
     "eslint-plugin-security": "4.0.1",
     "typescript": "5.9.3"
