@@ -63,7 +63,7 @@ func newScanCmd() *cobra.Command {
 					if !cfg.TypeScript.Enabled {
 						continue
 					}
-					tsResults, err := typescript.Check(ctx, dir, cfg.TypeScript.Exclude)
+					tsResults, err := typescript.Check(ctx, dir, cfg.TypeScript.Exclude, typescript.Linter(cfg.TypeScript.Linter))
 					if err != nil {
 						return err
 					}

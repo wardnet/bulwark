@@ -26,13 +26,6 @@ import (
 	"wardnet/bulwark/internal/executil"
 )
 
-// Pinned so every invocation of bulwark uses the exact same toolchain
-// regardless of what's already on the machine.
-const (
-	cargoAuditVersion = "0.22.2"
-	cargoDenyVersion  = "0.20.2"
-)
-
 // Check runs every Rust check against every independent Cargo crate/workspace
 // root discovered under root, skipping any directory named in exclude. A
 // nested crate already covered by an ancestor workspace's Cargo.toml is not

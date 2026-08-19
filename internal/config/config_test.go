@@ -355,3 +355,45 @@ func write(t *testing.T, dir, contents string) {
 		t.Fatal(err)
 	}
 }
+
+func TestLoadTypeScriptLinterDefaultsToESLint(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TypeScript.Linter != LinterESLint {
+		t.Errorf("TypeScript.Linter = %q, want %q — every repo predating this key must keep ESLint", cfg.TypeScript.Linter, LinterESLint)
+	}
+}
+
+func TestLoadTypeScriptLinterBiome(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "typescript:\n  linter: biome\n")
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TypeScript.Linter != LinterBiome {
+		t.Errorf("TypeScript.Linter = %q, want %q", cfg.TypeScript.Linter, LinterBiome)
+	}
+	// Opting into Biome must not disturb anything else in the section.
+	if !cfg.TypeScript.Enabled {
+		t.Error("TypeScript.Enabled was zeroed by a partial typescript: section")
+	}
+}
+
+// TestLoadRejectsUnknownLinter guards the failure mode the validator exists for:
+// a misspelled opt-in that silently falls back to ESLint would have a repo
+// believe it had migrated while bulwark ran the old linter and reported [PASS].
+func TestLoadRejectsUnknownLinter(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "typescript:\n  linter: bimoe\n")
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("Load accepted an unknown typescript.linter")
+	}
+	if !strings.Contains(err.Error(), "typescript.linter") {
+		t.Errorf("error does not name the offending key: %v", err)
+	}
+}

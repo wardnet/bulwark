@@ -14,10 +14,6 @@ import (
 	"wardnet/bulwark/internal/executil"
 )
 
-// Pinned so every invocation of bulwark uses the exact same Semgrep version
-// regardless of what's already on the machine.
-const version = "1.168.0"
-
 // AppTokenEnv is the environment variable Semgrep itself reads for AppSec
 // Platform authentication. bulwark doesn't invent its own — reusing
 // Semgrep's own variable means a caller (e.g. the wardnet/bulwark GitHub

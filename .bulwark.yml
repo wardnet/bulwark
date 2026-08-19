@@ -1,0 +1,19 @@
+# bulwark's own configuration, used by CI's self-scan job.
+#
+# The *-pin / go-pin directories hold version-pin manifests (package.json,
+# Cargo.toml, go.mod, requirements.txt) that exist purely so Dependabot can see
+# the tool versions bulwark pins. They are real manifests, so detection would
+# otherwise treat each one as a package to lint, a crate to audit, or a module to
+# scan — none of which they are. Excluding them by name prunes the whole subtree.
+#
+# Adding a new pin directory means adding it here AND adding a matching entry to
+# .github/dependabot.yml. internal/config's TestPinDirectoriesAreExcluded covers
+# only the first half — it checks these exclude lists against the *-pin
+# directories on disk, and does not read dependabot.yml. Nothing enforces the
+# Dependabot entry, so a pin can still be added that no bot ever bumps.
+rust:
+  exclude: ["eslint-pin", "biome-pin", "cargo-audit-pin", "cargo-deny-pin", "go-pin"]
+typescript:
+  exclude: ["eslint-pin", "biome-pin", "cargo-audit-pin", "cargo-deny-pin", "go-pin"]
+go:
+  exclude: ["eslint-pin", "biome-pin", "cargo-audit-pin", "cargo-deny-pin", "go-pin"]
