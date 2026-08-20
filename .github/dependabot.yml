@@ -9,6 +9,21 @@
 # branch.
 version: 2
 updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Dependabot's commit message is also its PR title, and PRs are
+    # squash-merged, so the prefix is what keeps dependency updates inside
+    # Conventional Commits. `include: scope` appends the dependency scope,
+    # producing e.g. `build(deps): bump …`.
+    commit-message:
+      prefix: "build"
+      include: scope
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 25
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -24,8 +39,110 @@ updates:
       default-days: 7
     open-pull-requests-limit: 25
 
+  # The ESLint stack (internal/typescript).
+  - package-ecosystem: "npm"
+    directory: "/internal/typescript/eslint-pin"
+    schedule:
+      interval: "weekly"
+    # Dependabot's commit message is also its PR title, and PRs are
+    # squash-merged, so the prefix is what keeps dependency updates inside
+    # Conventional Commits. `include: scope` appends the dependency scope,
+    # producing e.g. `build(deps): bump …`.
+    commit-message:
+      prefix: "build"
+      include: scope
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 25
+
+  # Biome (internal/typescript), used when a repo sets typescript.linter: biome.
+  - package-ecosystem: "npm"
+    directory: "/internal/typescript/biome-pin"
+    schedule:
+      interval: "weekly"
+    # Dependabot's commit message is also its PR title, and PRs are
+    # squash-merged, so the prefix is what keeps dependency updates inside
+    # Conventional Commits. `include: scope` appends the dependency scope,
+    # producing e.g. `build(deps): bump …`.
+    commit-message:
+      prefix: "build"
+      include: scope
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 25
+
+  # cargo-audit (internal/rust). One manifest per tool: cargo-audit and
+  # cargo-deny cannot resolve in a shared dependency graph.
+  - package-ecosystem: "cargo"
+    directory: "/internal/rust/cargo-audit-pin"
+    schedule:
+      interval: "weekly"
+    # Dependabot's commit message is also its PR title, and PRs are
+    # squash-merged, so the prefix is what keeps dependency updates inside
+    # Conventional Commits. `include: scope` appends the dependency scope,
+    # producing e.g. `build(deps): bump …`.
+    commit-message:
+      prefix: "build"
+      include: scope
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 25
+
+  # cargo-deny (internal/rust).
+  - package-ecosystem: "cargo"
+    directory: "/internal/rust/cargo-deny-pin"
+    schedule:
+      interval: "weekly"
+    # Dependabot's commit message is also its PR title, and PRs are
+    # squash-merged, so the prefix is what keeps dependency updates inside
+    # Conventional Commits. `include: scope` appends the dependency scope,
+    # producing e.g. `build(deps): bump …`.
+    commit-message:
+      prefix: "build"
+      include: scope
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 25
+
+  # gosec / govulncheck (internal/golang). A bump here must be mirrored into
+  # golang.go's constants; internal/golang/pins_test.go fails if it is not.
+  #
+  # The allow rules are load-bearing. go-pin has no .go files, so `go mod tidy`
+  # marks every require — gosec and govulncheck included — as `// indirect`,
+  # and Dependabot's default allow rule is direct dependencies only. Without
+  # these, both pins freeze and nothing reports it: pins_test.go only fires
+  # AFTER a bump lands.
+  #
+  # Named explicitly rather than dependency_type: all across the module: it has
+  # 49 indirect requires (grpc, protobuf, cloud.google.com/go, …) and allowing
+  # all of them would reintroduce the PR flood that keeping go-pin out of
+  # bulwark's own go.mod exists to avoid.
   - package-ecosystem: "gomod"
-    directory: "/"
+    directory: "/internal/golang/go-pin"
+    schedule:
+      interval: "weekly"
+    # Dependabot's commit message is also its PR title, and PRs are
+    # squash-merged, so the prefix is what keeps dependency updates inside
+    # Conventional Commits. `include: scope` appends the dependency scope,
+    # producing e.g. `build(deps): bump …`.
+    commit-message:
+      prefix: "build"
+      include: scope
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 25
+    # Dependabot's default is direct dependencies only, so anything held
+    # indirectly is never bumped. An allow rule is what stops a pin freezing
+    # silently — nothing reports a dependency that simply stops being updated.
+    allow:
+      - dependency-name: "github.com/securego/gosec/v2"
+        dependency-type: all
+      - dependency-name: "golang.org/x/vuln"
+        dependency-type: all
+
+  # Semgrep (internal/semgrep).
+  - package-ecosystem: "pip"
+    directory: "/internal/semgrep"
     schedule:
       interval: "weekly"
     # Dependabot's commit message is also its PR title, and PRs are
