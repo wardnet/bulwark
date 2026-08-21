@@ -10,24 +10,26 @@
 # never touches them again. Branch protection needs exactly one check, ci-gate,
 # which waits on all of them.
 
-gt_version: 1.0.0
+gt_version: 1.1.0
 dependabot:
   - ecosystem: gomod
     directory: /
   - ecosystem: github-actions
     directory: /
-
-  # Tool version pins. bulwark pins every tool it runs, and these manifests
-  # exist so those pins are visible to Dependabot rather than frozen in Go
-  # constants nothing ever ages out — a security scanner that is itself years
-  # out of date keeps reporting [PASS]. See AGENTS.md, "Tool version pins".
-  #
-  # Each is also excluded in .bulwark.yml: they are real manifests, so detection
-  # would otherwise treat them as packages to lint or modules to scan.
   - ecosystem: npm
     directory: /internal/typescript/eslint-pin
     note: |
       The ESLint stack (internal/typescript).
+
+      One of the tool version pins. bulwark pins every tool it runs, and these
+      manifests exist so those pins are visible to Dependabot rather than frozen
+      in Go constants nothing ever ages out — a security scanner that is itself
+      years out of date keeps reporting [PASS]. See AGENTS.md, "Tool version
+      pins".
+
+      Each pin directory is also excluded in .bulwark.yml: they are real
+      manifests, so detection would otherwise treat them as packages to lint or
+      modules to scan.
   - ecosystem: npm
     directory: /internal/typescript/biome-pin
     note: |
@@ -43,11 +45,6 @@ dependabot:
       cargo-deny (internal/rust).
   - ecosystem: gomod
     directory: /internal/golang/go-pin
-    allow:
-      - dependency_name: github.com/securego/gosec/v2
-        dependency_type: all
-      - dependency_name: golang.org/x/vuln
-        dependency_type: all
     note: |
       gosec / govulncheck (internal/golang). A bump here must be mirrored into
       golang.go's constants; internal/golang/pins_test.go fails if it is not.
@@ -62,11 +59,15 @@ dependabot:
       49 indirect requires (grpc, protobuf, cloud.google.com/go, …) and allowing
       all of them would reintroduce the PR flood that keeping go-pin out of
       bulwark's own go.mod exists to avoid.
+    allow:
+      - dependency_name: github.com/securego/gosec/v2
+        dependency_type: all
+      - dependency_name: golang.org/x/vuln
+        dependency_type: all
   - ecosystem: pip
     directory: /internal/semgrep
     note: |
       Semgrep (internal/semgrep).
-
 dependabot_auto_merge:
   enabled: true
   schedule: 0 1 * * *

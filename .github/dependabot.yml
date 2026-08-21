@@ -40,6 +40,16 @@ updates:
     open-pull-requests-limit: 25
 
   # The ESLint stack (internal/typescript).
+  #
+  # One of the tool version pins. bulwark pins every tool it runs, and these
+  # manifests exist so those pins are visible to Dependabot rather than frozen
+  # in Go constants nothing ever ages out — a security scanner that is itself
+  # years out of date keeps reporting [PASS]. See AGENTS.md, "Tool version
+  # pins".
+  #
+  # Each pin directory is also excluded in .bulwark.yml: they are real
+  # manifests, so detection would otherwise treat them as packages to lint or
+  # modules to scan.
   - package-ecosystem: "npm"
     directory: "/internal/typescript/eslint-pin"
     schedule:
