@@ -1,0 +1,130 @@
+# Repository governance for gt. This file is the source of truth; run
+# 'gt repo sync' to render it, and 'gt repo check' to verify.
+#
+# Shared policy (Dependabot cooldown, commit-message prefixes, the weekly sync
+# schedule) lives in gt's templates, not here, so it stays consistent across
+# every governed repo.
+#
+# The pipeline stages below become jobs in ci-orchestration.yml, each calling a
+# ci-*/cd-* workflow that belongs to this repository: gt creates those once and
+# never touches them again. Branch protection needs exactly one check, ci-gate,
+# which waits on all of them.
+
+gt_version: 1.1.0
+dependabot:
+  - ecosystem: gomod
+    directory: /
+  - ecosystem: github-actions
+    directory: /
+  - ecosystem: npm
+    directory: /internal/typescript/eslint-pin
+    note: |
+      The ESLint stack (internal/typescript).
+
+      One of the tool version pins. bulwark pins every tool it runs, and these
+      manifests exist so those pins are visible to Dependabot rather than frozen
+      in Go constants nothing ever ages out — a security scanner that is itself
+      years out of date keeps reporting [PASS]. See AGENTS.md, "Tool version
+      pins".
+
+      Each pin directory is also excluded in .bulwark.yml: they are real
+      manifests, so detection would otherwise treat them as packages to lint or
+      modules to scan.
+  - ecosystem: npm
+    directory: /internal/typescript/biome-pin
+    note: |
+      Biome (internal/typescript), used when a repo sets typescript.linter: biome.
+  - ecosystem: cargo
+    directory: /internal/rust/cargo-audit-pin
+    note: |
+      cargo-audit (internal/rust). One manifest per tool: cargo-audit and
+      cargo-deny cannot resolve in a shared dependency graph.
+  - ecosystem: cargo
+    directory: /internal/rust/cargo-deny-pin
+    note: |
+      cargo-deny (internal/rust).
+  - ecosystem: gomod
+    directory: /internal/golang/go-pin
+    note: |
+      gosec / govulncheck (internal/golang). A bump here must be mirrored into
+      golang.go's constants; internal/golang/pins_test.go fails if it is not.
+
+      The allow rules are load-bearing. go-pin has no .go files, so `go mod tidy`
+      marks every require — gosec and govulncheck included — as `// indirect`,
+      and Dependabot's default allow rule is direct dependencies only. Without
+      these, both pins freeze and nothing reports it: pins_test.go only fires
+      AFTER a bump lands.
+
+      Named explicitly rather than dependency_type: all across the module: it has
+      49 indirect requires (grpc, protobuf, cloud.google.com/go, …) and allowing
+      all of them would reintroduce the PR flood that keeping go-pin out of
+      bulwark's own go.mod exists to avoid.
+    allow:
+      - dependency_name: github.com/securego/gosec/v2
+        dependency_type: all
+      - dependency_name: golang.org/x/vuln
+        dependency_type: all
+  - ecosystem: pip
+    directory: /internal/semgrep
+    note: |
+      Semgrep (internal/semgrep).
+dependabot_auto_merge:
+  enabled: true
+  schedule: 0 1 * * *
+  max_bump: minor
+  delete_branch: true
+  github_app: false
+bulwark:
+  enabled: true
+pipeline:
+  ci:
+    enabled: true
+    stages:
+      - preflight
+      - build
+      - test
+      - end2end
+    merge_queue: false
+  cd:
+    enabled: false
+    stages:
+      - preflight
+      - publish
+      - deploy
+      - verify
+    tags:
+      - v*.*.*
+conventional_commits:
+  enabled: true
+  scope: pr_title
+  types:
+    - feat
+    - fix
+    - docs
+    - style
+    - refactor
+    - perf
+    - test
+    - build
+    - ci
+    - chore
+    - revert
+settings:
+  merge:
+    squash: true
+    merge_commit: false
+    rebase: false
+    delete_branch_on_merge: true
+    squash_title: pr_title
+    squash_message: blank
+  branch_protection:
+    branch: main
+    required_approvals: 0
+    require_up_to_date: false
+    dismiss_stale_reviews: true
+    require_thread_resolution: true
+    require_code_owner_review: false
+    require_last_push_approval: false
+files:
+  - sync
+  - dependabot-auto-merge

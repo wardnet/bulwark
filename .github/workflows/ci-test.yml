@@ -1,0 +1,48 @@
+# ci-test — this file is yours.
+#
+# gt created it once and will never modify or delete it again.
+#
+# The Go suite, moved from ci.yml, now also producing a coverage profile.
+name: ci-test
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # From go.mod's toolchain line. It was restated in five places, which
+          # is how one of them goes stale without anyone noticing.
+          go-version-file: go.mod
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      # -coverprofile so the bulwark stage reads a report instead of running
+      # the suite again. .bulwark.yml here declares `report`, and bulwark exits
+      # rather than shrugging when told to read one nothing produced.
+      - name: go test
+        run: go test -race -coverprofile=coverage.out ./...
+
+  # Dogfooding: bulwark scans itself. This is the only thing that would have
+  # caught a regression in the scanner logic itself (a broken auto-install, a
+  # findings-suppression that stops working, a version pin that drifts) —
+  # go test alone doesn't exercise the actual scan/report path end-to-end
+  # against a real repo the way this does.
+
+      - name: Upload coverage for the bulwark stage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gt-coverage
+          path: coverage.out
+          if-no-files-found: error
