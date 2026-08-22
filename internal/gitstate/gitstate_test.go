@@ -38,11 +38,15 @@ func TestReadBaselineTreatsEmptyAsCacheMiss(t *testing.T) {
 	run(seed, "init", "-b", BranchName, ".")
 	run(seed, "config", "user.email", "t@t")
 	run(seed, "config", "user.name", "t")
-	for name, content := range map[string]string{
-		"empty.json":  "{}",
-		"filled.json": `{"go":58.5}`,
+	for key, content := range map[string]string{
+		"empty":  "{}",
+		"filled": `{"go":58.5}`,
 	} {
-		if err := os.WriteFile(filepath.Join(seed, name), []byte(content), 0o600); err != nil {
+		path := filepath.Join(seed, filepath.FromSlash(StatePath(key)))
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -90,8 +94,12 @@ func seedStateBranch(t *testing.T, ctx context.Context, files map[string]string)
 	run(seed, "init", "-b", BranchName, ".")
 	run(seed, "config", "user.email", "t@t")
 	run(seed, "config", "user.name", "t")
-	for name, content := range files {
-		if err := os.WriteFile(filepath.Join(seed, name), []byte(content), 0o600); err != nil {
+	for key, content := range files {
+		path := filepath.Join(seed, filepath.FromSlash(StatePath(key)))
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -138,10 +146,10 @@ func TestPriorBaselinesNearestCommitWinsPerLanguage(t *testing.T) {
 	// bulwark-state has baselines for c4 itself (a concurrent job's fresh
 	// entry), c3 (empty — must be skipped), c2, and c1.
 	origin := seedStateBranch(t, ctx, map[string]string{
-		c4 + ".json": `{"go":77}`,
-		c3 + ".json": "{}",
-		c2 + ".json": `{"rust":10}`,
-		c1 + ".json": `{"rust":20,"typescript":93.8}`,
+		c4: `{"go":77}`,
+		c3: "{}",
+		c2: `{"rust":10}`,
+		c1: `{"rust":20,"typescript":93.8}`,
 	})
 	run(clone, "remote", "add", "origin", origin)
 
@@ -195,7 +203,7 @@ func TestPriorBaselinesNearestCommitWinsPerLanguage(t *testing.T) {
 func TestWriteBaselinePushesOverAStaleTrackingRef(t *testing.T) {
 	ctx := context.Background()
 	run := gitRunner(t, ctx)
-	origin := seedStateBranch(t, ctx, map[string]string{"first.json": `{"go":10}`})
+	origin := seedStateBranch(t, ctx, map[string]string{"first": `{"go":10}`})
 
 	// The caller's repo: fetches bulwark-state once, then the remote advances.
 	clone := t.TempDir()
@@ -208,7 +216,11 @@ func TestWriteBaselinePushesOverAStaleTrackingRef(t *testing.T) {
 	run(writer, "clone", "-b", BranchName, origin, ".")
 	run(writer, "config", "user.email", "t@t")
 	run(writer, "config", "user.name", "t")
-	if err := os.WriteFile(filepath.Join(writer, "concurrent.json"), []byte(`{"go":20}`), 0o600); err != nil {
+	concurrent := filepath.Join(writer, filepath.FromSlash(StatePath("concurrent")))
+	if err := os.MkdirAll(filepath.Dir(concurrent), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(concurrent, []byte(`{"go":20}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	run(writer, "add", "-A")
@@ -222,9 +234,9 @@ func TestWriteBaselinePushesOverAStaleTrackingRef(t *testing.T) {
 	// Both the concurrent write and ours must be on the remote branch.
 	verify := t.TempDir()
 	run(verify, "clone", "-b", BranchName, origin, ".")
-	for _, name := range []string{"first.json", "concurrent.json", "stalerace.json"} {
-		if _, err := os.Stat(filepath.Join(verify, name)); err != nil {
-			t.Errorf("%s missing from %s after WriteBaseline: %v", name, BranchName, err)
+	for _, key := range []string{"first", "concurrent", "stalerace"} {
+		if _, err := os.Stat(filepath.Join(verify, filepath.FromSlash(StatePath(key)))); err != nil {
+			t.Errorf("%s missing from %s after WriteBaseline: %v", StatePath(key), BranchName, err)
 		}
 	}
 }
@@ -235,7 +247,7 @@ func TestWriteBaselinePushesOverAStaleTrackingRef(t *testing.T) {
 func TestWriteBaselineReportsAPushThatNeverLands(t *testing.T) {
 	ctx := context.Background()
 	run := gitRunner(t, ctx)
-	origin := seedStateBranch(t, ctx, map[string]string{"first.json": `{"go":10}`})
+	origin := seedStateBranch(t, ctx, map[string]string{"first": `{"go":10}`})
 
 	// Reject every push from here on.
 	hook := filepath.Join(origin, "hooks", "pre-receive")
@@ -378,5 +390,43 @@ func TestReadBaselinePrefersTheTreeAndFallsBackToTheCommit(t *testing.T) {
 	}
 	if got["go"] != 77 {
 		t.Errorf("go = %v, want the tree-keyed 77 to take precedence over the commit-keyed 11", got["go"])
+	}
+}
+
+// The premise of versioning stateDir is that an entry recorded under a
+// superseded metric is never read as the current one. A baseline sitting at
+// the branch root — where entries predating the version-keyed layout live —
+// must therefore be a clean cache miss, not a hit whose number means
+// something else.
+func TestReadBaselineIgnoresEntriesOutsideTheStateDir(t *testing.T) {
+	ctx := context.Background()
+	run := gitRunner(t, ctx)
+
+	origin := t.TempDir()
+	run(origin, "init", "--bare", "-b", "main", ".")
+	seed := t.TempDir()
+	run(seed, "init", "-b", BranchName, ".")
+	run(seed, "config", "user.email", "t@t")
+	run(seed, "config", "user.name", "t")
+	// Deliberately at the branch root, not under StatePath's directory.
+	if err := os.WriteFile(filepath.Join(seed, "deadbeef.json"), []byte(`{"go":58.5}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run(seed, "add", "-A")
+	run(seed, "commit", "-m", "baseline under the superseded layout")
+	run(seed, "remote", "add", "origin", origin)
+	run(seed, "push", "origin", BranchName)
+
+	clone := t.TempDir()
+	run(clone, "init", "-b", "main", ".")
+	run(clone, "remote", "add", "origin", origin)
+
+	if report, hit, err := ReadBaseline(ctx, clone, "deadbeef"); err != nil || hit {
+		t.Errorf("ReadBaseline = (%v, hit=%v, err=%v), want a cache miss — the entry is outside %s", report, hit, err, StatePath(""))
+	}
+	// The carry-forward walk must agree: an entry it cannot compare against is
+	// not one to carry forward from either.
+	if got := PriorBaselines(ctx, clone, "deadbeef", []string{"go"}, 5); len(got) != 0 {
+		t.Errorf("PriorBaselines = %v, want nothing carried from an entry outside the state dir", got)
 	}
 }

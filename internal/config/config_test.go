@@ -356,14 +356,14 @@ func write(t *testing.T, dir, contents string) {
 	}
 }
 
-func TestLoadTypeScriptLinterDefaultsToESLint(t *testing.T) {
+func TestLoadTypeScriptLinterDefaultsToBiome(t *testing.T) {
 	dir := t.TempDir()
 	cfg, err := Load(dir)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.TypeScript.Linter != LinterESLint {
-		t.Errorf("TypeScript.Linter = %q, want %q — every repo predating this key must keep ESLint", cfg.TypeScript.Linter, LinterESLint)
+	if cfg.TypeScript.Linter != LinterBiome {
+		t.Errorf("TypeScript.Linter = %q, want %q — Biome is the only engine", cfg.TypeScript.Linter, LinterBiome)
 	}
 }
 
@@ -377,15 +377,34 @@ func TestLoadTypeScriptLinterBiome(t *testing.T) {
 	if cfg.TypeScript.Linter != LinterBiome {
 		t.Errorf("TypeScript.Linter = %q, want %q", cfg.TypeScript.Linter, LinterBiome)
 	}
-	// Opting into Biome must not disturb anything else in the section.
+	// Naming the linter explicitly must not disturb anything else in the section.
 	if !cfg.TypeScript.Enabled {
 		t.Error("TypeScript.Enabled was zeroed by a partial typescript: section")
 	}
 }
 
-// TestLoadRejectsUnknownLinter guards the failure mode the validator exists for:
-// a misspelled opt-in that silently falls back to ESLint would have a repo
-// believe it had migrated while bulwark ran the old linter and reported [PASS].
+// A repo still carrying `linter: eslint` has stated which rule set it gates on.
+// Accepting the key and running Biome anyway would change that silently —
+// Biome's security group is six JSX/eval/secret rules where
+// eslint-plugin-security was Node/backend heuristics, and Biome's correctness
+// group fires on things ESLint never reported. It must be told.
+func TestLoadRejectsTheRetiredESLintValue(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "typescript:\n  linter: eslint\n")
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("Load silently accepted the retired eslint linter")
+	}
+	for _, want := range []string{"typescript.linter", "eslint", "biome"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error does not mention %q, so it cannot be acted on: %v", want, err)
+		}
+	}
+}
+
+// TestLoadRejectsUnknownLinter guards the failure mode the validator exists
+// for: a misspelled value that silently fell back would have a repo believe it
+// had configured something bulwark never read, while every run reported [PASS].
 func TestLoadRejectsUnknownLinter(t *testing.T) {
 	dir := t.TempDir()
 	write(t, dir, "typescript:\n  linter: bimoe\n")
@@ -395,5 +414,56 @@ func TestLoadRejectsUnknownLinter(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "typescript.linter") {
 		t.Errorf("error does not name the offending key: %v", err)
+	}
+}
+
+// The floor is opt-in: absent from .bulwark.yml it must be 0, which disables
+// the gate. A default above 0 would fail existing repos on a bulwark upgrade
+// over a gap they never agreed to gate on.
+func TestCoverageFloorDefaultsToDisabled(t *testing.T) {
+	if got := Default().Coverage.Floor; got != 0 {
+		t.Errorf("default coverage.floor = %v, want 0 (disabled)", got)
+	}
+	cfg, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Coverage.Floor; got != 0 {
+		t.Errorf("coverage.floor with no config file = %v, want 0", got)
+	}
+}
+
+func TestCoverageFloorLoadsFromFile(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "coverage:\n  floor: 60\n")
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Coverage.Floor != 60 {
+		t.Errorf("coverage.floor = %v, want 60", cfg.Coverage.Floor)
+	}
+	// Setting the floor must not disturb the other coverage defaults.
+	if cfg.Coverage.Tolerance != 0.1 || cfg.Coverage.Source != SourceRun {
+		t.Errorf("coverage defaults disturbed: %+v", cfg.Coverage)
+	}
+}
+
+// A floor no unit could satisfy, or one that quietly disables itself, is
+// rejected rather than accepted: NaN makes every comparison false, so the
+// gate would print nothing and pass while looking configured, and a floor
+// above 100 fails a fully covered unit.
+func TestCoverageFloorRejectsImpossibleValues(t *testing.T) {
+	for _, body := range []string{
+		"coverage:\n  floor: -1\n",
+		"coverage:\n  floor: 101\n",
+		"coverage:\n  floor: .nan\n",
+		"coverage:\n  floor: .inf\n",
+	} {
+		dir := t.TempDir()
+		write(t, dir, body)
+		if _, err := Load(dir); err == nil {
+			t.Errorf("Load accepted %q, want a rejection", body)
+		}
 	}
 }

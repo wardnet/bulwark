@@ -36,37 +36,29 @@ type Language struct {
 	Exclude []string `yaml:"exclude"`
 }
 
-// Linter names which engine backs the TypeScript check. Like Source, it is
-// named for the decision the repo makes rather than for bulwark's behavior:
-// which linter this repo has migrated to. The answer is a property of the repo
-// and holds for every invocation in it.
-//
-// The two are mutually exclusive by design, and there is deliberately no
-// "both". They are also not interchangeable rule sets — eslint-plugin-security
-// is a set of Node/backend heuristics (detect-child-process,
-// detect-object-injection, detect-non-literal-fs-filename, …) while Biome's
-// security group is six JSX/eval/secret rules, and only noGlobalEval genuinely
-// coincides with anything ESLint's plugin has. Switching therefore changes what
-// bulwark gates on. That is accepted because it is opt-in per repo, and Semgrep
-// still runs across every ecosystem either way. See docs/adr/0005.
+// Linter names which engine backs the TypeScript check. Biome is the only
+// value, and the key survives a single-engine world for one reason: a repo
+// that still carries `linter: eslint` must be told, not silently switched.
+// Dropping the field would make yaml.Unmarshal ignore it, and such a repo
+// would start gating on a different rule set — more correctness findings,
+// fewer Node/backend security heuristics — with nothing in the output saying
+// so. See docs/adr/0008.
 type Linter string
 
 const (
-	// LinterESLint is the default: bulwark's pinned ESLint +
-	// eslint-plugin-security, reporting security findings only.
-	LinterESLint Linter = "eslint"
-	// LinterBiome is opt-in. Biome reports its security *and* correctness
-	// groups, so a repo that opts in is gating on more than security.
+	// LinterBiome reports Biome's security *and* correctness groups.
 	LinterBiome Linter = "biome"
+	// LinterESLint is retired. It is defined so validateLinter can recognise
+	// it and name what happened, and is never a value bulwark acts on.
+	LinterESLint Linter = "eslint"
 )
 
 // TypeScriptLanguage extends Language with TS-only coverage install
 // configuration.
 type TypeScriptLanguage struct {
 	Language `yaml:",inline"`
-	// Linter selects the engine backing the TypeScript check. Defaults to
-	// LinterESLint, which is the behavior every repo had before this key
-	// existed.
+	// Linter selects the engine backing the TypeScript check. LinterBiome is
+	// the only accepted value.
 	Linter Linter `yaml:"linter"`
 	// Install overrides coverage's install-command auto-detection (npm ci /
 	// corepack enable && yarn install --immutable / pnpm install
@@ -249,6 +241,24 @@ type Coverage struct {
 	// tolerated dips can't compound across merges. The patch gate has its
 	// own knob (Patch.Tolerance).
 	Tolerance float64 `yaml:"tolerance"`
+	// Floor is the minimum coverage percentage any single measured unit — a
+	// Go module, a Rust crate/workspace root, a TypeScript package — must
+	// reach. 0 disables the check, which is the default: it is opt-in, so
+	// upgrading bulwark never starts failing a repo over a gap it has always
+	// had.
+	//
+	// It exists because the aggregate figure is a line-weighted ratio, and
+	// weighting by lines is deliberately blind to a small unit nobody tests:
+	// a package with 0 of 8 lines covered is 0.1% of an 8,305-line repo, so
+	// the headline barely moves and the gate says nothing. The two questions
+	// are genuinely different — "did this change leave code untested?" is the
+	// aggregate, "is there a unit nobody tests at all?" is this — and neither
+	// answers the other. See docs/adr/0007-line-weighted-coverage-aggregation.md.
+	//
+	// Compared at the report's display precision (tenths), like the
+	// tolerances, so a unit shown as meeting the floor is never failed for a
+	// difference the report cannot show.
+	Floor float64 `yaml:"floor"`
 }
 
 // Toolchain is the override surface for language-toolchain provisioning —
@@ -295,7 +305,7 @@ type Config struct {
 func Default() Config {
 	return Config{
 		Rust:       Language{Enabled: true},
-		TypeScript: TypeScriptLanguage{Language: Language{Enabled: true}, Linter: LinterESLint},
+		TypeScript: TypeScriptLanguage{Language: Language{Enabled: true}, Linter: LinterBiome},
 		Go:         Language{Enabled: true},
 		Semgrep:    Semgrep{Enabled: true, Config: "auto"},
 		Toolchain:  Toolchain{Enabled: true},
@@ -339,6 +349,9 @@ func Load(root string) (Config, error) {
 	if err := validateLinter(cfg); err != nil {
 		return Config{}, fmt.Errorf("%s: %w", path, err)
 	}
+	if err := validateFloor(cfg); err != nil {
+		return Config{}, fmt.Errorf("%s: %w", path, err)
+	}
 	return cfg, nil
 }
 
@@ -356,17 +369,25 @@ func validateSource(cfg Config) error {
 	}
 }
 
-// validateLinter rejects any typescript.linter other than the two defined
-// values, for the same reason validateSource does: silently falling back to
-// eslint on a typo ("biomejs", "Biome") would run a linter the repo believes it
-// has migrated off, and report [PASS] the whole time. A misspelled opt-in that
-// silently does nothing is the worst outcome available here.
+// validateLinter accepts only LinterBiome, and gives the retired ESLint value
+// its own message.
+//
+// Rejecting rather than ignoring is the whole point. A repo carrying
+// `linter: eslint` has stated which rule set it gates on; accepting the key and
+// running Biome anyway would change that silently — Biome's security group is
+// six JSX/eval/secret rules where eslint-plugin-security was Node/backend
+// heuristics, and Biome's correctness group fires on things ESLint never
+// reported. A scan that quietly starts measuring something else is the failure
+// this file rejects unknown values to prevent; a value that used to be valid
+// deserves the same treatment, and a better sentence.
 func validateLinter(cfg Config) error {
 	switch cfg.TypeScript.Linter {
-	case LinterESLint, LinterBiome:
+	case LinterBiome:
 		return nil
+	case LinterESLint:
+		return fmt.Errorf("typescript.linter: %q is no longer supported — Biome is the only TypeScript linter. Remove the key (or set it to %q) and review the rule-set change in docs/adr/0008", LinterESLint, LinterBiome)
 	default:
-		return fmt.Errorf("typescript.linter must be %q or %q, got %q", LinterESLint, LinterBiome, cfg.TypeScript.Linter)
+		return fmt.Errorf("typescript.linter must be %q, got %q", LinterBiome, cfg.TypeScript.Linter)
 	}
 }
 
@@ -383,6 +404,19 @@ func validateTolerances(cfg Config) error {
 		if math.IsNaN(tol) || math.IsInf(tol, 0) || tol < 0 {
 			return fmt.Errorf("%s must be a finite, non-negative number of percentage points, got %v", name, tol)
 		}
+	}
+	return nil
+}
+
+// validateFloor rejects a per-unit floor no unit could satisfy or that would
+// silently disable itself. NaN makes every comparison false, so the gate
+// prints nothing and passes while looking configured; a floor above 100 fails
+// every unit including a fully covered one, which is a typo (1000 for 100)
+// rather than a policy anyone holds.
+func validateFloor(cfg Config) error {
+	floor := cfg.Coverage.Floor
+	if math.IsNaN(floor) || math.IsInf(floor, 0) || floor < 0 || floor > 100 {
+		return fmt.Errorf("coverage.floor must be a percentage between 0 and 100 (0 disables it), got %v", floor)
 	}
 	return nil
 }

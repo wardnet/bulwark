@@ -78,7 +78,11 @@ func TestCoverageOnMainRecordsFullyCarriedBaselineWhenNothingMeasured(t *testing
 	run(seed, "init", "-b", gitstate.BranchName, ".")
 	run(seed, "config", "user.email", "t@t")
 	run(seed, "config", "user.name", "t")
-	if err := os.WriteFile(filepath.Join(seed, c1+".json"), []byte(`{"typescript":93.8}`), 0o600); err != nil {
+	seeded := filepath.Join(seed, filepath.FromSlash(gitstate.StatePath(c1)))
+	if err := os.MkdirAll(filepath.Dir(seeded), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(seeded, []byte(`{"typescript":93.8}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	run(seed, "add", "-A")
@@ -105,7 +109,7 @@ func TestCoverageOnMainRecordsFullyCarriedBaselineWhenNothingMeasured(t *testing
 	if err != nil {
 		t.Fatalf("resolve tree for %s: %v", c2, err)
 	}
-	r := executil.Run(ctx, repo, "git", "show", "origin/"+gitstate.BranchName+":"+tree+".json")
+	r := executil.Run(ctx, repo, "git", "show", "origin/"+gitstate.BranchName+":"+gitstate.StatePath(tree))
 	if !r.Ok() {
 		t.Fatalf("no baseline recorded for tree %s (commit %s): %v\nstdout: %s\nstderr: %s", tree, c2, r.Err, out.String(), errOut.String())
 	}
@@ -788,5 +792,215 @@ func TestFormatReport(t *testing.T) {
 	}
 	if got := formatReport(map[string]float64{}); got != "" {
 		t.Errorf("formatReport(empty) = %q, want \"\"", got)
+	}
+}
+
+func runFloorReport(t *testing.T, floor float64, units ...coverage.Unit) (string, error) {
+	t.Helper()
+	cmd := &cobra.Command{}
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	err := floorReport(cmd, units, floor, []detect.Ecosystem{detect.Go, detect.Rust, detect.TypeScript})
+	return buf.String(), err
+}
+
+// The floor is opt-in: a repo that never set one must see no new line and no
+// new failure when it upgrades, however bad its worst unit is.
+func TestFloorReportDisabledByDefault(t *testing.T) {
+	out, err := runFloorReport(t, config.Default().Coverage.Floor,
+		coverage.Unit{Lang: "typescript", Dir: "packages/layout", Lines: coverage.LineCount{Covered: 0, Total: 8}})
+	if err != nil {
+		t.Fatalf("floor 0 must gate nothing, got error: %v", err)
+	}
+	if out != "" {
+		t.Errorf("floor 0 printed %q, want nothing at all", out)
+	}
+}
+
+// What the line-weighted aggregate cannot see: an untested package that is
+// 8 lines of 8,305 moves the headline by 0.1%, so only a per-unit floor
+// reports it.
+func TestFloorReportFailsAUnitBelowTheFloor(t *testing.T) {
+	out, err := runFloorReport(t, 50,
+		coverage.Unit{Lang: "typescript", Dir: "packages/expressions", Lines: coverage.LineCount{Covered: 4300, Total: 4494}},
+		coverage.Unit{Lang: "typescript", Dir: "packages/layout", Lines: coverage.LineCount{Covered: 0, Total: 8}})
+	if err == nil {
+		t.Fatal("a unit at 0% against a 50% floor must fail the gate")
+	}
+	if !strings.Contains(out, "[FAIL]") || !strings.Contains(out, "packages/layout") {
+		t.Errorf("expected a [FAIL] line naming packages/layout, got: %q", out)
+	}
+	if !strings.Contains(out, "0/8 lines") {
+		t.Errorf("expected the unit's counts in the line, got: %q", out)
+	}
+	if strings.Contains(out, "packages/expressions") {
+		t.Errorf("a unit above the floor must not be listed individually, got: %q", out)
+	}
+}
+
+func TestFloorReportPassesWhenEveryUnitClears(t *testing.T) {
+	out, err := runFloorReport(t, 50,
+		coverage.Unit{Lang: "go", Dir: "", Lines: coverage.LineCount{Covered: 9, Total: 10}},
+		coverage.Unit{Lang: "go", Dir: "sdk", Lines: coverage.LineCount{Covered: 6, Total: 10}})
+	if err != nil {
+		t.Fatalf("every unit clears the floor, got error: %v", err)
+	}
+	if !strings.Contains(out, "[PASS]") || !strings.Contains(out, "floor: 2 of 2 unit(s)") {
+		t.Errorf("expected a single [PASS] summary line naming cleared-of-total, got: %q", out)
+	}
+}
+
+// A unit with no coverage report must be named, never folded into the passing
+// count. The language-level warning cannot cover this: a language reports a
+// percentage as soon as one of its units measures, so a repo whose CI
+// path-filtered most of its packages has a fully measured language and a
+// floor gate that saw one package — and a bare "[PASS] floor: N unit(s)"
+// reads in the PR comment as if the gate covered the repo.
+func TestFloorReportNamesUnmeasuredUnits(t *testing.T) {
+	cmd := &cobra.Command{}
+	var out, errOut bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	err := floorReport(cmd, []coverage.Unit{
+		{Lang: "typescript", Dir: "packages/measured", Lines: coverage.LineCount{Covered: 90, Total: 100}},
+		{Lang: "typescript", Dir: "packages/skipped"},
+	}, 50, []detect.Ecosystem{detect.TypeScript})
+	if err != nil {
+		t.Fatalf("an unmeasured unit must not fail the gate on its own, got: %v", err)
+	}
+	if !strings.Contains(out.String(), "[UNMEASURED]") || !strings.Contains(out.String(), "packages/skipped") {
+		t.Errorf("expected an [UNMEASURED] line naming packages/skipped, got: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "floor: 1 of 2 unit(s)") {
+		t.Errorf("the PASS line must show cleared-of-total so a partial run is visible, got: %q", out.String())
+	}
+	// Stderr, not stdout: action.yml's PR-comment builder scrapes bracketed
+	// tags from stdout with a pattern that is not line-anchored.
+	if !strings.Contains(errOut.String(), "packages/skipped") {
+		t.Errorf("expected a stderr warning naming the missing report, got: %q", errOut.String())
+	}
+}
+
+// An unmeasured unit is not a unit at 0%: it must never be failed against the
+// floor, which is the whole reason Compute returns it with a zero LineCount
+// rather than dropping it.
+func TestFloorReportDoesNotFailAnUnmeasuredUnit(t *testing.T) {
+	_, err := runFloorReport(t, 90,
+		coverage.Unit{Lang: "rust", Dir: "daemon"},
+		coverage.Unit{Lang: "rust", Dir: "cli", Lines: coverage.LineCount{Covered: 95, Total: 100}})
+	if err != nil {
+		t.Errorf("an unmeasured unit must not be gated as 0%%, got: %v", err)
+	}
+}
+
+// The floor is compared at the report's display precision, like the
+// tolerances: a unit shown as meeting the floor must never be failed over a
+// difference the report cannot show.
+func TestFloorReportComparesAtDisplayPrecision(t *testing.T) {
+	// 8524/10000 = 85.24%, displayed as 85.2%, against a floor of 85.2%.
+	if _, err := runFloorReport(t, 85.2,
+		coverage.Unit{Lang: "rust", Dir: "daemon", Lines: coverage.LineCount{Covered: 8524, Total: 10000}}); err != nil {
+		t.Errorf("a unit displayed at exactly the floor must pass, got error: %v", err)
+	}
+}
+
+// A unit rooted at --dir itself has an empty relative directory, which would
+// otherwise print as nothing at all and leave the line unattributable.
+func TestFloorReportNamesTheRootUnit(t *testing.T) {
+	out, _ := runFloorReport(t, 90,
+		coverage.Unit{Lang: "go", Dir: "", Lines: coverage.LineCount{Covered: 1, Total: 10}})
+	if !strings.Contains(out, "go floor: . at 10.0%") {
+		t.Errorf("expected the root unit named \".\", got: %q", out)
+	}
+}
+
+// coverage.Compute measures every language it detects without consulting
+// `enabled:` in .bulwark.yml, so its units can carry a language the repo
+// opted out of gating. A per-unit gate must not turn that into one build
+// failure per crate for a language nobody asked to be gated on.
+func TestFloorReportSkipsDisabledLanguages(t *testing.T) {
+	cmd := &cobra.Command{}
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	err := floorReport(cmd, []coverage.Unit{
+		{Lang: "go", Dir: "", Lines: coverage.LineCount{Covered: 90, Total: 100}},
+		{Lang: "rust", Dir: "daemon", Lines: coverage.LineCount{Covered: 0, Total: 500}},
+	}, 60, []detect.Ecosystem{detect.Go})
+	if err != nil {
+		t.Fatalf("a crate in a disabled language must not fail the floor gate, got: %v", err)
+	}
+	if strings.Contains(out.String(), "rust") {
+		t.Errorf("a disabled language must not appear in the floor report, got: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "floor: 1 of 1 unit(s)") {
+		t.Errorf("the enabled language's unit must still be counted, got: %q", out.String())
+	}
+}
+
+// The floor is an absolute standard with no baseline, so unlike the aggregate
+// and patch gates it is meaningful on main too: the current commit IS the
+// baseline there, but a unit is still either above the bar or below it.
+// Skipping it would leave main ungated on a unit that arrived through a path
+// no pull request measured. The baseline is still recorded first, and
+// unconditionally — losing it over a floor failure would push every later
+// pull request into a recompute-nothing cache miss.
+func TestCoverageOnMainRecordsBaselineThenGatesOnTheFloor(t *testing.T) {
+	ctx := context.Background()
+	run := func(dir string, args ...string) {
+		t.Helper()
+		if r := executil.Run(ctx, dir, "git", args...); !r.Ok() {
+			t.Fatalf("git %v: %v\n%s", args, r.Err, r.Output)
+		}
+	}
+
+	origin := t.TempDir()
+	run(origin, "init", "--bare", "-b", "main", ".")
+
+	repo := t.TempDir()
+	run(repo, "init", "-b", "main", ".")
+	run(repo, "config", "user.email", "t@t")
+	run(repo, "config", "user.name", "t")
+	// One Go module, entirely uncovered, against a floor it cannot meet.
+	for name, body := range map[string]string{
+		"go.mod":        "module fixture\n\ngo 1.26\n",
+		"main.go":       "package fixture\n\nfunc Foo() int { return 1 }\n",
+		"coverage.out":  "mode: set\nfixture/main.go:3.16,3.28 1 0\n",
+		config.FileName: "coverage:\n  source: report\n  floor: 50\n",
+	} {
+		if err := os.WriteFile(filepath.Join(repo, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run(repo, "add", "-A")
+	run(repo, "commit", "-m", "fixture")
+	run(repo, "remote", "add", "origin", origin)
+	run(repo, "push", "origin", "main")
+	run(repo, "fetch", "origin")
+
+	cmd := newCoverageCmd()
+	var out, errOut bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	cmd.SetArgs([]string{"--dir", repo})
+	err := cmd.Execute()
+
+	if !strings.Contains(out.String(), "recorded coverage baseline") {
+		t.Errorf("the baseline must be recorded even when the floor fails, got stdout: %q", out.String())
+	}
+	if err == nil {
+		t.Errorf("a unit at 0%% against a 50%% floor must fail the main run too, got nil\nstdout: %s", out.String())
+	}
+	if !strings.Contains(out.String(), "[FAIL]") || !strings.Contains(out.String(), "floor") {
+		t.Errorf("expected a [FAIL] floor line on the main run, got stdout: %q", out.String())
+	}
+
+	// The recorded baseline must have landed on the branch regardless.
+	run(repo, "fetch", "origin", gitstate.BranchName)
+	tree, treeErr := gitstate.TreeSHA(ctx, repo, "HEAD")
+	if treeErr != nil {
+		t.Fatalf("resolve tree: %v", treeErr)
+	}
+	if r := executil.Run(ctx, repo, "git", "show", "origin/"+gitstate.BranchName+":"+gitstate.StatePath(tree)); !r.Ok() {
+		t.Errorf("no baseline recorded for tree %s despite the floor failure: %v", tree, r.Err)
 	}
 }

@@ -120,8 +120,83 @@ type GoModuleProfile struct {
 	RelDir string
 }
 
+// LineCount is one measured unit's tally of executable lines: how many the
+// coverage report knows about, and how many of those were hit. For Go it
+// counts statements rather than lines, because that is what a Go coverage
+// profile records; the ratio is the same quantity either way.
+//
+// Carrying the counts rather than a percentage is what lets a language's
+// figure be the ratio of its summed counts. A percentage is a lossy
+// reduction: once a unit is down to one number, its size is gone, and the
+// only aggregation left is an unweighted mean in which a 10-line package
+// moves the headline as much as a 5,000-line one.
+type LineCount struct {
+	Covered int
+	Total   int
+}
+
+// Percent is the covered-over-total ratio as a percentage. Total is never
+// zero on a LineCount that reached a Unit — a unit with nothing to measure
+// is dropped at the point it is measured, so no 0/0 ever enters an
+// aggregate.
+func (c LineCount) Percent() float64 {
+	if c.Total == 0 {
+		return 0
+	}
+	return float64(c.Covered) / float64(c.Total) * 100
+}
+
+// Unit is one independently-discovered piece of a language's coverage: a Go
+// module, a Rust crate/workspace root, or a TypeScript package. Compute
+// returns them alongside the per-language percentages so a caller can gate
+// on the distribution as well as the total — the per-unit floor in
+// cmd/bulwark/coverage.go is the reason they leave this package at all,
+// since a line-weighted headline cannot see a small unit with no tests.
+//
+// Discovered, not measured: a unit whose report is missing is returned with a
+// zero Lines rather than dropped. A language reports a percentage as long as
+// one of its units measured, so dropping the rest would leave the floor gate
+// silently covering fewer units than the repo holds while the language still
+// looks fully gated — and the per-language warnUnmeasured cannot see it,
+// because the language did measure. Use Measured to tell the two apart.
+type Unit struct {
+	// Lang is the detect.Ecosystem this unit belongs to, as a string.
+	Lang string
+	// Dir is the unit root relative to Compute's dir, "" when the unit root
+	// is dir itself.
+	Dir string
+	// Lines is the unit's own tally. Its Total is zero exactly when the unit
+	// produced no measurement.
+	Lines LineCount
+}
+
+// Measured reports whether this unit produced a coverage measurement. It is
+// the single predicate for that distinction: an unmeasured unit must never
+// reach an aggregate or a floor comparison as a 0%, only as "not gated".
+func (u Unit) Measured() bool {
+	return u.Lines.Total > 0
+}
+
+// aggregate sums every measured unit's counts into one language-level tally.
+// This is the whole point of carrying counts: sum-covered over sum-total
+// weights each unit by its size, where a mean of percentages weights them all
+// equally. Unmeasured units contribute nothing rather than a zero.
+func aggregate(units []Unit) LineCount {
+	var sum LineCount
+	for _, u := range units {
+		if !u.Measured() {
+			continue
+		}
+		sum.Covered += u.Lines.Covered
+		sum.Total += u.Lines.Total
+	}
+	return sum
+}
+
 // Compute returns a coverage percentage per detected ecosystem under dir,
-// plus whatever patch-coverage sources want asked for. An ecosystem is
+// every unit that percentage was summed from, and whatever patch-coverage
+// sources want asked for. A language's percentage is the ratio of its units'
+// summed line counts, not the mean of their percentages. An ecosystem is
 // silently omitted from the percentage map (not an error) when its coverage
 // tooling isn't available or produces no measurable result — coverage
 // tooling is more varied across projects than a linter, so bulwark reports
@@ -139,10 +214,10 @@ type GoModuleProfile struct {
 // PatchSources paths (it removes the scratch directory SourceRun writes
 // reports into; SourceReport's cleanup is a no-op since it only ever reads
 // files the caller/CI already produced).
-func Compute(ctx context.Context, dir string, cfg config.Config, source Source, reports ReportPaths, want PatchWanted) (map[string]float64, PatchSources, func(), error) {
+func Compute(ctx context.Context, dir string, cfg config.Config, source Source, reports ReportPaths, want PatchWanted) (map[string]float64, []Unit, PatchSources, func(), error) {
 	ecosystems, err := detect.Ecosystems(dir, cfg.AllExcludes())
 	if err != nil {
-		return nil, PatchSources{}, func() {}, err
+		return nil, nil, PatchSources{}, func() {}, err
 	}
 
 	workDir := ""
@@ -150,42 +225,44 @@ func Compute(ctx context.Context, dir string, cfg config.Config, source Source, 
 	if source == SourceRun {
 		tmp, err := os.MkdirTemp("", "bulwark-coverage-*")
 		if err != nil {
-			return nil, PatchSources{}, func() {}, err
+			return nil, nil, PatchSources{}, func() {}, err
 		}
 		workDir = tmp
 		cleanup = func() { _ = os.RemoveAll(tmp) }
 	}
 
 	report := map[string]float64{}
+	var units []Unit
 	var sources PatchSources
 	for _, e := range ecosystems {
-		var pct float64
+		var measured []Unit
 		var ok bool
 		switch e {
 		case detect.Rust:
 			var lcovPaths map[string]string
-			pct, lcovPaths, ok = rustCoverage(ctx, dir, workDir, source, cfg.Rust.Exclude, reports.Rust, reports.RustLCOV, want.Rust)
+			measured, lcovPaths, ok = rustCoverage(ctx, dir, workDir, source, cfg.Rust.Exclude, reports.Rust, reports.RustLCOV, want.Rust)
 			if ok && want.Rust {
 				sources.RustLCOV = lcovPaths
 			}
 		case detect.Go:
 			var goProfiles map[string]GoModuleProfile
-			pct, goProfiles, ok = goCoverage(ctx, dir, workDir, source, cfg.Go.Exclude, reports.Go)
+			measured, goProfiles, ok = goCoverage(ctx, dir, workDir, source, cfg.Go.Exclude, reports.Go)
 			if ok && want.Go {
 				sources.GoProfiles = goProfiles
 			}
 		case detect.TypeScript:
-			pct, ok = tsCoverage(ctx, dir, cfg.TypeScript.Exclude, source, cfg.TypeScript.Install)
+			measured, ok = tsCoverage(ctx, dir, cfg.TypeScript.Exclude, source, cfg.TypeScript.Install)
 			if ok && want.TypeScript {
 				pkgDirs, _ := detect.TSPackageDirs(dir, cfg.TypeScript.Exclude)
 				sources.TSLCOV = tsLCOVSources(pkgDirs)
 			}
 		}
 		if ok {
-			report[string(e)] = pct
+			report[string(e)] = aggregate(measured).Percent()
+			units = append(units, measured...)
 		}
 	}
-	return report, sources, cleanup, nil
+	return report, units, sources, cleanup, nil
 }
 
 // moduleName returns the Go module path rooted at moduleDir (e.g.
@@ -252,23 +329,28 @@ func findReport(dir, override string, candidates []string) (string, bool) {
 // produces one.
 var goReportCandidates = []string{"coverage.out", "cover.out", "c.out"}
 
-// goCoverage reads the statement coverage percentage for every independent Go
-// module discovered under dir (see detect.GoModuleDirs), averaging across the
-// modules that produced a result — mirroring how rustCoverage averages across
-// crates and tsCoverage across packages. Returns a map of module dir -> what
+// goCoverage measures statement coverage for every independent Go module
+// discovered under dir (see detect.GoModuleDirs), returning one Unit per
+// module that produced a result — mirroring how rustCoverage reports per
+// crate and tsCoverage per package. Also returns a map of module dir -> what
 // patch coverage needs to read that module's profile back.
+//
+// The units carry counts, not percentages, so the caller's language-level
+// figure is summed statements over summed statements. A mean of per-module
+// percentages instead lets a tiny module dominate a monorepo's headline.
 //
 // Discovering modules rather than treating dir as one is what makes a
 // monorepo work at all: `go test` and `go list -m` are both module-scoped, so
 // running them at a dir that merely *contains* modules measures nothing.
-func goCoverage(ctx context.Context, dir, workDir string, source Source, exclude []string, overrides GoReportOverrides) (float64, map[string]GoModuleProfile, bool) {
+func goCoverage(ctx context.Context, dir, workDir string, source Source, exclude []string, overrides GoReportOverrides) ([]Unit, map[string]GoModuleProfile, bool) {
 	moduleDirs, err := detect.GoModuleDirs(dir, exclude)
 	if err != nil || len(moduleDirs) == 0 {
-		return 0, nil, false
+		return nil, nil, false
 	}
 	solo := len(moduleDirs) == 1
 
-	var total, count float64
+	var units []Unit
+	measured := 0
 	profiles := map[string]GoModuleProfile{}
 	for i, moduleDir := range moduleDirs {
 		rel, err := filepath.Rel(dir, moduleDir)
@@ -278,31 +360,32 @@ func goCoverage(ctx context.Context, dir, workDir string, source Source, exclude
 		if rel == "." {
 			rel = ""
 		}
-		pct, src, ok := goCoverageOne(ctx, dir, moduleDir, rel, workDir, source, overrides, solo, i)
+		lines, src, ok := goCoverageOne(ctx, dir, moduleDir, rel, workDir, source, overrides, solo, i)
 		if !ok {
+			units = append(units, Unit{Lang: string(detect.Go), Dir: rel})
 			continue
 		}
-		total += pct
-		count++
+		measured++
+		units = append(units, Unit{Lang: string(detect.Go), Dir: rel, Lines: lines})
 		profiles[moduleDir] = src
 	}
-	if count == 0 {
-		return 0, nil, false
+	if measured == 0 {
+		return nil, nil, false
 	}
-	return total / count, profiles, true
+	return units, profiles, true
 }
 
 // goCoverageOne measures one module, either running `go test -coverprofile`
 // inside it (SourceRun) or parsing a profile another step already produced
 // (SourceReport). Every command runs in moduleDir rather than dir, because that
 // is the only place a module-scoped Go command works.
-func goCoverageOne(ctx context.Context, dir, moduleDir, moduleRelDir, workDir string, source Source, overrides GoReportOverrides, solo bool, idx int) (float64, GoModuleProfile, bool) {
+func goCoverageOne(ctx context.Context, dir, moduleDir, moduleRelDir, workDir string, source Source, overrides GoReportOverrides, solo bool, idx int) (LineCount, GoModuleProfile, bool) {
 	var profile string
 	switch source {
 	case SourceReport:
 		found, ok := findReportForUnit(dir, moduleDir, moduleRelDir, overrides, solo, goReportCandidates)
 		if !ok {
-			return 0, GoModuleProfile{}, false
+			return LineCount{}, GoModuleProfile{}, false
 		}
 		profile = found
 	default:
@@ -310,25 +393,27 @@ func goCoverageOne(ctx context.Context, dir, moduleDir, moduleRelDir, workDir st
 		// module overwrite the last, leaving only the final module measured.
 		profile = filepath.Join(workDir, fmt.Sprintf("cover-%d.out", idx))
 		if r := executil.Run(ctx, moduleDir, "go", "test", "-coverprofile="+profile, "./..."); !r.Ok() {
-			return 0, GoModuleProfile{}, false
+			return LineCount{}, GoModuleProfile{}, false
 		}
 	}
 
 	name := moduleName(ctx, moduleDir)
 	if name == "" {
-		return 0, GoModuleProfile{}, false
+		return LineCount{}, GoModuleProfile{}, false
 	}
 	src := GoModuleProfile{Profile: profile, ModuleName: name, RelDir: moduleRelDir}
-	pct, ok := goProfilePercent(src, dir)
+	lines, ok := goProfileLines(src, dir)
 	if !ok {
-		return 0, GoModuleProfile{}, false
+		return LineCount{}, GoModuleProfile{}, false
 	}
-	return pct, src, true
+	return lines, src, true
 }
 
-// goProfilePercent computes a module's statement coverage straight from its
-// profile: the covered-statements-over-total-statements ratio `go tool cover
-// -func` prints on its `total:` line, minus generated files.
+// goProfileLines counts a module's covered and total statements straight from
+// its profile — the two numbers behind the ratio `go tool cover -func` prints
+// on its `total:` line, minus generated files. A module the profile says has
+// no statements at all is reported as unmeasured rather than as a 0/0 that
+// would contribute nothing but still claim to be a result.
 //
 // Parsing rather than shelling out to `go tool cover -func` is what lets this
 // work from anywhere. That command resolves each profile entry's
@@ -340,10 +425,10 @@ func goCoverageOne(ctx context.Context, dir, moduleDir, moduleRelDir, workDir st
 //
 // It is also the only place a generated file can be dropped from the
 // denominator, which `go tool cover` offers no way to do.
-func goProfilePercent(src GoModuleProfile, dir string) (float64, bool) {
+func goProfileLines(src GoModuleProfile, dir string) (LineCount, bool) {
 	profiles, err := cover.ParseProfiles(src.Profile)
 	if err != nil {
-		return 0, false
+		return LineCount{}, false
 	}
 	var covered, total int
 	for _, p := range profiles {
@@ -358,9 +443,9 @@ func goProfilePercent(src GoModuleProfile, dir string) (float64, bool) {
 		}
 	}
 	if total == 0 {
-		return 0, false
+		return LineCount{}, false
 	}
-	return float64(covered) / float64(total) * 100, true
+	return LineCount{Covered: covered, Total: total}, true
 }
 
 // llvmCovExport is the subset of `cargo llvm-cov --json`'s export format
@@ -369,7 +454,8 @@ type llvmCovExport struct {
 	Data []struct {
 		Totals struct {
 			Lines struct {
-				Percent float64 `json:"percent"`
+				Count   int `json:"count"`
+				Covered int `json:"covered"`
 			} `json:"lines"`
 		} `json:"totals"`
 	} `json:"data"`
@@ -437,20 +523,25 @@ func isRegularFile(path string) bool {
 	return err == nil && info.Mode().IsRegular()
 }
 
-// rustCoverage reads the total line coverage percentage for every
-// independent Cargo crate/workspace root discovered under dir (see
-// detect.RustCrateDirs), averaging across crates that produced a result —
-// mirroring how tsCoverage averages across TS packages. Returns a map of
-// crate dir -> its resolved lcov export path (when wantLCOV is set and one
-// was resolved for that crate), for patch coverage.
-func rustCoverage(ctx context.Context, dir, workDir string, source Source, exclude []string, reportOverrides, lcovReportOverrides RustReportOverrides, wantLCOV bool) (float64, map[string]string, bool) {
+// rustCoverage counts lines for every independent Cargo crate/workspace root
+// discovered under dir (see detect.RustCrateDirs), returning one Unit per
+// crate that produced a result — mirroring how tsCoverage reports per TS
+// package. Also returns a map of crate dir -> its resolved lcov export path
+// (when wantLCOV is set and one was resolved for that crate), for patch
+// coverage.
+//
+// Counts rather than percentages, for the same reason goCoverage carries
+// them: a workspace of one 20-line helper crate and one 5,000-line crate has
+// one honest line-coverage figure, and it is not the mean of the two.
+func rustCoverage(ctx context.Context, dir, workDir string, source Source, exclude []string, reportOverrides, lcovReportOverrides RustReportOverrides, wantLCOV bool) ([]Unit, map[string]string, bool) {
 	crateDirs, err := detect.RustCrateDirs(dir, exclude)
 	if err != nil || len(crateDirs) == 0 {
-		return 0, nil, false
+		return nil, nil, false
 	}
 	solo := len(crateDirs) == 1
 
-	var total, count float64
+	var units []Unit
+	measured := 0
 	lcovPaths := map[string]string{}
 	for i, crateDir := range crateDirs {
 		rel, err := filepath.Rel(dir, crateDir)
@@ -460,24 +551,25 @@ func rustCoverage(ctx context.Context, dir, workDir string, source Source, exclu
 		if rel == "." {
 			rel = ""
 		}
-		pct, lcovPath, ok := rustCoverageOne(ctx, dir, crateDir, rel, workDir, source, reportOverrides, lcovReportOverrides, solo, wantLCOV, i)
+		lines, lcovPath, ok := rustCoverageOne(ctx, dir, crateDir, rel, workDir, source, reportOverrides, lcovReportOverrides, solo, wantLCOV, i)
 		if !ok {
+			units = append(units, Unit{Lang: string(detect.Rust), Dir: rel})
 			continue
 		}
-		total += pct
-		count++
+		measured++
+		units = append(units, Unit{Lang: string(detect.Rust), Dir: rel, Lines: lines})
 		if lcovPath != "" {
 			lcovPaths[crateDir] = lcovPath
 		}
 	}
-	if count == 0 {
-		return 0, nil, false
+	if measured == 0 {
+		return nil, nil, false
 	}
-	return total / count, lcovPaths, true
+	return units, lcovPaths, true
 }
 
-// rustCoverageOne reads one crate's total line coverage percentage from a
-// cargo-llvm-cov JSON export, either running `cargo llvm-cov` itself
+// rustCoverageOne reads one crate's total covered and total line counts from
+// a cargo-llvm-cov JSON export, either running `cargo llvm-cov` itself
 // (SourceRun — requires cargo-llvm-cov already installed, a cargo subcommand
 // like cargo-audit/cargo-deny that bulwark doesn't auto-install) or parsing
 // an existing export another step already produced (SourceReport — needs no
@@ -489,18 +581,18 @@ func rustCoverage(ctx context.Context, dir, workDir string, source Source, exclu
 // raw profile data on disk, and both the JSON and lcov reports are then
 // regenerated from that same profile via `--no-run` — no second test
 // execution.
-func rustCoverageOne(ctx context.Context, dir, crateDir, crateRelDir, workDir string, source Source, reportOverrides, lcovReportOverrides RustReportOverrides, solo, wantLCOV bool, idx int) (float64, string, bool) {
+func rustCoverageOne(ctx context.Context, dir, crateDir, crateRelDir, workDir string, source Source, reportOverrides, lcovReportOverrides RustReportOverrides, solo, wantLCOV bool, idx int) (LineCount, string, bool) {
 	var data []byte
 	var lcovPath string
 	switch source {
 	case SourceReport:
 		found, ok := findReportForUnit(dir, crateDir, crateRelDir, reportOverrides, solo, rustReportCandidates)
 		if !ok {
-			return 0, "", false
+			return LineCount{}, "", false
 		}
 		d, err := os.ReadFile(found) // #nosec G304 -- found is resolved from bulwark's own candidate list or an explicit CLI flag, not user input
 		if err != nil {
-			return 0, "", false
+			return LineCount{}, "", false
 		}
 		data = d
 		if wantLCOV {
@@ -510,22 +602,22 @@ func rustCoverageOne(ctx context.Context, dir, crateDir, crateRelDir, workDir st
 		}
 	default:
 		if !executil.Available("cargo-llvm-cov") {
-			return 0, "", false
+			return LineCount{}, "", false
 		}
 		if !wantLCOV {
 			r := executil.Run(ctx, crateDir, "cargo", "llvm-cov", "--summary-only", "--json")
 			if !r.Ok() {
-				return 0, "", false
+				return LineCount{}, "", false
 			}
 			data = []byte(r.Output)
 			break
 		}
 		if r := executil.Run(ctx, crateDir, "cargo", "llvm-cov", "--no-report"); !r.Ok() {
-			return 0, "", false
+			return LineCount{}, "", false
 		}
 		r := executil.Run(ctx, crateDir, "cargo", "llvm-cov", "--no-run", "--summary-only", "--json")
 		if !r.Ok() {
-			return 0, "", false
+			return LineCount{}, "", false
 		}
 		data = []byte(r.Output)
 		lcovOut := filepath.Join(workDir, fmt.Sprintf("rust-lcov-%d.info", idx))
@@ -536,9 +628,19 @@ func rustCoverageOne(ctx context.Context, dir, crateDir, crateRelDir, workDir st
 
 	var export llvmCovExport
 	if err := json.Unmarshal(data, &export); err != nil || len(export.Data) == 0 {
-		return 0, "", false
+		return LineCount{}, "", false
 	}
-	return export.Data[0].Totals.Lines.Percent, lcovPath, true
+	lines := LineCount{
+		Covered: export.Data[0].Totals.Lines.Covered,
+		Total:   export.Data[0].Totals.Lines.Count,
+	}
+	// A crate llvm-cov found no coverable lines in is unmeasured, not 0%
+	// covered: contributing 0/0 would be harmless to the aggregate but would
+	// present the crate to the per-unit floor as a unit with zero coverage.
+	if lines.Total <= 0 {
+		return LineCount{}, "", false
+	}
+	return lines, lcovPath, true
 }
 
 // istanbulSummary is the subset of Vitest/Istanbul's coverage-summary.json
@@ -546,7 +648,8 @@ func rustCoverageOne(ctx context.Context, dir, crateDir, crateRelDir, workDir st
 type istanbulSummary struct {
 	Total struct {
 		Lines struct {
-			Pct float64 `json:"pct"`
+			Total   int `json:"total"`
+			Covered int `json:"covered"`
 		} `json:"lines"`
 	} `json:"total"`
 }
@@ -667,42 +770,91 @@ func tsInstall(ctx context.Context, roots []string, override string) {
 // (skipping packages that don't declare one) to produce that file; in
 // SourceReport it only reads a file a prior step already produced, running
 // nothing.
-func tsCoverage(ctx context.Context, dir string, exclude []string, source Source, install string) (float64, bool) {
+func tsCoverage(ctx context.Context, dir string, exclude []string, source Source, install string) ([]Unit, bool) {
 	pkgDirs, err := detect.TSPackageDirs(dir, exclude)
 	if err != nil || len(pkgDirs) == 0 {
-		return 0, false
+		return nil, false
 	}
 
 	if source == SourceRun {
 		tsInstall(ctx, tsWorkspaceRoots(dir, pkgDirs), install)
 	}
 
-	var total, count float64
+	var units []Unit
+	measured := 0
 	for _, pkgDir := range pkgDirs {
-		if source == SourceRun {
-			if !hasCoverageScript(pkgDir) {
-				continue
-			}
-			if r := executil.Run(ctx, pkgDir, "npm", "run", "test:coverage"); !r.Ok() {
-				continue
-			}
-		}
-		summaryPath := filepath.Join(pkgDir, "coverage", "coverage-summary.json")
-		data, err := os.ReadFile(summaryPath) // #nosec G304 -- summaryPath is a fixed relative path under a detected package dir, not user input
+		rel, err := filepath.Rel(dir, pkgDir)
 		if err != nil {
 			continue
 		}
-		var summary istanbulSummary
-		if err := json.Unmarshal(data, &summary); err != nil {
+		if rel == "." {
+			rel = ""
+		}
+		// A package declaring no test:coverage script has opted out of being
+		// measured, which is a different state from a report bulwark expected
+		// and did not find. It is not a discovered unit at all: reporting one
+		// [UNMEASURED] line and one stderr warning per types-only or
+		// config-only package, on every run and in every PR comment, is noise
+		// that trains readers to ignore the tag that exists to be noticed.
+		//
+		// Under SourceRun the check comes first, because there is no point
+		// running a script that isn't there. Under SourceReport it is the
+		// fallback below instead: a report already on disk is authoritative
+		// whether or not the package declares a script to produce it, since a
+		// workspace-level runner can write into a package that names none.
+		if source == SourceRun && !hasCoverageScript(pkgDir) {
 			continue
 		}
-		total += summary.Total.Lines.Pct
-		count++
+		lines, ok := tsPackageLines(ctx, pkgDir, source)
+		if !ok {
+			// No report. Only a package that meant to produce one is
+			// unmeasured; the rest opted out.
+			if !hasCoverageScript(pkgDir) {
+				continue
+			}
+			units = append(units, Unit{Lang: string(detect.TypeScript), Dir: rel})
+			continue
+		}
+		measured++
+		units = append(units, Unit{Lang: string(detect.TypeScript), Dir: rel, Lines: lines})
 	}
-	if count == 0 {
-		return 0, false
+	if measured == 0 {
+		return nil, false
 	}
-	return total / count, true
+	return units, true
+}
+
+// tsPackageLines measures one package: under SourceRun by executing its own
+// test:coverage script first, then — either way — by reading the
+// coverage-summary.json Istanbul/Vitest writes at its fixed conventional
+// path. The caller has already established that the package declares such a
+// script; a false return here means the run or the report failed, which is
+// what makes the package unmeasured rather than opted out.
+func tsPackageLines(ctx context.Context, pkgDir string, source Source) (LineCount, bool) {
+	if source == SourceRun {
+		if r := executil.Run(ctx, pkgDir, "npm", "run", "test:coverage"); !r.Ok() {
+			return LineCount{}, false
+		}
+	}
+	summaryPath := filepath.Join(pkgDir, "coverage", "coverage-summary.json")
+	data, err := os.ReadFile(summaryPath) // #nosec G304 -- summaryPath is a fixed relative path under a detected package dir, not user input
+	if err != nil {
+		return LineCount{}, false
+	}
+	var summary istanbulSummary
+	if err := json.Unmarshal(data, &summary); err != nil {
+		return LineCount{}, false
+	}
+	// total.lines.{total,covered} rather than total.lines.pct: the counts are
+	// what make the language figure a line-weighted ratio instead of a mean in
+	// which a 230-line app outvotes a 4,494-line library.
+	lines := LineCount{Covered: summary.Total.Lines.Covered, Total: summary.Total.Lines.Total}
+	// A package with no executable lines is unmeasured, not 0% covered — same
+	// rule as Go's empty profile and Rust's zero line count.
+	if lines.Total <= 0 {
+		return LineCount{}, false
+	}
+	return lines, true
 }
 
 // packageJSON is the subset of package.json bulwark needs to detect whether
