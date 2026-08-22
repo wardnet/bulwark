@@ -93,9 +93,9 @@ func TestBiomeConfigEnablesTailwindDirectives(t *testing.T) {
 	}
 }
 
-// TestBiomeConfigIgnoresMatchesDefaultSkipDirs is the Biome counterpart of
-// TestEslintConfigIgnoresMatchesDefaultSkipDirs, and guards a failure verified
-// against Biome 2.5.8 directly: with these negations removed, Biome lints
+// TestBiomeConfigIgnoresMatchesDefaultSkipDirs guards a failure verified
+// against Biome directly, on 2.5.8 and again on 2.5.10: with these negations
+// removed, Biome lints
 // dist/ and reports findings inside a minified production bundle. The ignores
 // are load-bearing, not decorative.
 func TestBiomeConfigIgnoresMatchesDefaultSkipDirs(t *testing.T) {
@@ -141,8 +141,7 @@ func TestReportableBiomeGatesOnlyOnOurGroups(t *testing.T) {
 	// A file Biome cannot parse emits only `parse` diagnostics (category verified
 	// against 2.5.8 with a deliberately broken .ts file). Filtering those out
 	// leaves count == 0, which clears the error and prints "no findings" — a
-	// package where nothing was linted would report as a clean pass. ESLint's
-	// reportable() keeps its fatal diagnostics for exactly this reason.
+	// package where nothing was linted would report as a clean pass.
 	// Failure categories, none of which are rule opinions: a package where these
 	// fire was not successfully linted, and filtering them out reports it as a
 	// clean pass. internalError/io is the nastier one — Biome emits it with
