@@ -13,9 +13,23 @@ import (
 
 // Result is the outcome of running one external command.
 type Result struct {
-	Name   string
-	Args   []string
+	Name string
+	Args []string
+	// Output is everything the command wrote to stdout and stderr. Run
+	// streams it live as well, so for most tools it has already reached the
+	// terminal by the time anyone reads this field.
 	Output string
+	// Detail is findings a scanner package derived itself, for a tool whose
+	// real report never reaches the terminal at all. Biome is the case that
+	// needs it: bulwark sends its report to a file with --reporter-file so
+	// that Biome's own chatter cannot corrupt the JSON, which means nothing
+	// streams and Output holds no findings. A caller that only prints a
+	// pass/fail line then shows the developer a failure with no reason
+	// attached, in the terminal and in the PR comment alike.
+	//
+	// Empty for every tool that prints its own findings — reprinting those
+	// would duplicate what already streamed.
+	Detail string
 	Err    error
 }
 

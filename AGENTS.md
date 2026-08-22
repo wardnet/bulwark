@@ -26,13 +26,14 @@ internal/detect/                # ecosystem + TS-package detection (walks for Ca
 internal/config/                # .bulwark.yml loading (opt-outs + pipeline shape — see Configuration below)
 internal/toolchain/             # ensures the Go/Rust/Node runtime each detected ecosystem needs (see Toolchains below)
 internal/rust/                  # clippy, cargo-audit, cargo-deny
-internal/typescript/            # pinned ESLint + eslint-plugin-security; opt-in Biome (see Linters)
+internal/typescript/            # pinned Biome, the only TS linter (see Linters)
 internal/golang/                # gosec, govulncheck (installed into a version-keyed GOBIN dir)
 internal/semgrep/                # pinned Semgrep, installed via pipx
 internal/coverage/               # per-language coverage percentage (see Coverage below)
 internal/gitstate/               # bulwark-state branch read/write (see Coverage below)
 internal/executil/              # shared external-command runner every scanner package uses
 assets/bulwark-logo.png         # logo — used by README and the action's PR comment (see below)
+docs/release-notes/             # _header.md + one <tag>.md per release that needs one (see Release notes)
 .goreleaser.yml                 # build/release config (v2 schema)
 .golangci.yml                   # lint config (v2 schema)
 .github/workflows/{ci,release}.yml
@@ -103,8 +104,8 @@ rust:
 typescript:
   enabled: true
   exclude: ["legacy-app"]
-  linter: eslint         # or "biome" — which engine backs the TS check (see Linters
-                          # below). Mutually exclusive; there is deliberately no "both".
+  linter: biome          # the only accepted value. The retired "eslint" is rejected with an
+                          # error rather than silently run under Biome (see Linters below).
   install: ""            # override coverage's install-command auto-detection, e.g.
                           # "corepack enable && yarn install --immutable" (see Coverage below)
 go:
@@ -146,6 +147,11 @@ coverage:
                           # baseline 86.1%, regressed 0.0%"). Compared at display precision
                           # (tenths); 0 = fail any dip the report can show. Must be finite and
                           # non-negative — Load rejects anything else.
+  floor: 0               # minimum coverage any single measured unit (Go module, Rust crate/
+                          # workspace root, TS package) must reach. 0 = off, which is the default:
+                          # it is opt-in, so upgrading never starts failing a repo over a gap it
+                          # has always had. This is the signal line-weighting removes — see
+                          # Aggregation below.
   patch:
     tolerance: 0.1       # the patch gate's own dip allowance — deliberately independent, so
                           # loosening the aggregate knob never weakens the untested-new-code check
@@ -154,48 +160,90 @@ coverage:
 Omitting the file, or omitting a section/key within it, keeps that value at its default — see
 `internal/config/config_test.go` for the exact merge semantics.
 
-## Linters: ESLint (default) and Biome (opt-in)
+## Linters: Biome, and only Biome
 
-`typescript.linter` selects which engine backs the TypeScript check: `eslint` (the default,
-and byte-for-byte what every repo had before the key existed) or `biome`. They are mutually
-exclusive and there is deliberately no `both` — a repo is migrating, and the key names where
-it has got to. An unknown value is rejected by `config.validateLinter` rather than falling
-back, because a misspelled opt-in that silently keeps running the old linter is the one
-outcome nobody can detect.
+Biome backs the TypeScript check. `typescript.linter` accepts `biome` and nothing else; the
+retired `eslint` value is **rejected** by `config.validateLinter` with an error naming the
+removal, rather than accepted and quietly run under Biome. A repo that set that key stated
+which rule set it gates on, and switching it silently would change what the scan measures
+while every run still reported `[PASS]` — the same reason an unknown value is rejected rather
+than defaulted. `LinterESLint` stays defined for no purpose but to be recognised and refused.
 
-**The two are not interchangeable rule sets, and switching changes what bulwark gates on.**
-`eslint-plugin-security` is Node/backend heuristics (`detect-child-process`,
-`detect-object-injection`, `detect-non-literal-fs-filename`, `detect-unsafe-regex`, …);
+**Biome is not a replacement for `eslint-plugin-security` — Semgrep is, and it already ran.**
 Biome's `security` group is six JSX/eval/secret rules (`noBlankTarget`,
 `noDangerouslySetInnerHtml`, `noDangerouslySetInnerHtmlWithChildren`, `noGlobalEval`,
-`noScriptUrl`, `noSecrets`). Only `noGlobalEval` genuinely coincides with anything ESLint's
-plugin has. Under Biome, bulwark additionally gates on the **`correctness`** group, so a repo
-that opts in is gating on more than security. That is accepted because it is opt-in per repo,
-and Semgrep still runs across every ecosystem either way. See [ADR 0005](docs/adr/0005-optional-biome-linter.md).
+`noScriptUrl`, `noSecrets`), of which only `noGlobalEval` coincided with anything the plugin
+had; bulwark additionally gates on the **`correctness`** group, so the TypeScript check is not
+"security findings only" the way the others are. Measured against a fixture carrying all four
+classes, Semgrep at `config: auto` covers `detect-child-process` (with taint — it names the
+tainted argument) and `detect-non-literal-fs-filename` (as a path-traversal finding), partly
+covers `detect-unsafe-regex` (dynamic patterns via `detect-non-literal-regexp`, but no static
+ReDoS analysis of a literal), and does not cover `detect-object-injection` at all. Several of
+those Semgrep rules are ports of the ESLint ones and are stronger than the originals. The real
+gap is `detect-object-injection` — the plugin's most commonly disabled rule — plus
+literal-pattern ReDoS. Do not rebuild either as a Biome GritQL plugin: GritQL matches syntax
+against the CST with no dataflow or taint, so it could only produce a weaker copy of what
+Semgrep already does. See [ADR 0008](docs/adr/0008-biome-as-the-only-typescript-linter.md),
+and [ADR 0005](docs/adr/0005-optional-biome-linter.md) for the opt-in it supersedes.
 
-Four things about the Biome integration were established against Biome 2.5.8 directly rather
-than from its docs, and all four are load-bearing:
+**Why it went.** ESLint's TypeScript support is a *compiler* dependency, not a linter one:
+`@typescript-eslint/parser` declares `typescript` as a peer with an
+upper bound (`>=4.8.4 <6.1.0`), so bulwark's own pin manifest had to carry a `typescript`
+inside that window, and the window moves only when upstream ships support for a new compiler.
+`internal/typescript`'s package doc had recorded exactly this hazard — and a Dependabot PR
+bumped `typescript` across the ceiling anyway and merged, after which `npm ci` on the
+committed lockfile failed with `ERESOLVE` and every consumer with TypeScript got an install
+error instead of a lint result. CI stayed green throughout, because bulwark's own repo has no
+TypeScript to scan: its only `package.json` files are the pin manifests, which `.bulwark.yml`
+excludes by name, so `self-scan` cannot reach that code path. Biome parses TypeScript with its
+own Rust parser and depends on no compiler package, so `biome-pin` has no peer range to cross
+and the failure class does not exist for it.
 
-- **`files.includes` negations work from an out-of-tree config.** Biome resolves config globs
+Four things about the Biome integration were established against Biome directly rather than
+from its docs. The pin is now **2.5.10**, and `biome.json`'s `$schema` URL must be bumped with
+it — `TestBiomePinMatchesConfigSchema` fails the build otherwise, the same mirror guard
+`internal/golang/pins_test.go` provides for the Go constants. Re-verified on 2.5.10 where
+noted:
+
+- **`files.includes` negations work from an out-of-tree config** (re-verified on 2.5.10: an
+  `eval` inside `dist/` is not reported). Biome resolves config globs
   "relative to the folder the configuration file is in", and bulwark stages `biome.json` in its
   cache directory — so this looked like it would silently ignore nothing. It doesn't: `**`-prefixed
   negations are depth-agnostic and match correctly. But they are doing real work — with them
-  removed, Biome lints `dist/` and reports findings inside a minified production bundle, the exact
-  incident `TestEslintConfigIgnoresMatchesDefaultSkipDirs` was written for. `TestBiomeConfigIgnoresMatchesDefaultSkipDirs`
-  guards it.
-- **`--config-path` beats the scanned project's own root `biome.json`.** A project config setting
+  removed, Biome lints `dist/` and reports findings inside a minified production bundle.
+  `TestBiomeConfigIgnoresMatchesDefaultSkipDirs` guards it.
+- **`--config-path` beats the scanned project's own root `biome.json`** (re-verified on 2.5.10).
+  A project config setting
   `linter.enabled: false` is ignored, so bulwark's verdict doesn't vary with what the target repo
-  declares — the same stance `internal/typescript`'s doc comment takes for ESLint.
-- **A `biome.json` in a *subdirectory* aborts the whole run.** Biome reports "Found a nested root
-  configuration" and produces no report at all, regardless of what bulwark's own config sets
-  `root` to. `lintDirBiome` detects that specific failure and reports it as a configuration
-  conflict naming the fix (add `"root": false` to the nested file, or exclude the directory),
-  because it must read as neither a pass nor a findings failure.
+  declares — the same stance `internal/typescript`'s doc comment takes generally.
+- **A `biome.json` in a *subdirectory* does NOT abort bulwark's run**, and the earlier claim that
+  it does was a mis-scoped reproduction. Biome errors with "Found a nested root configuration, but
+  there's already a root configuration" **only when it resolves configuration from the tree
+  itself**. bulwark always passes `--config-path`, and under that flag a nested `biome.json` —
+  with `"root": true`, or with no `root` key at all — is simply ignored: Biome exits 0, lints
+  normally, and the report is clean. Confirmed on 2.5.8 and 2.5.10 with bulwark's exact
+  invocation, so this was never version drift.
+  The consequence is that `lintDirBiome`'s `biomeNestedRootConfig` branch is unreachable as long
+  as `--config-path` is passed. It stays, because it stops being unreachable the moment anyone
+  drops that flag — and dropping it is a plausible change, since it is what would let a project's
+  own Biome config be honoured. What must not survive is the claim that it fires today.
 - **A nested config declaring `"root": false` is *merged* into bulwark's config.** Its rules then
   fire in our run. `reportableBiome`'s category allowlist contains that — merged `lint/style/*`
   is dropped. The same merge is a real limitation in the other direction that cannot be closed
   from here: a nested config could set `"security": "off"` and silently narrow what bulwark
   checks.
+
+**A check whose findings never stream must set `executil.Result.Detail`.** `executil.Run`
+streams every tool's stdout/stderr live, so for gosec, clippy, cargo-audit and Semgrep the
+findings are on the terminal and in the log `action.yml` captures before anyone reads the
+`Result`. Biome is the exception: its report goes to a file via `--reporter-file` so its own
+chatter cannot corrupt the JSON, so nothing streams and `Output` holds no findings.
+`cmd/bulwark/scan.go`'s `report` prints `Detail` under a failing check — without it a
+developer sees `[FAIL] biome(.)` and has to re-run the pinned toolchain by hand to learn why,
+and the PR comment carries nothing at all. Detail lines are **indented**, and that is
+load-bearing rather than cosmetic: `action.yml`'s `tool_result()` matches
+`^\[(PASS|FAIL)\] <name>$` anchored at both ends, so an indented line cannot be mistaken for
+a status line even when a finding's own message contains one.
 
 `recommended: false` in the bundled `biome.json` is not tidiness — without it Biome's default
 preset enables `style` and `suspicious` too, and bulwark would start failing PRs over opinions it
@@ -212,7 +260,6 @@ Dependabot watches, colocated with the package that uses it:
 
 | Tool(s) | Manifest | Runtime source |
 |---|---|---|
-| eslint, eslint-plugin-security, @typescript-eslint/parser, typescript | `internal/typescript/eslint-pin/package.json` + lock | the manifest itself (`npm ci`) |
 | @biomejs/biome | `internal/typescript/biome-pin/package.json` + lock | the manifest itself (`npm ci`) |
 | cargo-audit | `internal/rust/cargo-audit-pin/Cargo.toml` | parsed by `internal/rust/pins.go` |
 | cargo-deny | `internal/rust/cargo-deny-pin/Cargo.toml` | parsed by `internal/rust/pins.go` |
@@ -253,7 +300,7 @@ entry. See [ADR 0006](docs/adr/0006-tool-pins-as-dependabot-manifests.md).
 ## Toolchains
 
 bulwark provisions every tool it *runs* — gosec/govulncheck via `go install` into a version-keyed
-cache, cargo-audit/cargo-deny via `cargo install`, ESLint via npm, Semgrep via pipx — under the
+cache, cargo-audit/cargo-deny via `cargo install`, Biome via npm, Semgrep via pipx — under the
 "pin the exact toolchain, don't reuse ambient installs" principle in `internal/golang`. The one
 thing it long did *not* provision was the language toolchain it does that provisioning **with**:
 `go`, `cargo` and `node` were simply assumed to be on PATH. `internal/toolchain` closes that.
@@ -397,7 +444,8 @@ generated cache data, not source, needs no PR/review and never pollutes main's h
   hole (wardnet/wardnet#899). "No coverage measured" is only printed when there was truly nothing
   to record: nothing measured *and* no priors to carry.
 - `internal/gitstate.BaseSHA` resolves `git merge-base HEAD origin/main`.
-- `internal/gitstate.ReadBaseline` fetches `bulwark-state` and reads `<sha>.json` via `git show`
+- `internal/gitstate.ReadBaseline` fetches `bulwark-state` and reads `v2/<sha>.json` (see
+  `gitstate.StatePath`, and Aggregation below for why it is versioned) via `git show`
   (no checkout) — a missing branch or missing file is a cache miss, not an error.
 - On a cache miss, `cmd/bulwark/coverage.go`'s `computeBaselineAt` checks out `origin/main` at that
   SHA into a throwaway `git worktree` (never disturbing the caller's own working tree/branch),
@@ -412,8 +460,9 @@ generated cache data, not source, needs no PR/review and never pollutes main's h
   "recorded" for a baseline that was lost — that exact silent loss (stale ref → non-fast-forward
   rejection → swallowed) is how wardnet's main runs kept recording nothing while every PR
   re-hit a cache miss.
-- `internal/coverage.Compute` gets the actual number per detected ecosystem: `go tool cover -func`'s
-  total line for Go, `cargo llvm-cov --json`'s `data[0].totals.lines.percent` for Rust, and — for
+- `internal/coverage.Compute` gets the actual number per detected ecosystem: covered-over-total
+  statements read from the profile for Go, `cargo llvm-cov --json`'s
+  `data[0].totals.lines.{count,covered}` for Rust, and — for
   TypeScript, best-effort only — a package's own `test:coverage` script plus Vitest/Istanbul's
   `coverage-summary.json`, since unlike a linter there's no single canonical coverage-invocation
   convention to standardize on across arbitrary TS packages. A language whose coverage can't be
@@ -421,8 +470,8 @@ generated cache data, not source, needs no PR/review and never pollutes main's h
 - Rust never assumes `--dir` itself is the crate/workspace root — `internal/detect.RustCrateDirs`
   discovers every independent Cargo crate/workspace root under `--dir` (deduping a workspace
   member's own `Cargo.toml` under its ancestor workspace root), and both `internal/rust.Check` and
-  `internal/coverage.rustCoverage` iterate every discovered root, averaging coverage across them the
-  same way TypeScript averages across packages. Rust's report overrides are therefore keyed by
+  `internal/coverage.rustCoverage` iterate every discovered root, summing line counts across them
+  the same way TypeScript sums across packages (see Aggregation below). Rust's report overrides are therefore keyed by
   crate directory (relative to `--dir`) rather than a single path — `coverage.rust.report` and
   `coverage.rust.lcov` accept a mapping of crate dir to path, and the `--rust-report`/
   `--rust-lcov-report` flags are repeatable with the same `<crateDir>=<path>` syntax. A bare value
@@ -431,7 +480,7 @@ generated cache data, not source, needs no PR/review and never pollutes main's h
 - Go never assumes `--dir` itself is a module root either, for the same reason and by the same
   shape (see [ADR 0002](docs/adr/0002-go-multi-module-coverage.md)) — `internal/detect.GoModuleDirs`
   discovers every module under `--dir` and `internal/coverage.goCoverage` measures each in turn,
-  averaging across them. `coverage.go.report` and `--go-report` are likewise keyed by module dir
+  summing across them. `coverage.go.report` and `--go-report` are likewise keyed by module dir
   (`--go-report <moduleDir>=<path>`). This one bit for real: `go test`, `go list -m` and `go tool
   cover -func` are all module-scoped, so running them at a monorepo root measured *nothing* — and
   said so only in a warning, leaving Go absent from wardnet's gate, aggregate and patch both, while
@@ -471,6 +520,79 @@ generated cache data, not source, needs no PR/review and never pollutes main's h
   no longer detected means the source actually left the tree and it's reported as `[DROPPED]`
   (wardnet/wardnet#892 showed a Rust-only PR as "typescript: no longer measured" when the TS code
   was untouched — only the frontend coverage job had been skipped). Neither fails on its own.
+
+### Aggregation: line-weighted, plus a per-unit floor
+
+A language's figure is the ratio of its units' **summed line counts** — `Σ covered / Σ total`
+across every discovered Go module, Rust crate/workspace root and TypeScript package — never the
+mean of the units' percentages. Each per-unit measurement returns an `internal/coverage.LineCount`
+(Go counts statements, since that is what a Go profile records; the ratio is the same quantity),
+and `Compute` returns the `Unit` list alongside the per-language percentages.
+
+The mean is not a mild approximation, which is why the counts are carried all the way rather than
+reduced early. On a nine-package pnpm monorepo, one commit that added a 39-line untested file to
+the smallest package (230 lines) while adding ~1,250 well-tested lines elsewhere read as **−2.2**
+under the mean and **+0.44** by line count: the gate failed a change that improved coverage, by
+five times the true magnitude, in the opposite direction. A 4,494-line library and a 230-line app
+had equal votes. Widening `coverage.tolerance` to absorb that is explicitly not the fix — it exists
+for sub-tenth instrumentation noise, and a tolerance wide enough to hide a 2.2-point artefact hides
+a genuine two-point regression too.
+
+**A unit with no measurable lines is unmeasured, never 0%.** An empty Go profile, a crate llvm-cov
+reports zero lines for, an Istanbul summary with `total.lines.total == 0` — each is returned as a
+`Unit` with a zero `LineCount`, which `Unit.Measured` reports false for. `aggregate` skips it, so no
+0/0 reaches a language's figure, and the floor below never fails it as a unit at 0%.
+
+It is returned rather than dropped because dropping it is invisible. A language reports a percentage
+as soon as **one** of its units measures, so `warnUnmeasured` — which works per language — stays
+silent while the floor gate covers fewer units than the repo holds: a repo whose CI path-filtered
+eight of nine TypeScript packages has a fully measured language and a gate that saw one package.
+`floorReport` therefore names each one as `[UNMEASURED]` with a stderr warning and prints its pass
+line as `N of M unit(s)`, the same "a gate that didn't run must be visibly distinct from a gate that
+passed" rule Patch coverage below states.
+
+A TypeScript package that declares no `test:coverage` script is the exception: under `SourceRun` it
+has opted out of being measured, which is not the same as a report bulwark expected and did not
+find, so it is not a discovered unit at all. One `[UNMEASURED]` line and one warning per types-only
+package on every run trains readers to ignore the tag that exists to be noticed.
+
+**`floorReport` filters to enabled ecosystems, and it is the only gate that does.** `Compute`
+measures every language `detect.Ecosystems` finds without consulting `rust/typescript/go.enabled`,
+so its units — and `current` itself — can carry a language the repo opted out of. For the aggregate
+that has always been one surprising `[FAIL]` line; for a per-unit gate it would be one build failure
+per crate. Closing it at the source (having `Compute` skip disabled languages, which is what this
+document's Coverage section already claims happens) is the better fix and is not this change.
+
+**`coverage.floor` is what line-weighting removes, put back deliberately.** Weighting by lines is
+blind to a small unit nobody tests: a package with 0 of 8 lines covered is 0.1% of an 8,305-line
+repo, so the headline barely moves. The two metrics answer different questions — "did this change
+leave code untested?" is the aggregate, "is there a unit nobody tests at all?" is the floor — and
+neither bounds the other. `cmd/bulwark/coverage.go`'s `floorReport` gates every measured unit
+against it and prints one `[FAIL]` line per unit below, in the same bracketed vocabulary
+`diffReport`/`patchReport` use. An unmeasured unit is `[UNMEASURED]`, never a failure and never
+folded into the passing count.
+
+**It is also the one gate that runs on main.** The aggregate and patch gates compare against a
+baseline, and on a push to main the current commit *is* the baseline, so they have nothing to
+compare and the record-on-main path returns before them. A floor has no baseline: a unit is above
+the bar or below it, and that reads the same on main as on a pull request. Skipping it there would
+leave main ungated on a unit that arrived through a path no pull request measured. The baseline is
+recorded first and unconditionally — it is worth keeping whether or not a unit is below the floor,
+and losing it would push every later pull request into a recompute-nothing cache miss over an
+unrelated failure. It defaults to `0` (off), because upgrading bulwark must not start
+failing a repo over a gap it has always had, and it has **no baseline and no
+compare-against-last-time**: a floor is an absolute standard, and ratcheting it against a prior
+value would make a unit that has never had tests permanently acceptable.
+
+**Cached baselines from before this live at a different path and are simply missed.** Entries
+recorded under the mean are a different quantity, so `gitstate.StatePath` writes and reads
+`v2/<key>.json` on `bulwark-state` and every consumer takes one clean cache miss and re-records.
+The version is the *metric's*, not the file format's — the entries stay a plain
+language → percentage object, readable by hand on the branch — and the old entries stay in place
+rather than being overwritten. `PriorBaselines`' `git ls-tree` needs `-r` for the same reason, or
+it lists the directory instead of the entries in it. Consumers still see a step change on upgrade
+(+9 points on the repo above); say so in the release notes. See
+[ADR 0007](docs/adr/0007-line-weighted-coverage-aggregation.md).
 
 ### `coverage.source`: who produces the coverage
 
@@ -721,6 +843,24 @@ into a shell script is a real script-injection vector if the interpolated value 
 shell metacharacters, regardless of how trusted the input value looks today. `if:` conditions and
 `with:` blocks on a `uses:` step are fine to interpolate directly — only `run:` script bodies are
 the risk, since that's the only place text gets spliced into something a shell then executes.
+
+## Release notes
+
+`release.yml` assembles the GitHub release body's header from
+`docs/release-notes/_header.md` (the invariant install block — it lives there
+rather than in `.goreleaser.yml`'s `header:` so the workflow can extend it) plus
+`docs/release-notes/<tag>.md` when that file exists, passes it with
+`--release-header`, and goreleaser appends its commit-derived changelog beneath.
+
+A missing per-version file is deliberately not an error. Most patch releases are
+fully described by their commit subjects, and failing a release over a file it
+never needed would make every release depend on remembering a step — the same
+failure the major-alias move in that workflow was automated away to prevent.
+Write one when the release carries what a commit subject cannot: a change in
+what an existing number or verdict *means*, an upgrade step consumers must take,
+or a new major. `docs/release-notes/v2.0.0.md` is the worked example, and the
+file has to be on `main` before the tag is pushed — the workflow reads it out of
+the tagged tree.
 
 ## Conventions
 

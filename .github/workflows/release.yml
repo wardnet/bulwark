@@ -44,11 +44,39 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # goreleaser derives the release body from commit subjects, which can say
+      # what landed but not what it means: a change to how a coverage number is
+      # computed, or an upgrade step a consumer has to take, has no commit
+      # subject that conveys it. docs/release-notes/<tag>.md is where that gets
+      # written, and this is what puts it in front of the changelog rather than
+      # in a file nobody visits.
+      #
+      # A missing notes file is not an error. Most releases are patches whose
+      # commit list genuinely is the whole story, and failing a release over a
+      # file the release did not need would make every release depend on
+      # remembering a step — the exact failure mode the major-alias move below
+      # was automated to fix.
+      - name: Assemble the release header
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          cat docs/release-notes/_header.md > release-header.md
+          notes="docs/release-notes/${TAG}.md"
+          if [[ -f "$notes" ]]; then
+            printf '\n---\n\n' >> release-header.md
+            cat "$notes" >> release-header.md
+            echo "Release body carries ${notes}." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No ${notes}; release body is the header plus the generated changelog." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Run goreleaser
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
           version: "~> v2"
-          args: release --clean --parallelism 1
+          args: release --clean --parallelism 1 --release-header=release-header.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

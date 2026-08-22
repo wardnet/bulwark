@@ -76,7 +76,7 @@ func newCoverageCmd() *cobra.Command {
 				return err
 			}
 
-			current, sources, cleanup, err := coverage.Compute(ctx, dir, cfg, source, reports, patchWanted)
+			current, units, sources, cleanup, err := coverage.Compute(ctx, dir, cfg, source, reports, patchWanted)
 			defer cleanup()
 			if err != nil {
 				return err
@@ -136,15 +136,31 @@ func newCoverageCmd() *cobra.Command {
 				if err := gitstate.WriteBaseline(ctx, dir, key, record); err != nil {
 					// Best-effort, as everywhere else: a write race with a concurrent
 					// main build must not fail the build.
-					_, printErr := fmt.Fprintf(cmd.ErrOrStderr(), "warning: failed to record coverage baseline for %s: %v\n", key, err)
-					return printErr
+					if _, printErr := fmt.Fprintf(cmd.ErrOrStderr(), "warning: failed to record coverage baseline for %s: %v\n", key, err); printErr != nil {
+						return printErr
+					}
+				} else {
+					note := ""
+					if len(carried) > 0 {
+						note = fmt.Sprintf(" (%s carried forward from a prior baseline — detected but not measured this run)", strings.Join(carried, ", "))
+					}
+					if _, err := fmt.Fprintf(cmd.OutOrStdout(), "recorded coverage baseline for %s: %s%s\n", sha, formatReport(record), note); err != nil {
+						return err
+					}
 				}
-				note := ""
-				if len(carried) > 0 {
-					note = fmt.Sprintf(" (%s carried forward from a prior baseline — detected but not measured this run)", strings.Join(carried, ", "))
-				}
-				_, err = fmt.Fprintf(cmd.OutOrStdout(), "recorded coverage baseline for %s: %s%s\n", sha, formatReport(record), note)
-				return err
+				// The floor is the one gate with something to say on main. The
+				// aggregate and patch gates compare against a baseline, and on
+				// main the current commit IS the baseline, so there is nothing
+				// to compare; the floor is an absolute standard that every unit
+				// meets or does not, and it reads the same here as on a pull
+				// request. Skipping it would leave main ungated on a unit that
+				// arrived through a path no pull request measured.
+				//
+				// Recording comes first and is unconditional: the baseline is
+				// worth keeping whether or not a unit is below the floor, and
+				// losing it would push every later pull request into a
+				// recompute-nothing cache miss over an unrelated failure.
+				return floorReport(cmd, units, cfg.Coverage.Floor, ecosystems)
 			}
 
 			if len(current) == 0 {
@@ -239,11 +255,18 @@ func newCoverageCmd() *cobra.Command {
 			// directly rather than recomputing "git merge-base HEAD origin/main"
 			// a second time.
 			patchErr := patchReport(cmd, ctx, dir, patchWanted, sources, sha, baseline, cfg.Coverage.Patch.Tolerance, ecosystems)
+			// The per-unit floor is what the line-weighted aggregate above
+			// cannot see: a unit small enough that having no tests at all
+			// barely moves the total. It gates on the units this run
+			// measured, with no baseline of its own — the floor is an
+			// absolute standard, not a ratchet, which is also why the
+			// record-on-main path above runs it and the other two gates.
+			floorErr := floorReport(cmd, units, cfg.Coverage.Floor, ecosystems)
 			// errors.Join keeps both messages when aggregate AND patch coverage
 			// regress in the same run — AGENTS.md's documented "compute and gate
 			// on both, not either/or" contract must hold for the returned error
 			// too, not just for what gets printed to stdout above.
-			return errors.Join(aggregateErr, patchErr)
+			return errors.Join(aggregateErr, patchErr, floorErr)
 		},
 	}
 	// --dir stays a flag and cannot move into .bulwark.yml: the file lives AT
@@ -413,7 +436,7 @@ func computeBaselineAt(ctx context.Context, cmd *cobra.Command, dir, sha string,
 	// source — patch coverage always compares against the current tree's
 	// baseline lookup, never a baseline-of-a-baseline — so PatchWanted is the
 	// zero value here, and the resolved sources/cleanup are discarded.
-	report, _, cleanup, err := coverage.Compute(ctx, tmp, cfg, coverage.SourceRun, coverage.ReportPaths{}, coverage.PatchWanted{})
+	report, _, _, cleanup, err := coverage.Compute(ctx, tmp, cfg, coverage.SourceRun, coverage.ReportPaths{}, coverage.PatchWanted{})
 	defer cleanup()
 	if err != nil {
 		return nil, err
@@ -876,6 +899,116 @@ func diffReport(cmd *cobra.Command, current, baseline map[string]float64, tolera
 		return fmt.Errorf("coverage regressed for %d language(s)", regressed)
 	}
 	return nil
+}
+
+// floorReport gates every measured unit against coverage.floor, printing one
+// bracketed line per unit that falls below it and a single summary line when
+// they all clear. A floor of 0 disables the gate entirely and prints nothing
+// — it is opt-in, so a repo that never configured one sees no new output and
+// no new failure.
+//
+// It has no baseline and no tolerance-against-a-previous-value. Aggregate and
+// patch coverage both ask "is this worse than it was"; the floor asks "is
+// this below the bar", which the repo states once and every unit meets or
+// does not. Gating it against a prior value would ratchet a unit that has
+// never had tests into permanent acceptability, which is the exact gap it
+// exists to close.
+//
+// A unit that produced no measurement is named as [UNMEASURED], never folded
+// into the passing count, for the reason patchReport does the same: a gate
+// that did not run must be visibly distinct from a gate that passed. The
+// language-level warnUnmeasured cannot cover this — a language reports a
+// percentage as soon as one of its units measures, so a repo whose CI
+// path-filtered eight of nine TypeScript packages has a fully measured
+// language and a floor gate that saw one package. Like diffReport's
+// [UNMEASURED], it never fails the gate on its own, and a stderr warning
+// names what is missing.
+//
+// The report is scoped to enabled ecosystems. coverage.Compute measures every
+// language it detects without consulting `enabled:` in .bulwark.yml, so its
+// units can include a language the repo opted out of gating — and a per-unit
+// gate turns that into one build failure per crate for a language nobody
+// asked to be gated on. enabled is the caller's answer, so the filter belongs
+// here, next to the other two gates that already take it.
+//
+// Units are reported in a stable order (language, then directory) so the line
+// set doesn't reshuffle between runs, and the bracketed vocabulary matches
+// diffReport/patchReport because action.yml's PR-comment builder greps for
+// exactly that.
+func floorReport(cmd *cobra.Command, units []coverage.Unit, floor float64, enabled []detect.Ecosystem) error {
+	if floor <= 0 || len(units) == 0 {
+		return nil
+	}
+	enabledSet := make(map[string]bool, len(enabled))
+	for _, e := range enabled {
+		enabledSet[string(e)] = true
+	}
+	sorted := make([]coverage.Unit, 0, len(units))
+	for _, u := range units {
+		if enabledSet[u.Lang] {
+			sorted = append(sorted, u)
+		}
+	}
+	if len(sorted) == 0 {
+		return nil
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Lang != sorted[j].Lang {
+			return sorted[i].Lang < sorted[j].Lang
+		}
+		return sorted[i].Dir < sorted[j].Dir
+	})
+
+	below, cleared := 0, 0
+	for _, u := range sorted {
+		if !u.Measured() {
+			detail := fmt.Sprintf("%s floor: %s not measured this run (floor %.1f%% not applied)",
+				u.Lang, unitLabel(u), floor)
+			if _, err := fmt.Fprintln(cmd.OutOrStdout(), statusPrefix("UNMEASURED")+detail); err != nil {
+				return err
+			}
+			if _, err := fmt.Fprintf(cmd.ErrOrStderr(),
+				"warning: no coverage report for %s unit %s, so the %.1f%% floor was not applied to it — its coverage step didn't run, or its report isn't where bulwark looks\n",
+				u.Lang, unitLabel(u), floor); err != nil {
+				return err
+			}
+			continue
+		}
+		pct := u.Lines.Percent()
+		// Display precision, like regressedBeyond: a unit printed as meeting
+		// the floor must never be failed for a difference the report can't
+		// show.
+		if math.Round(pct*10) >= math.Round(floor*10) {
+			cleared++
+			continue
+		}
+		below++
+		detail := fmt.Sprintf("%s floor: %s at %.1f%% (%d/%d lines, floor %.1f%%)",
+			u.Lang, unitLabel(u), pct, u.Lines.Covered, u.Lines.Total, floor)
+		if _, err := fmt.Fprintln(cmd.OutOrStdout(), statusPrefix("FAIL")+detail); err != nil {
+			return err
+		}
+	}
+	if below == 0 {
+		// "N of M" rather than a bare count: the two numbers differ exactly
+		// when some unit went ungated, so the PR comment cannot read as
+		// repo-wide coverage of a partial run.
+		detail := fmt.Sprintf("floor: %d of %d unit(s) at or above %.1f%%", cleared, len(sorted), floor)
+		if _, err := fmt.Fprintln(cmd.OutOrStdout(), statusPrefix("PASS")+detail); err != nil {
+			return err
+		}
+		return nil
+	}
+	return fmt.Errorf("%d unit(s) below the %.1f%% per-unit coverage floor", below, floor)
+}
+
+// unitLabel names a unit for a report line. A unit rooted at --dir itself has
+// an empty relative directory, which would print as nothing at all.
+func unitLabel(u coverage.Unit) string {
+	if u.Dir == "" {
+		return "."
+	}
+	return u.Dir
 }
 
 // printNoCoverage reports a run that measured nothing and — on main — had no

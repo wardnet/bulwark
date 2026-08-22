@@ -15,8 +15,8 @@ import (
 //go:embed biome.json
 var biomeConfig []byte
 
-// The pin manifest — see eslint-pin's counterpart in typescript.go for why the
-// version lives in package.json rather than a Go constant.
+// The pin manifest — see the package doc in typescript.go for why the version
+// lives in package.json rather than a Go constant.
 var (
 	//go:embed biome-pin/package.json
 	biomePackageJSON []byte
@@ -49,10 +49,9 @@ type biomeDiagnostic struct {
 }
 
 // reportableBiome decides whether a diagnostic is something bulwark should fail
-// on. It is the direct analogue of reportable() for ESLint, and exists for the
-// same reason: bulwark lints with its own standalone config, so anything the
-// scanned project's own configuration drags in is a complaint about the setup
-// we imposed rather than a defect in the code.
+// on. bulwark lints with its own standalone config, so anything the scanned
+// project's own configuration drags in is a complaint about the setup we
+// imposed rather than a defect in the code.
 //
 // Only the two groups bulwark's bundled config enables count. In particular
 // this drops:
@@ -70,8 +69,7 @@ type biomeDiagnostic struct {
 // way to close it from here: a nested config could set `"security": "off"` and
 // silently narrow what bulwark checks. It is called out in AGENTS.md.
 //
-// Everything that is *not* a rule opinion is kept, for the same reason
-// reportable() keeps ESLint's fatal diagnostics: a file bulwark could not
+// Everything that is *not* a rule opinion is kept: a file bulwark could not
 // actually lint is worth knowing about, and dropping it is worse than a false
 // positive. This is deliberately a denylist of opinion categories rather than an
 // allowlist of failure categories, because the failure categories are open-ended
@@ -131,22 +129,28 @@ func lintDirBiome(ctx context.Context, dir, biomeBin, configPath string) (execut
 	defer func() { _ = os.Remove(outPath) }()
 
 	// --reporter-file keeps the machine-readable report out of the combined
-	// stdout/stderr stream, for the same reason ESLint's --output-file does:
-	// Biome writes its own diagnostics there, including an "experimental
-	// reporter" notice, which JSON parsing must not trip over.
+	// stdout/stderr stream: Biome writes its own diagnostics there, including
+	// an "experimental reporter" notice, which JSON parsing must not trip over.
 	r := executil.Run(ctx, dir, biomeBin, "lint",
 		"--config-path", configPath, "--reporter", "json", "--reporter-file", outPath, ".")
 	r.Name = "biome(" + dir + ")"
 
-	// A nested biome.json aborts the whole run before anything is linted. That
-	// must not read as a pass, and it must not read as a findings failure
-	// either — it is a fixable configuration conflict, so say exactly that and
-	// what fixes it.
+	// A nested biome.json aborting the run before anything is linted must not
+	// read as a pass, and must not read as a findings failure either — it is a
+	// fixable configuration conflict, so say exactly that and what fixes it.
+	//
+	// The abort happens only when Biome resolves configuration from the tree
+	// itself. --config-path, which is always passed above, suppresses it: a
+	// nested config is ignored and the lint proceeds normally (checked against
+	// 2.5.8 and 2.5.10). So this branch does not fire today. It is kept
+	// because it stops being unreachable the moment --config-path is dropped,
+	// which is exactly what honouring a project's own Biome config would
+	// require.
 	if !r.Ok() && strings.Contains(r.Output, biomeNestedRootConfig) {
 		r.Err = fmt.Errorf("nested biome.json conflicts with bulwark's bundled config")
-		r.Output = "Biome refused to run: a biome.json below this package is treated as a second root config.\n" +
+		r.Detail = "Biome refused to run: a biome.json below this package is treated as a second root config.\n" +
 			"Add \"root\": false to it (Biome's own requirement for nested configs), or exclude that\n" +
-			"directory via typescript.exclude in .bulwark.yml.\n\n" + r.Output
+			"directory via typescript.exclude in .bulwark.yml."
 		return r, nil
 	}
 
@@ -173,10 +177,13 @@ func lintDirBiome(ctx context.Context, dir, biomeBin, configPath string) (execut
 
 	if count == 0 {
 		r.Err = nil
-		r.Output = "no findings"
 		return r, nil
 	}
-	r.Output = b.String()
+	// Detail, not Output: Output is Biome's own stream, which already reached
+	// the terminal and holds no findings, and overwriting it would discard the
+	// raw log the run artifact keeps. These findings exist nowhere else, so
+	// they are what report() has to print.
+	r.Detail = b.String()
 	r.Err = fmt.Errorf("%d finding(s)", count)
 	return r, nil
 }

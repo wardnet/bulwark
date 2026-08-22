@@ -32,7 +32,7 @@ const maxArchiveBytes = 2 << 30 // 2 GiB
 // cacheRoot is the version-keyed directory layout every bulwark-managed
 // install already uses (internal/golang's gobin-<tool>-<version>,
 // internal/rust's <tool>-<version>, internal/typescript's
-// eslint-toolchain-<versions>). Language toolchains join it rather than
+// biome-toolchain-<versions>). Language toolchains join it rather than
 // inventing a second location, so one cache key in CI covers all of them —
 // which is exactly what wardnet's workflow already caches by path.
 func cacheRoot(elem ...string) (string, error) {

@@ -12,11 +12,11 @@
 # directories on disk, and does not read dependabot.yml. Nothing enforces the
 # Dependabot entry, so a pin can still be added that no bot ever bumps.
 rust:
-  exclude: ["eslint-pin", "biome-pin", "cargo-audit-pin", "cargo-deny-pin", "go-pin"]
+  exclude: ["biome-pin", "cargo-audit-pin", "cargo-deny-pin", "go-pin"]
 typescript:
-  exclude: ["eslint-pin", "biome-pin", "cargo-audit-pin", "cargo-deny-pin", "go-pin"]
+  exclude: ["biome-pin", "cargo-audit-pin", "cargo-deny-pin", "go-pin"]
 go:
-  exclude: ["eslint-pin", "biome-pin", "cargo-audit-pin", "cargo-deny-pin", "go-pin"]
+  exclude: ["biome-pin", "cargo-audit-pin", "cargo-deny-pin", "go-pin"]
 
 # Who produces the coverage this repo is gated on.
 #

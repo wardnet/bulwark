@@ -39,7 +39,7 @@ updates:
       default-days: 7
     open-pull-requests-limit: 25
 
-  # The ESLint stack (internal/typescript).
+  # Biome (internal/typescript), the only TypeScript linter.
   #
   # One of the tool version pins. bulwark pins every tool it runs, and these
   # manifests exist so those pins are visible to Dependabot rather than frozen
@@ -50,22 +50,6 @@ updates:
   # Each pin directory is also excluded in .bulwark.yml: they are real
   # manifests, so detection would otherwise treat them as packages to lint or
   # modules to scan.
-  - package-ecosystem: "npm"
-    directory: "/internal/typescript/eslint-pin"
-    schedule:
-      interval: "weekly"
-    # Dependabot's commit message is also its PR title, and PRs are
-    # squash-merged, so the prefix is what keeps dependency updates inside
-    # Conventional Commits. `include: scope` appends the dependency scope,
-    # producing e.g. `build(deps): bump …`.
-    commit-message:
-      prefix: "build"
-      include: scope
-    cooldown:
-      default-days: 7
-    open-pull-requests-limit: 25
-
-  # Biome (internal/typescript), used when a repo sets typescript.linter: biome.
   - package-ecosystem: "npm"
     directory: "/internal/typescript/biome-pin"
     schedule:

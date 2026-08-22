@@ -29,6 +29,31 @@ import (
 // BranchName is the dedicated branch coverage baselines live on.
 const BranchName = "bulwark-state"
 
+// stateDir is the directory inside BranchName that baselines are written to
+// and read from, and it is keyed to the coverage metric rather than to the
+// file format. A baseline is only comparable to one produced by the same
+// metric: today's figure is a language's units' summed line counts, and
+// diffing it against a figure computed some other way measures the change of
+// definition, not a change in coverage — which surfaces as a step change of
+// several points that the gate reads as a regression.
+//
+// So any change to how a language's percentage is derived must bump this
+// constant. Entries at the superseded directory are then simply never found,
+// every consumer takes one clean cache miss, and the gate recovers by
+// recording afresh.
+//
+// A directory rather than a marker inside the file: the entries stay a plain
+// language -> percentage object, which is what makes them readable by hand on
+// the branch, and the superseded ones stay in place to be inspected rather
+// than overwritten.
+const stateDir = "v2"
+
+// StatePath is the path, inside BranchName, of the baseline for key (a tree
+// or commit SHA).
+func StatePath(key string) string {
+	return stateDir + "/" + key + ".json"
+}
+
 // TreeSHA resolves the tree a commit points at.
 //
 // Baselines are keyed by tree rather than by commit because the tree is what
@@ -90,7 +115,7 @@ func ReadBaseline(ctx context.Context, dir string, keys ...string) (map[string]f
 		if key == "" {
 			continue
 		}
-		r = executil.Run(ctx, dir, "git", "show", "origin/"+BranchName+":"+key+".json")
+		r = executil.Run(ctx, dir, "git", "show", "origin/"+BranchName+":"+StatePath(key))
 		if r.Ok() {
 			found = key
 			break
@@ -142,8 +167,10 @@ func PriorBaselines(ctx context.Context, dir, sha string, langs []string, maxDep
 	// ls-tree scopes to the cwd's path inside the ref's tree — bulwark-state
 	// has no such subtree, so the listing comes back empty and carry-forward
 	// silently finds nothing (`show ref:path` below is root-relative and
-	// unaffected).
-	ls := executil.Run(ctx, dir, "git", "ls-tree", "--full-tree", "--name-only", "origin/"+BranchName)
+	// unaffected). -r is load-bearing for the same reason: baselines live in
+	// a subdirectory of the branch, and a non-recursive listing names that
+	// directory rather than the entries inside it.
+	ls := executil.Run(ctx, dir, "git", "ls-tree", "-r", "--full-tree", "--name-only", "origin/"+BranchName)
 	if !ls.Ok() {
 		return found
 	}
@@ -170,7 +197,7 @@ func PriorBaselines(ctx context.Context, dir, sha string, langs []string, maxDep
 		// Tree first, so a commit that has both resolves to the same entry
 		// ReadBaseline would pick.
 		for i := len(fields) - 1; i >= 0; i-- {
-			if cached[fields[i]+".json"] {
+			if cached[StatePath(fields[i])] {
 				key = fields[i]
 				break
 			}
@@ -178,7 +205,7 @@ func PriorBaselines(ctx context.Context, dir, sha string, langs []string, maxDep
 		if key == "" {
 			continue
 		}
-		r := executil.Run(ctx, dir, "git", "show", "origin/"+BranchName+":"+key+".json")
+		r := executil.Run(ctx, dir, "git", "show", "origin/"+BranchName+":"+StatePath(key))
 		if !r.Ok() {
 			continue
 		}
@@ -275,11 +302,15 @@ func pushBaseline(ctx context.Context, dir, sha string, data []byte) error {
 		}
 	}
 
-	path := filepath.Join(tmp, sha+".json")
+	rel := StatePath(sha)
+	path := filepath.Join(tmp, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return err
+	}
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return err
 	}
-	if r := executil.Run(ctx, tmp, "git", "add", sha+".json"); !r.Ok() {
+	if r := executil.Run(ctx, tmp, "git", "add", rel); !r.Ok() {
 		return fmt.Errorf("git add: %w", r.Err)
 	}
 	// Nothing staged means the fetched branch already carries this exact
