@@ -68,6 +68,31 @@ func TestBiomeConfigDisablesFormatterAndAssist(t *testing.T) {
 	}
 }
 
+// TestBiomeConfigEnablesTailwindDirectives guards a failure that had no
+// workaround from the scanned repository. Tailwind v4 moved configuration into
+// ordinary .css files — @theme, @custom-variant, @utility, @source — and
+// Biome's CSS parser rejects all of them unless this is set. The result is a
+// `parse` diagnostic, which reportableBiome keeps on purpose (a file bulwark
+// could not lint is worth knowing about), so the TypeScript check failed on a
+// stylesheet that was never wrong.
+//
+// A repository cannot fix it locally, which is why it belongs here: suppression
+// comments do not apply to parse errors, and a nested biome.json is ignored
+// when Biome runs under --config-path, as lintDirBiome does.
+func TestBiomeConfigEnablesTailwindDirectives(t *testing.T) {
+	css, ok := biomeCfg(t)["css"].(map[string]any)
+	if !ok {
+		t.Fatal("biome.json has no css section; Tailwind v4 directives fail to parse without it")
+	}
+	parser, ok := css["parser"].(map[string]any)
+	if !ok {
+		t.Fatal("biome.json has no css.parser section")
+	}
+	if parser["tailwindDirectives"] != true {
+		t.Errorf("css.parser.tailwindDirectives = %v, want true", parser["tailwindDirectives"])
+	}
+}
+
 // TestBiomeConfigIgnoresMatchesDefaultSkipDirs is the Biome counterpart of
 // TestEslintConfigIgnoresMatchesDefaultSkipDirs, and guards a failure verified
 // against Biome 2.5.8 directly: with these negations removed, Biome lints
