@@ -22,9 +22,9 @@ dependabot:
   - ecosystem: github-actions
     directory: /
   - ecosystem: npm
-    directory: /internal/typescript/eslint-pin
+    directory: /internal/typescript/biome-pin
     note: |
-      The ESLint stack (internal/typescript).
+      Biome (internal/typescript), the only TypeScript linter.
 
       One of the tool version pins. bulwark pins every tool it runs, and these
       manifests exist so those pins are visible to Dependabot rather than frozen
@@ -35,10 +35,6 @@ dependabot:
       Each pin directory is also excluded in .bulwark.yml: they are real
       manifests, so detection would otherwise treat them as packages to lint or
       modules to scan.
-  - ecosystem: npm
-    directory: /internal/typescript/biome-pin
-    note: |
-      Biome (internal/typescript), used when a repo sets typescript.linter: biome.
   - ecosystem: cargo
     directory: /internal/rust/cargo-audit-pin
     note: |

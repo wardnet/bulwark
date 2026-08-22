@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -63,7 +64,7 @@ func newScanCmd() *cobra.Command {
 					if !cfg.TypeScript.Enabled {
 						continue
 					}
-					tsResults, err := typescript.Check(ctx, dir, cfg.TypeScript.Exclude, typescript.Linter(cfg.TypeScript.Linter))
+					tsResults, err := typescript.Check(ctx, dir, cfg.TypeScript.Exclude)
 					if err != nil {
 						return err
 					}
@@ -126,6 +127,20 @@ func resolveDiffBase(ctx context.Context, dir, diffBase string) (string, error) 
 
 // report prints a pass/fail line per check and returns an error if any
 // check failed, so the process exit code reflects the aggregate result.
+//
+// A failing check also prints its Detail, which is the only place some
+// findings exist. Most tools stream their own output live through
+// executil.Run, so it is already on the terminal and in the log the action
+// captures; Biome does not, because bulwark sends its report to a file so the
+// JSON cannot be corrupted by Biome's own chatter. Printing only "[FAIL]
+// biome(.)" left the developer to re-run the pinned toolchain by hand to find
+// out what was wrong, and put nothing in the PR comment either.
+//
+// Detail lines are indented, which is not cosmetic: action.yml's tool_result()
+// matches "^\[(PASS|FAIL)\] <name>$" anchored at both ends, so an indented
+// line can never be mistaken for a status line even when a finding's message
+// happens to contain one. The action's emit_error_output then inlines the tail
+// of this same stream into the PR comment, so the findings travel with it.
 func report(cmd *cobra.Command, results []executil.Result) error {
 	failed := 0
 	for _, r := range results {
@@ -136,6 +151,14 @@ func report(cmd *cobra.Command, results []executil.Result) error {
 		}
 		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "[%s] %s\n", status, r.Name); err != nil {
 			return err
+		}
+		if r.Ok() || strings.TrimSpace(r.Detail) == "" {
+			continue
+		}
+		for _, line := range strings.Split(strings.TrimRight(r.Detail, "\n"), "\n") {
+			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "  %s\n", line); err != nil {
+				return err
+			}
 		}
 	}
 	if failed > 0 {

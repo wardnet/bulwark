@@ -12,7 +12,7 @@
 // (the standard rustup convention for pinning rustc/clippy/rustfmt together) —
 // bulwark doesn't second-guess that. cargo-audit and cargo-deny are different:
 // they're standalone cargo subcommands with no equivalent per-repo pin, so —
-// like every other scanner's toolchain (gosec/govulncheck, ESLint, Semgrep) —
+// like every other scanner's toolchain (gosec/govulncheck, Biome, Semgrep) —
 // bulwark pins their exact versions and installs them into a version-keyed
 // cache directory rather than trusting whatever's already on PATH.
 package rust

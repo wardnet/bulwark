@@ -9,7 +9,7 @@ import (
 // TestPinnedVersionsMatchGoPinModule is the drift guard for the one pair of
 // pins bulwark cannot read from its manifest at runtime.
 //
-// Every other pinned tool (ESLint, Biome, cargo-audit, cargo-deny, Semgrep) has
+// Every other pinned tool (Biome, cargo-audit, cargo-deny, Semgrep) has
 // its version read directly out of the package-manager manifest Dependabot
 // edits, so drift is impossible by construction. Go's two can't work that way:
 // gosecPkg/govulncheckPkg are const expressions that concatenate the version at

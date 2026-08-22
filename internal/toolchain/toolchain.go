@@ -6,7 +6,7 @@
 // toolchain, don't reuse ambient installs" principle (see internal/golang).
 // bulwark provisions everything it *runs* — gosec and govulncheck via `go
 // install` into a version-keyed cache, cargo-audit/cargo-deny via `cargo
-// install`, ESLint via npm, Semgrep via pipx — but until now it assumed the
+// install`, Biome via npm, Semgrep via pipx — but until now it assumed the
 // language toolchain it does that provisioning *with* was simply there. On a
 // GitHub-hosted runner that holds, which is why nothing was visibly broken;
 // on a self-hosted or container runner without Go it fails at `go install`,

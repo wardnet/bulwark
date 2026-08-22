@@ -1,5 +1,10 @@
 # TypeScript projects may opt into Biome, one repo at a time
 
+> **Superseded by [ADR 0008](0008-biome-as-the-only-typescript-linter.md).** Biome is now the
+> only TypeScript linter; ESLint is removed and `typescript.linter: eslint` is rejected. The
+> rule-set comparison below still holds and is the record of what that removal costs.
+
+
 The consuming projects are migrating from ESLint to Biome, so `.bulwark.yml` grows
 `typescript.linter: eslint|biome` — a validated enum defaulting to `eslint`, mirroring
 `coverage.source`'s precedent of naming the decision the repo makes rather than bulwark's
