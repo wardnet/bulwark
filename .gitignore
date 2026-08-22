@@ -11,6 +11,9 @@ go.work.sum
 # goreleaser build artifacts
 dist/
 
+# Release body assembled by release.yml from docs/release-notes/
+/release-header.md
+
 # Agentic toolkit generated config
 /.claude/
 /CLAUDE.md

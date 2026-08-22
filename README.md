@@ -19,7 +19,7 @@ against a lazily-computed baseline — no manual setup, no "works on my machine.
 | Ecosystem | Checks |
 |---|---|
 | Rust | `cargo fmt --check`, `cargo clippy` (pedantic/restriction groups come from the target repo's own `Cargo.toml`), `cargo-audit` (CVEs), `cargo-deny` (licenses + bans) |
-| TypeScript | ESLint + `eslint-plugin-security`, using a toolchain `bulwark` bundles and pins itself — independent of whatever (if anything) the target package declares in its own `devDependencies`. Projects migrating to [Biome](https://biomejs.dev) can opt in with `typescript.linter: biome` |
+| TypeScript | [Biome](https://biomejs.dev)'s `security` and `correctness` rules, using a toolchain `bulwark` bundles and pins itself — independent of whatever (if anything) the target package declares in its own `devDependencies`. Biome parses TypeScript with its own parser, so no compiler version can constrain it |
 | Go | `gosec`, `govulncheck` |
 | All of the above | [Semgrep](https://semgrep.dev) |
 
@@ -94,7 +94,6 @@ rust:
 typescript:
   enabled: true
   exclude: ["legacy-app"]
-  linter: eslint  # or "biome" — which linter backs the TypeScript check
 go:
   enabled: true
   exclude: []
@@ -106,7 +105,13 @@ toolchain:
 coverage:
   source: run     # or "report" — a prior CI job produces coverage, bulwark only parses it
   tolerance: 0.1  # pp the aggregate gate tolerates below baseline (patch gate: coverage.patch.tolerance)
+  floor: 0        # minimum coverage any single module/crate/package must reach; 0 = off
 ```
+
+A language's aggregate is its units' summed line counts (`Σ covered / Σ total`), so a big package
+and a small one contribute in proportion to their size. That is the honest headline, and it is
+deliberately blind to a small package with no tests at all — `coverage.floor` is the opt-in gate
+for that second question.
 
 See [AGENTS.md](AGENTS.md#configuration) for the full schema and merge semantics.
 
