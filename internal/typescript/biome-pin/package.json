@@ -4,6 +4,6 @@
   "private": true,
   "description": "Version pin for bulwark's bundled Biome toolchain, the engine behind the TypeScript check. Not a package bulwark builds or publishes: it exists so Dependabot can see this version and open bump PRs, and so `npm ci` installs it deterministically. See internal/typescript/biome.go.",
   "dependencies": {
-    "@biomejs/biome": "2.5.10"
+    "@biomejs/biome": "2.5.12"
   }
 }
