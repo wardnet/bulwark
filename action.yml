@@ -148,7 +148,7 @@ runs:
       # even when a check failed — that's exactly when the full log matters.
       if: always() && (inputs.run-scan == 'true' || inputs.run-coverage == 'true')
       id: output-artifact
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
       with:
         # Job-scoped name so two jobs in the same run don't collide (v4+ errors
         # on a duplicate artifact name within a run).
