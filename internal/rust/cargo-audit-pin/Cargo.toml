@@ -21,4 +21,4 @@ edition = "2021"
 publish = false
 
 [dependencies]
-cargo-audit = "=0.22.2"
+cargo-audit = "=0.23.0"
