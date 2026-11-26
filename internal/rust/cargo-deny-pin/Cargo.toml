@@ -21,4 +21,4 @@ edition = "2021"
 publish = false
 
 [dependencies]
-cargo-deny = "=0.20.2"
+cargo-deny = "=0.21.0"
